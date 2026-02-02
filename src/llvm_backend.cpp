@@ -20,7 +20,7 @@
 
 #include "llvm_backend.hpp"
 
-// LLVM C++ headers for DIBuilder, TargetMachine, and split-DWARF emission.
+// LLVM C++ headers for TargetMachine, split-DWARF emission, and type units.
 // gb.h defines 'cast' as a C-style cast macro, which conflicts with llvm::cast.
 #if !defined(GB_SYSTEM_WINDOWS)
 #pragma push_macro("cast")
@@ -3201,13 +3201,11 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 	// inject flags like -generate-type-units that have no API-level control.
 	// Type units reduce .debug_info size by deduplicating type DIEs across CUs.
 	// Safe with DWARF4 (default linker) and DWARF5 (lld/mold).
-	#if 1
 	if (build_context.ODIN_DEBUG && build_context.debug_mode != DebugMode_Minimal
 	    && build_context.metrics.os != TargetOs_windows) {
 		const char *args[] = {"odin", "-generate-type-units"};
 		LLVMParseCommandLineOptions(2, args, nullptr);
 	}
-	#endif
 #endif
 
 	char const *target_triple = alloc_cstring(permanent_allocator(), build_context.metrics.target_triplet);
