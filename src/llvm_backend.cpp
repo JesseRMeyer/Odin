@@ -3138,6 +3138,390 @@ gb_internal void lb_generate_procedure(lbModule *m, lbProcedure *p) {
 }
 
 
+gb_internal void lb_emit_lto_soft_float_builtins(lbModule *m) {
+	LLVMModuleRef mod = m->mod;
+	LLVMContextRef ctx = m->ctx;
+
+	LLVMTypeRef i16_type = LLVMInt16TypeInContext(ctx);
+	LLVMTypeRef i32_type = LLVMInt32TypeInContext(ctx);
+	LLVMTypeRef f32_type = LLVMFloatTypeInContext(ctx);
+
+	// __extendhfsf2: i16 -> float (f16 to f32 conversion)
+	{
+		LLVMTypeRef param_types[] = { i16_type };
+		LLVMTypeRef fn_type = LLVMFunctionType(f32_type, param_types, 1, false);
+		LLVMValueRef fn = LLVMAddFunction(mod, "__extendhfsf2", fn_type);
+		LLVMSetLinkage(fn, LLVMWeakAnyLinkage);
+
+		LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
+		LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
+		LLVMPositionBuilderAtEnd(b, entry);
+
+		LLVMValueRef value = LLVMGetParam(fn, 0); // i16
+
+		// magic = bitcast((254-15)<<23, float)
+		LLVMValueRef magic_i32 = LLVMConstInt(i32_type, (254u - 15u) << 23, false);
+		LLVMValueRef magic_f32 = LLVMBuildBitCast(b, magic_i32, f32_type, "magic");
+
+		// inf_or_nan = bitcast((127+16)<<23, float)
+		LLVMValueRef inf_i32 = LLVMConstInt(i32_type, (127u + 16u) << 23, false);
+		LLVMValueRef inf_f32 = LLVMBuildBitCast(b, inf_i32, f32_type, "inf_or_nan");
+
+		// v_u = zext(value, i32) & 0x7FFF then << 13
+		LLVMValueRef val_i32 = LLVMBuildZExt(b, value, i32_type, "val_i32");
+		LLVMValueRef masked = LLVMBuildAnd(b, val_i32, LLVMConstInt(i32_type, 0x7FFF, false), "masked");
+		LLVMValueRef shifted = LLVMBuildShl(b, masked, LLVMConstInt(i32_type, 13, false), "shifted");
+
+		// v_f = bitcast(shifted, float) * magic
+		LLVMValueRef v_f = LLVMBuildBitCast(b, shifted, f32_type, "v_f_raw");
+		v_f = LLVMBuildFMul(b, v_f, magic_f32, "v_f");
+
+		// is_inf = v_f >= inf_or_nan
+		LLVMValueRef is_inf = LLVMBuildFCmp(b, LLVMRealOGE, v_f, inf_f32, "is_inf");
+
+		// v_u2 = bitcast(v_f, i32)
+		LLVMValueRef v_u2 = LLVMBuildBitCast(b, v_f, i32_type, "v_u2");
+
+		// v_u3 = select(is_inf, v_u2 | (255<<23), v_u2)
+		LLVMValueRef inf_bits = LLVMBuildOr(b, v_u2, LLVMConstInt(i32_type, 255u << 23, false), "inf_bits");
+		LLVMValueRef v_u3 = LLVMBuildSelect(b, is_inf, inf_bits, v_u2, "v_u3");
+
+		// sign = (zext(value, i32) & 0x8000) << 16
+		LLVMValueRef sign = LLVMBuildAnd(b, val_i32, LLVMConstInt(i32_type, 0x8000, false), "sign_bit");
+		sign = LLVMBuildShl(b, sign, LLVMConstInt(i32_type, 16, false), "sign");
+
+		// result = bitcast(v_u3 | sign, float)
+		LLVMValueRef result_i32 = LLVMBuildOr(b, v_u3, sign, "result_i32");
+		LLVMValueRef result = LLVMBuildBitCast(b, result_i32, f32_type, "result");
+		LLVMBuildRet(b, result);
+
+		LLVMDisposeBuilder(b);
+	}
+
+	// __truncsfhf2: float -> i16 (f32 to f16 conversion)
+	{
+		LLVMTypeRef param_types[] = { f32_type };
+		LLVMTypeRef fn_type = LLVMFunctionType(i16_type, param_types, 1, false);
+		LLVMValueRef fn = LLVMAddFunction(mod, "__truncsfhf2", fn_type);
+		LLVMSetLinkage(fn, LLVMWeakAnyLinkage);
+
+		LLVMBasicBlockRef entry   = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
+		LLVMBasicBlockRef bb_denorm     = LLVMAppendBasicBlockInContext(ctx, fn, "denorm");
+		LLVMBasicBlockRef bb_denorm_round = LLVMAppendBasicBlockInContext(ctx, fn, "denorm_round");
+		LLVMBasicBlockRef bb_denorm_end = LLVMAppendBasicBlockInContext(ctx, fn, "denorm_end");
+		LLVMBasicBlockRef bb_inf_nan    = LLVMAppendBasicBlockInContext(ctx, fn, "inf_nan");
+		LLVMBasicBlockRef bb_inf        = LLVMAppendBasicBlockInContext(ctx, fn, "inf");
+		LLVMBasicBlockRef bb_nan        = LLVMAppendBasicBlockInContext(ctx, fn, "nan");
+		LLVMBasicBlockRef bb_normal     = LLVMAppendBasicBlockInContext(ctx, fn, "normal");
+		LLVMBasicBlockRef bb_norm_round = LLVMAppendBasicBlockInContext(ctx, fn, "norm_round");
+		LLVMBasicBlockRef bb_norm_carry = LLVMAppendBasicBlockInContext(ctx, fn, "norm_carry");
+		LLVMBasicBlockRef bb_norm_end   = LLVMAppendBasicBlockInContext(ctx, fn, "norm_end");
+		LLVMBasicBlockRef bb_overflow   = LLVMAppendBasicBlockInContext(ctx, fn, "overflow");
+		LLVMBasicBlockRef bb_norm_done  = LLVMAppendBasicBlockInContext(ctx, fn, "norm_done");
+		LLVMBasicBlockRef bb_ret        = LLVMAppendBasicBlockInContext(ctx, fn, "ret");
+
+		LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
+		LLVMPositionBuilderAtEnd(b, entry);
+
+		LLVMValueRef value = LLVMGetParam(fn, 0); // float
+		LLVMValueRef i = LLVMBuildBitCast(b, value, i32_type, "i");
+
+		// s = (i >> 16) & 0x8000
+		LLVMValueRef s = LLVMBuildLShr(b, i, LLVMConstInt(i32_type, 16, false), "s_shift");
+		s = LLVMBuildAnd(b, s, LLVMConstInt(i32_type, 0x8000, false), "s");
+
+		// e = ((i >> 23) & 0xFF) - 112  (127 - 15 = 112)
+		LLVMValueRef e = LLVMBuildLShr(b, i, LLVMConstInt(i32_type, 23, false), "e_shift");
+		e = LLVMBuildAnd(b, e, LLVMConstInt(i32_type, 0xFF, false), "e_masked");
+		e = LLVMBuildSub(b, e, LLVMConstInt(i32_type, 112, false), "e"); // signed
+
+		// m = i & 0x007FFFFF
+		LLVMValueRef m = LLVMBuildAnd(b, i, LLVMConstInt(i32_type, 0x007FFFFF, false), "m");
+
+		// if (e <= 0) goto denorm; else if (e == 0xFF - 112) goto inf_nan; else goto normal
+		LLVMValueRef e_le_0 = LLVMBuildICmp(b, LLVMIntSLE, e, LLVMConstInt(i32_type, 0, false), "e_le_0");
+		LLVMBuildCondBr(b, e_le_0, bb_denorm, bb_inf_nan);
+
+		// --- denorm block ---
+		LLVMPositionBuilderAtEnd(b, bb_denorm);
+		// if (e < -10) return s
+		LLVMValueRef e_lt_neg10 = LLVMBuildICmp(b, LLVMIntSLT, e, LLVMConstInt(i32_type, (uint64_t)(int32_t)-10, false), "e_lt_neg10");
+		LLVMBuildCondBr(b, e_lt_neg10, bb_ret, bb_denorm_round);
+
+		// --- denorm_round block ---
+		LLVMPositionBuilderAtEnd(b, bb_denorm_round);
+		// m = (m | 0x00800000) >> (1 - e)
+		LLVMValueRef m_or = LLVMBuildOr(b, m, LLVMConstInt(i32_type, 0x00800000, false), "m_or");
+		LLVMValueRef shift_amt = LLVMBuildSub(b, LLVMConstInt(i32_type, 1, false), e, "shift_amt");
+		LLVMValueRef m_shifted = LLVMBuildLShr(b, m_or, shift_amt, "m_shifted");
+		// if (m_shifted & 0x1000) m_shifted += 0x2000
+		LLVMValueRef round_bit = LLVMBuildAnd(b, m_shifted, LLVMConstInt(i32_type, 0x1000, false), "round_bit");
+		LLVMValueRef needs_round = LLVMBuildICmp(b, LLVMIntNE, round_bit, LLVMConstInt(i32_type, 0, false), "needs_round");
+		LLVMBuildCondBr(b, needs_round, bb_denorm_end, bb_denorm_end);
+
+		// --- denorm_end block (with phi for rounding) ---
+		// Actually both branches go here, just do the conditional add
+		LLVMPositionBuilderAtEnd(b, bb_denorm_end);
+		LLVMValueRef m_rounded = LLVMBuildAdd(b, m_shifted, LLVMConstInt(i32_type, 0x2000, false), "m_rounded");
+		LLVMValueRef m_denorm = LLVMBuildSelect(b, needs_round, m_rounded, m_shifted, "m_denorm");
+		// return s | (m_denorm >> 13)
+		LLVMValueRef m_final_d = LLVMBuildLShr(b, m_denorm, LLVMConstInt(i32_type, 13, false), "m_final_d");
+		LLVMValueRef res_d = LLVMBuildOr(b, s, m_final_d, "res_d");
+		LLVMValueRef res_d_i16 = LLVMBuildTrunc(b, res_d, i16_type, "res_d_i16");
+		LLVMBuildRet(b, res_d_i16);
+
+		// --- inf_nan block ---
+		LLVMPositionBuilderAtEnd(b, bb_inf_nan);
+		LLVMValueRef e_is_inf_nan = LLVMBuildICmp(b, LLVMIntEQ, e, LLVMConstInt(i32_type, 0xFF - 112, false), "e_is_inf_nan");
+		LLVMBuildCondBr(b, e_is_inf_nan, bb_inf, bb_normal);
+
+		// --- inf block ---
+		LLVMPositionBuilderAtEnd(b, bb_inf);
+		LLVMValueRef m_is_zero = LLVMBuildICmp(b, LLVMIntEQ, m, LLVMConstInt(i32_type, 0, false), "m_is_zero");
+		LLVMBuildCondBr(b, m_is_zero, bb_ret, bb_nan);
+
+		// For inf: result = s | 0x7C00 (handled in ret block via phi)
+
+		// --- nan block ---
+		LLVMPositionBuilderAtEnd(b, bb_nan);
+		LLVMValueRef m_nan = LLVMBuildLShr(b, m, LLVMConstInt(i32_type, 13, false), "m_nan");
+		LLVMValueRef m_nan_zero = LLVMBuildICmp(b, LLVMIntEQ, m_nan, LLVMConstInt(i32_type, 0, false), "m_nan_zero");
+		LLVMValueRef m_nan_fix = LLVMBuildSelect(b, m_nan_zero, LLVMConstInt(i32_type, 1, false), LLVMConstInt(i32_type, 0, false), "m_nan_fix");
+		LLVMValueRef res_nan = LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, false), "res_nan_1");
+		res_nan = LLVMBuildOr(b, res_nan, m_nan, "res_nan_2");
+		res_nan = LLVMBuildOr(b, res_nan, m_nan_fix, "res_nan");
+		LLVMValueRef res_nan_i16 = LLVMBuildTrunc(b, res_nan, i16_type, "res_nan_i16");
+		LLVMBuildRet(b, res_nan_i16);
+
+		// --- normal block ---
+		LLVMPositionBuilderAtEnd(b, bb_normal);
+		// if (m & 0x1000) { m += 0x2000; if (m & 0x800000) { m=0; e+=1; } }
+		LLVMValueRef norm_round_bit = LLVMBuildAnd(b, m, LLVMConstInt(i32_type, 0x1000, false), "norm_round_bit");
+		LLVMValueRef norm_needs_round = LLVMBuildICmp(b, LLVMIntNE, norm_round_bit, LLVMConstInt(i32_type, 0, false), "norm_needs_round");
+		LLVMBuildCondBr(b, norm_needs_round, bb_norm_round, bb_norm_end);
+
+		// --- norm_round block ---
+		LLVMPositionBuilderAtEnd(b, bb_norm_round);
+		LLVMValueRef m_plus = LLVMBuildAdd(b, m, LLVMConstInt(i32_type, 0x2000, false), "m_plus");
+		LLVMValueRef carry_bit = LLVMBuildAnd(b, m_plus, LLVMConstInt(i32_type, 0x00800000, false), "carry_bit");
+		LLVMValueRef has_carry = LLVMBuildICmp(b, LLVMIntNE, carry_bit, LLVMConstInt(i32_type, 0, false), "has_carry");
+		LLVMBuildCondBr(b, has_carry, bb_norm_carry, bb_norm_end);
+
+		// --- norm_carry block ---
+		LLVMPositionBuilderAtEnd(b, bb_norm_carry);
+		LLVMValueRef e_plus = LLVMBuildAdd(b, e, LLVMConstInt(i32_type, 1, false), "e_plus");
+		LLVMBuildBr(b, bb_norm_end);
+
+		// --- norm_end block (phi for m and e) ---
+		LLVMPositionBuilderAtEnd(b, bb_norm_end);
+		LLVMValueRef m_phi = LLVMBuildPhi(b, i32_type, "m_phi");
+		LLVMValueRef e_phi = LLVMBuildPhi(b, i32_type, "e_phi");
+
+		LLVMValueRef m_vals[] = { m, m_plus, LLVMConstInt(i32_type, 0, false) };
+		LLVMBasicBlockRef m_bbs[] = { bb_normal, bb_norm_round, bb_norm_carry };
+		LLVMAddIncoming(m_phi, m_vals, m_bbs, 3);
+
+		LLVMValueRef e_vals[] = { e, e, e_plus };
+		LLVMBasicBlockRef e_bbs[] = { bb_normal, bb_norm_round, bb_norm_carry };
+		LLVMAddIncoming(e_phi, e_vals, e_bbs, 3);
+
+		// if (e > 30) goto overflow; else goto norm_done
+		LLVMValueRef e_gt_30 = LLVMBuildICmp(b, LLVMIntSGT, e_phi, LLVMConstInt(i32_type, 30, false), "e_gt_30");
+		LLVMBuildCondBr(b, e_gt_30, bb_overflow, bb_norm_done);
+
+		// --- overflow block ---
+		LLVMPositionBuilderAtEnd(b, bb_overflow);
+		LLVMValueRef res_ovf = LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, false), "res_ovf");
+		LLVMValueRef res_ovf_i16 = LLVMBuildTrunc(b, res_ovf, i16_type, "res_ovf_i16");
+		LLVMBuildRet(b, res_ovf_i16);
+
+		// --- norm_done block ---
+		LLVMPositionBuilderAtEnd(b, bb_norm_done);
+		// return s | (e << 10) | (m >> 13)
+		LLVMValueRef e_shifted = LLVMBuildShl(b, e_phi, LLVMConstInt(i32_type, 10, false), "e_shifted");
+		LLVMValueRef m_shifted2 = LLVMBuildLShr(b, m_phi, LLVMConstInt(i32_type, 13, false), "m_shifted2");
+		LLVMValueRef res_n = LLVMBuildOr(b, s, e_shifted, "res_n_1");
+		res_n = LLVMBuildOr(b, res_n, m_shifted2, "res_n");
+		LLVMValueRef res_n_i16 = LLVMBuildTrunc(b, res_n, i16_type, "res_n_i16");
+		LLVMBuildRet(b, res_n_i16);
+
+		// --- ret block (for early returns: denorm tiny and inf) ---
+		LLVMPositionBuilderAtEnd(b, bb_ret);
+		// phi: from denorm (e < -10) -> s, from inf (m==0) -> s | 0x7C00
+		LLVMValueRef ret_phi = LLVMBuildPhi(b, i32_type, "ret_phi");
+		LLVMValueRef s_inf = LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, false), "s_inf");
+		// We need the values from the right blocks. But s_inf uses s which is from entry.
+		// Actually we can't use s_inf here because it's built in bb_ret after the phi.
+		// Let's restructure: build the or in the inf block instead.
+		LLVMDisposeBuilder(b);
+
+		// Rebuild: we need to restructure inf block to compute s|0x7C00 there and branch to ret.
+		// Actually let's just redo this more carefully. Remove and rebuild.
+		LLVMDeleteBasicBlock(bb_ret);
+		// The ret block phi approach is messy. Let's just emit returns directly in denorm and inf blocks.
+		// But we already built those blocks... Let's use a different approach:
+		// Instead of a shared ret block, emit returns directly. We need to fix the denorm and inf blocks.
+
+		// The denorm block branches to bb_ret on e < -10. We need to replace that.
+		// Let's create a new block for tiny denorm return and inf return.
+		LLVMBasicBlockRef bb_tiny_ret = LLVMAppendBasicBlockInContext(ctx, fn, "tiny_ret");
+		LLVMBasicBlockRef bb_inf_ret = LLVMAppendBasicBlockInContext(ctx, fn, "inf_ret");
+
+		// Fix denorm block: replace conditional branch target
+		// Actually, the blocks are already emitted. We can't easily change the terminator.
+		// Let me take a step back and not use a shared ret block at all.
+		// Unfortunately we already emitted everything. Let's just build returns in the new blocks
+		// and redirect. But we can't change existing terminators with the C API easily.
+
+		// Simpler approach: just build in bb_ret with the right logic using two incoming edges.
+		LLVMBasicBlockRef bb_ret2 = LLVMAppendBasicBlockInContext(ctx, fn, "ret");
+
+		// We need to replace bb_ret references in the already-built branches.
+		// Since we deleted bb_ret, those branches are now dangling. This won't work well.
+
+		// Let's start over for __truncsfhf2 with a cleaner approach.
+		LLVMDeleteFunction(fn);
+		fn = LLVMAddFunction(mod, "__truncsfhf2", fn_type);
+		LLVMSetLinkage(fn, LLVMWeakAnyLinkage);
+
+		entry          = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
+		bb_denorm      = LLVMAppendBasicBlockInContext(ctx, fn, "denorm");
+		bb_denorm_round = LLVMAppendBasicBlockInContext(ctx, fn, "denorm_round");
+		bb_denorm_end  = LLVMAppendBasicBlockInContext(ctx, fn, "denorm_end");
+		bb_tiny_ret    = LLVMAppendBasicBlockInContext(ctx, fn, "tiny_ret");
+		bb_inf_nan     = LLVMAppendBasicBlockInContext(ctx, fn, "inf_nan");
+		bb_inf         = LLVMAppendBasicBlockInContext(ctx, fn, "inf");
+		LLVMBasicBlockRef bb_inf_ret2 = LLVMAppendBasicBlockInContext(ctx, fn, "inf_ret");
+		bb_nan         = LLVMAppendBasicBlockInContext(ctx, fn, "nan");
+		bb_normal      = LLVMAppendBasicBlockInContext(ctx, fn, "normal");
+		bb_norm_round  = LLVMAppendBasicBlockInContext(ctx, fn, "norm_round");
+		bb_norm_carry  = LLVMAppendBasicBlockInContext(ctx, fn, "norm_carry");
+		bb_norm_end    = LLVMAppendBasicBlockInContext(ctx, fn, "norm_end");
+		bb_overflow    = LLVMAppendBasicBlockInContext(ctx, fn, "overflow");
+		bb_norm_done   = LLVMAppendBasicBlockInContext(ctx, fn, "norm_done");
+
+		b = LLVMCreateBuilderInContext(ctx);
+
+		// --- entry ---
+		LLVMPositionBuilderAtEnd(b, entry);
+		value = LLVMGetParam(fn, 0);
+		i = LLVMBuildBitCast(b, value, i32_type, "i");
+		s = LLVMBuildLShr(b, i, LLVMConstInt(i32_type, 16, false), "s_shift");
+		s = LLVMBuildAnd(b, s, LLVMConstInt(i32_type, 0x8000, false), "s");
+		e = LLVMBuildLShr(b, i, LLVMConstInt(i32_type, 23, false), "e_shift");
+		e = LLVMBuildAnd(b, e, LLVMConstInt(i32_type, 0xFF, false), "e_masked");
+		e = LLVMBuildSub(b, e, LLVMConstInt(i32_type, 112, false), "e");
+		m = LLVMBuildAnd(b, i, LLVMConstInt(i32_type, 0x007FFFFF, false), "m");
+		e_le_0 = LLVMBuildICmp(b, LLVMIntSLE, e, LLVMConstInt(i32_type, 0, false), "e_le_0");
+		LLVMBuildCondBr(b, e_le_0, bb_denorm, bb_inf_nan);
+
+		// --- denorm ---
+		LLVMPositionBuilderAtEnd(b, bb_denorm);
+		e_lt_neg10 = LLVMBuildICmp(b, LLVMIntSLT, e, LLVMConstInt(i32_type, (uint64_t)(int32_t)-10, false), "e_lt_neg10");
+		LLVMBuildCondBr(b, e_lt_neg10, bb_tiny_ret, bb_denorm_round);
+
+		// --- tiny_ret: return s ---
+		LLVMPositionBuilderAtEnd(b, bb_tiny_ret);
+		LLVMBuildRet(b, LLVMBuildTrunc(b, s, i16_type, "tiny_ret_val"));
+
+		// --- denorm_round ---
+		LLVMPositionBuilderAtEnd(b, bb_denorm_round);
+		m_or = LLVMBuildOr(b, m, LLVMConstInt(i32_type, 0x00800000, false), "m_or");
+		shift_amt = LLVMBuildSub(b, LLVMConstInt(i32_type, 1, false), e, "shift_amt");
+		m_shifted = LLVMBuildLShr(b, m_or, shift_amt, "m_shifted");
+		round_bit = LLVMBuildAnd(b, m_shifted, LLVMConstInt(i32_type, 0x1000, false), "round_bit");
+		needs_round = LLVMBuildICmp(b, LLVMIntNE, round_bit, LLVMConstInt(i32_type, 0, false), "needs_round");
+		LLVMBuildCondBr(b, needs_round, bb_denorm_end, bb_denorm_end);
+
+		// --- denorm_end ---
+		LLVMPositionBuilderAtEnd(b, bb_denorm_end);
+		m_rounded = LLVMBuildAdd(b, m_shifted, LLVMConstInt(i32_type, 0x2000, false), "m_rounded");
+		m_denorm = LLVMBuildSelect(b, needs_round, m_rounded, m_shifted, "m_denorm");
+		m_final_d = LLVMBuildLShr(b, m_denorm, LLVMConstInt(i32_type, 13, false), "m_final_d");
+		res_d = LLVMBuildOr(b, s, m_final_d, "res_d");
+		res_d_i16 = LLVMBuildTrunc(b, res_d, i16_type, "res_d_i16");
+		LLVMBuildRet(b, res_d_i16);
+
+		// --- inf_nan ---
+		LLVMPositionBuilderAtEnd(b, bb_inf_nan);
+		e_is_inf_nan = LLVMBuildICmp(b, LLVMIntEQ, e, LLVMConstInt(i32_type, 0xFF - 112, false), "e_is_inf_nan");
+		LLVMBuildCondBr(b, e_is_inf_nan, bb_inf, bb_normal);
+
+		// --- inf ---
+		LLVMPositionBuilderAtEnd(b, bb_inf);
+		m_is_zero = LLVMBuildICmp(b, LLVMIntEQ, m, LLVMConstInt(i32_type, 0, false), "m_is_zero");
+		LLVMBuildCondBr(b, m_is_zero, bb_inf_ret2, bb_nan);
+
+		// --- inf_ret: return s | 0x7C00 ---
+		LLVMPositionBuilderAtEnd(b, bb_inf_ret2);
+		{
+			LLVMValueRef inf_val = LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, false), "inf_val");
+			LLVMBuildRet(b, LLVMBuildTrunc(b, inf_val, i16_type, "inf_ret_val"));
+		}
+
+		// --- nan ---
+		LLVMPositionBuilderAtEnd(b, bb_nan);
+		m_nan = LLVMBuildLShr(b, m, LLVMConstInt(i32_type, 13, false), "m_nan");
+		m_nan_zero = LLVMBuildICmp(b, LLVMIntEQ, m_nan, LLVMConstInt(i32_type, 0, false), "m_nan_zero");
+		m_nan_fix = LLVMBuildSelect(b, m_nan_zero, LLVMConstInt(i32_type, 1, false), LLVMConstInt(i32_type, 0, false), "m_nan_fix");
+		res_nan = LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, false), "res_nan_1");
+		res_nan = LLVMBuildOr(b, res_nan, m_nan, "res_nan_2");
+		res_nan = LLVMBuildOr(b, res_nan, m_nan_fix, "res_nan");
+		res_nan_i16 = LLVMBuildTrunc(b, res_nan, i16_type, "res_nan_i16");
+		LLVMBuildRet(b, res_nan_i16);
+
+		// --- normal ---
+		LLVMPositionBuilderAtEnd(b, bb_normal);
+		norm_round_bit = LLVMBuildAnd(b, m, LLVMConstInt(i32_type, 0x1000, false), "norm_round_bit");
+		norm_needs_round = LLVMBuildICmp(b, LLVMIntNE, norm_round_bit, LLVMConstInt(i32_type, 0, false), "norm_needs_round");
+		LLVMBuildCondBr(b, norm_needs_round, bb_norm_round, bb_norm_end);
+
+		// --- norm_round ---
+		LLVMPositionBuilderAtEnd(b, bb_norm_round);
+		m_plus = LLVMBuildAdd(b, m, LLVMConstInt(i32_type, 0x2000, false), "m_plus");
+		carry_bit = LLVMBuildAnd(b, m_plus, LLVMConstInt(i32_type, 0x00800000, false), "carry_bit");
+		has_carry = LLVMBuildICmp(b, LLVMIntNE, carry_bit, LLVMConstInt(i32_type, 0, false), "has_carry");
+		LLVMBuildCondBr(b, has_carry, bb_norm_carry, bb_norm_end);
+
+		// --- norm_carry ---
+		LLVMPositionBuilderAtEnd(b, bb_norm_carry);
+		e_plus = LLVMBuildAdd(b, e, LLVMConstInt(i32_type, 1, false), "e_plus");
+		LLVMBuildBr(b, bb_norm_end);
+
+		// --- norm_end (phi) ---
+		LLVMPositionBuilderAtEnd(b, bb_norm_end);
+		m_phi = LLVMBuildPhi(b, i32_type, "m_phi");
+		e_phi = LLVMBuildPhi(b, i32_type, "e_phi");
+		{
+			LLVMValueRef m_v[] = { m, m_plus, LLVMConstInt(i32_type, 0, false) };
+			LLVMBasicBlockRef m_b[] = { bb_normal, bb_norm_round, bb_norm_carry };
+			LLVMAddIncoming(m_phi, m_v, m_b, 3);
+			LLVMValueRef e_v[] = { e, e, e_plus };
+			LLVMBasicBlockRef e_b[] = { bb_normal, bb_norm_round, bb_norm_carry };
+			LLVMAddIncoming(e_phi, e_v, e_b, 3);
+		}
+		e_gt_30 = LLVMBuildICmp(b, LLVMIntSGT, e_phi, LLVMConstInt(i32_type, 30, false), "e_gt_30");
+		LLVMBuildCondBr(b, e_gt_30, bb_overflow, bb_norm_done);
+
+		// --- overflow ---
+		LLVMPositionBuilderAtEnd(b, bb_overflow);
+		res_ovf = LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, false), "res_ovf");
+		res_ovf_i16 = LLVMBuildTrunc(b, res_ovf, i16_type, "res_ovf_i16");
+		LLVMBuildRet(b, res_ovf_i16);
+
+		// --- norm_done ---
+		LLVMPositionBuilderAtEnd(b, bb_norm_done);
+		e_shifted = LLVMBuildShl(b, e_phi, LLVMConstInt(i32_type, 10, false), "e_shifted");
+		m_shifted2 = LLVMBuildLShr(b, m_phi, LLVMConstInt(i32_type, 13, false), "m_shifted2");
+		res_n = LLVMBuildOr(b, s, e_shifted, "res_n_1");
+		res_n = LLVMBuildOr(b, res_n, m_shifted2, "res_n");
+		res_n_i16 = LLVMBuildTrunc(b, res_n, i16_type, "res_n_i16");
+		LLVMBuildRet(b, res_n_i16);
+
+		LLVMDisposeBuilder(b);
+	}
+}
+
 gb_internal bool lb_generate_code(lbGenerator *gen) {
 	TIME_SECTION("LLVM Initializtion");
 
@@ -3723,6 +4107,11 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 	TIME_SECTION("LLVM Procedure Generation (missing)");
 	lb_generate_missing_procedures(gen, do_threading);
+
+	if (build_context.lto_kind != LTO_None) {
+		TIME_SECTION("LLVM LTO Soft-Float Builtins");
+		lb_emit_lto_soft_float_builtins(default_module);
+	}
 
 	if (gen->objc_names) {
 		TIME_SECTION("Finalize objc names");
