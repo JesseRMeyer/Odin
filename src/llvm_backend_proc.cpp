@@ -1216,7 +1216,9 @@ gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> c
 				return_ptr = lb_add_local_generated(p, rt, true).addr;
 			}
 			lb_emit_call_internal(p, value, return_ptr, processed_args, nullptr, context_ptr, inlining, tailing);
-			result = lb_emit_load(p, return_ptr);
+			if (sret_dest == nullptr) {
+				result = lb_emit_load(p, return_ptr);
+			}
 		} else if (rt != nullptr) {
 			result = lb_emit_call_internal(p, value, {}, processed_args, rt, context_ptr, inlining, tailing);
 			if (ft->ret.cast_type) {
