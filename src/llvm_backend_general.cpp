@@ -74,11 +74,24 @@ gb_internal WORKER_TASK_PROC(lb_init_module_worker_proc) {
 			break;
 
 		case TargetOs_darwin:
-			// NOTE(bill): Darwin only supports DWARF2 (that I know of)
 			LLVMAddModuleFlag(m->mod,
 				LLVMModuleFlagBehaviorWarning,
 				"Dwarf Version", 13,
-				LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(m->ctx), 2, true)));
+				LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(m->ctx), 4, true)));
+			break;
+		default:
+			// Use DWARF5 with lld/mold which handle .debug_str_offsets correctly.
+			// Fall back to DWARF4 with GNU ld which tail-merges .debug_str strings,
+			// creating offsets that fail DWARF5 .debug_str_offsets verification.
+			{
+				int dwarf_version = (build_context.linker_choice == Linker_lld ||
+				                     build_context.linker_choice == Linker_mold)
+				                    ? 5 : 4;
+				LLVMAddModuleFlag(m->mod,
+					LLVMModuleFlagBehaviorWarning,
+					"Dwarf Version", 13,
+					LLVMValueAsMetadata(LLVMConstInt(LLVMInt32TypeInContext(m->ctx), dwarf_version, true)));
+			}
 			break;
 		}
 		m->debug_builder = LLVMCreateDIBuilder(m->mod);
