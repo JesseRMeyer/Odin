@@ -19,6 +19,20 @@
 
 
 #include "llvm_backend.hpp"
+
+// LLVM C++ headers for DIBuilder, TargetMachine, and split-DWARF emission.
+// gb.h defines 'cast' as a C-style cast macro, which conflicts with llvm::cast.
+#if !defined(GB_SYSTEM_WINDOWS)
+#pragma push_macro("cast")
+#undef cast
+#include <llvm/Target/TargetMachine.h>
+#include <llvm/MC/MCTargetOptions.h>
+#include <llvm/Support/FileSystem.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/IR/LegacyPassManager.h>
+#include <llvm-c/Support.h>
+#pragma pop_macro("cast")
+#endif
 #include "llvm_abi.cpp"
 #include "llvm_backend_opt.cpp"
 #include "llvm_backend_general.cpp"
@@ -2324,6 +2338,62 @@ gb_internal bool lb_is_module_empty(lbModule *m) {
 	return true;
 }
 
+gb_internal bool lb_split_dwarf_enabled() {
+	return build_context.ODIN_DEBUG
+		&& build_context.split_dwarf
+		&& build_context.metrics.os != TargetOs_windows;
+}
+
+#if !defined(GB_SYSTEM_WINDOWS)
+// Emit an object file with a separate .dwo output stream for split DWARF.
+gb_internal bool lb_emit_object_file_with_dwo(
+	LLVMTargetMachineRef target_machine,
+	LLVMModuleRef mod,
+	char const *obj_path,
+	LLVMCodeGenFileType file_type,
+	char const *dwo_path)
+{
+	#pragma push_macro("cast")
+	#undef cast
+	auto *TM = reinterpret_cast<llvm::TargetMachine *>(target_machine);
+	auto *M = reinterpret_cast<llvm::Module *>(mod);
+
+	llvm::CodeGenFileType cgft;
+	switch (file_type) {
+	case LLVMAssemblyFile: cgft = llvm::CodeGenFileType::AssemblyFile; break;
+	default:               cgft = llvm::CodeGenFileType::ObjectFile;   break;
+	}
+
+	std::error_code EC;
+	llvm::raw_fd_ostream obj_out(obj_path, EC, llvm::sys::fs::OF_None);
+	if (EC) {
+		gb_printf_err("Failed to open output file '%s': %s\n", obj_path, EC.message().c_str());
+		return false;
+	}
+
+	assert(dwo_path && dwo_path[0]);
+	std::error_code DWO_EC;
+	llvm::raw_fd_ostream dwo_out(dwo_path, DWO_EC, llvm::sys::fs::OF_None);
+	if (DWO_EC) {
+		gb_printf_err("Failed to open DWO file '%s': %s\n", dwo_path, DWO_EC.message().c_str());
+		return false;
+	}
+
+	llvm::legacy::PassManager pass;
+	if (TM->addPassesToEmitFile(pass, obj_out, &dwo_out, cgft)) {
+		gb_printf_err("TargetMachine can't emit a file of this type\n");
+		return false;
+	}
+
+	pass.run(*M);
+	obj_out.flush();
+	dwo_out.flush();
+
+	#pragma pop_macro("cast")
+	return true;
+}
+#endif
+
 struct lbLLVMEmitWorker {
 	LLVMTargetMachineRef target_machine;
 	LLVMCodeGenFileType code_gen_file_type;
@@ -2338,11 +2408,26 @@ gb_internal WORKER_TASK_PROC(lb_llvm_emit_worker_proc) {
 
 	auto wd = cast(lbLLVMEmitWorker *)data;
 
+#if !defined(GB_SYSTEM_WINDOWS)
+	String dwo_path = {};
+	if (lb_split_dwarf_enabled()) {
+		dwo_path = lb_filepath_dwo_for_module(wd->m);
+	}
+#endif
+
 	if (build_context.lto_kind != LTO_None) {
 		if (LLVMWriteBitcodeToFile(wd->m->mod, cast(char *)wd->filepath_obj.text)) {
 			gb_printf_err("Failed to write bitcode file: %.*s\n", LIT(wd->filepath_obj));
 			exit_with_errors();
 		}
+#if !defined(GB_SYSTEM_WINDOWS)
+	} else if (dwo_path.len > 0) {
+		if (!lb_emit_object_file_with_dwo(wd->target_machine, wd->m->mod,
+			cast(char *)wd->filepath_obj.text, wd->code_gen_file_type,
+			cast(char *)dwo_path.text)) {
+			exit_with_errors();
+		}
+#endif
 	} else if (LLVMTargetMachineEmitToFile(wd->target_machine, wd->m->mod, cast(char *)wd->filepath_obj.text, wd->code_gen_file_type, &llvm_error)) {
 		gb_printf_err("LLVM Error: %s\n", llvm_error);
 		exit_with_errors();
@@ -2737,6 +2822,29 @@ gb_internal String lb_filepath_obj_for_module(lbModule *m) {
 
 }
 
+gb_internal String lb_filepath_dwo_for_module(lbModule *m) {
+	String basename = build_context.build_paths[BuildPath_Output].basename;
+	gbString path = gb_string_make_length(permanent_allocator(), basename.text, basename.len);
+	path = gb_string_appendc(path, "/");
+
+	if (USE_SEPARATE_MODULES) {
+		GB_ASSERT(m->module_name != nullptr);
+		String s = make_string_c(m->module_name);
+		String prefix = str_lit("odin_package");
+		if (string_starts_with(s, prefix)) {
+			s.text += prefix.len;
+			s.len  -= prefix.len;
+		}
+		path = gb_string_append_length(path, s.text, s.len);
+	} else {
+		String name = build_context.build_paths[BuildPath_Output].name;
+		path = gb_string_append_length(path, name.text, name.len);
+	}
+
+	path = gb_string_appendc(path, ".dwo");
+	return make_string(cast(u8 *)path, gb_string_length(path));
+}
+
 gb_internal void lb_add_foreign_library_paths(lbGenerator *gen) {
 	for (auto const &entry : gen->modules) {
 		lbModule *m = entry.value;
@@ -2796,12 +2904,28 @@ gb_internal bool lb_llvm_object_generation(lbGenerator *gen, bool do_threading) 
 
 			TIME_SECTION_WITH_LEN(section_name, gb_string_length(section_name));
 
+		#if !defined(GB_SYSTEM_WINDOWS)
+			String dwo_path = {};
+			if (lb_split_dwarf_enabled()) {
+				dwo_path = lb_filepath_dwo_for_module(m);
+			}
+		#endif
+
 			if (build_context.lto_kind != LTO_None) {
 				if (LLVMWriteBitcodeToFile(m->mod, cast(char *)filepath_obj.text)) {
 					gb_printf_err("Failed to write bitcode file: %.*s\n", LIT(filepath_obj));
 					exit_with_errors();
 					return false;
 				}
+		#if !defined(GB_SYSTEM_WINDOWS)
+			} else if (dwo_path.len > 0) {
+				if (!lb_emit_object_file_with_dwo(m->target_machine, m->mod,
+					cast(char *)filepath_obj.text, code_gen_file_type,
+					cast(char *)dwo_path.text)) {
+					exit_with_errors();
+					return false;
+				}
+		#endif
 			} else if (LLVMTargetMachineEmitToFile(m->target_machine, m->mod, cast(char *)filepath_obj.text, code_gen_file_type, &llvm_error)) {
 				gb_printf_err("LLVM Error: %s\n", llvm_error);
 				exit_with_errors();
@@ -3074,6 +3198,21 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		LLVMInitializeNativeTarget();
 	}
 
+#if !defined(GB_SYSTEM_WINDOWS)
+	// NOTE: LLVMParseCommandLineOptions sets global LLVM cl::opt flags that persist
+	// for the lifetime of the process. This is the standard way external consumers
+	// inject flags like -generate-type-units that have no API-level control.
+	// Type units reduce .debug_info size by deduplicating type DIEs across CUs.
+	// Safe with DWARF4 (default linker) and DWARF5 (lld/mold).
+	#if 1
+	if (build_context.ODIN_DEBUG && build_context.debug_mode != DebugMode_Minimal
+	    && build_context.metrics.os != TargetOs_windows) {
+		const char *args[] = {"odin", "-generate-type-units"};
+		LLVMParseCommandLineOptions(2, args, nullptr);
+	}
+	#endif
+#endif
+
 	char const *target_triple = alloc_cstring(permanent_allocator(), build_context.metrics.target_triplet);
 	for (auto const &entry : gen->modules) {
 		LLVMSetTarget(entry.value->mod, target_triple);
@@ -3182,6 +3321,14 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 		m->target_machine = target_machine;
 		LLVMSetModuleDataLayout(m->mod, LLVMCreateTargetDataLayout(target_machine));
 
+	#if !defined(GB_SYSTEM_WINDOWS)
+		if (lb_split_dwarf_enabled()) {
+			auto *TM = reinterpret_cast<llvm::TargetMachine *>(target_machine);
+			String dwo = lb_filepath_dwo_for_module(m);
+			TM->Options.MCOptions.SplitDwarfFile = std::string((char*)dwo.text, dwo.len);
+		}
+	#endif
+
 	#if LLVM_VERSION_MAJOR >= 18
 		if (build_context.fast_isel) {
 			LLVMSetTargetMachineFastISel(m->target_machine, true);
@@ -3214,6 +3361,10 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			// #endif
 
 			gbString split_name = gb_string_make(temporary_allocator(), "");
+			if (lb_split_dwarf_enabled()) {
+				String dwo = lb_filepath_dwo_for_module(m);
+				split_name = gb_string_make_length(temporary_allocator(), dwo.text, dwo.len);
+			}
 
 			LLVMBool is_optimized = build_context.optimization_level > 0;
 			AstFile *init_file = m->info->init_package->files[0];
@@ -3461,7 +3612,7 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			lb_append_to_compiler_used(m, g.value);
 		}
 
-		if (m->debug_builder) {
+		if (m->debug_builder && build_context.debug_mode != DebugMode_Minimal) {
 			String global_name = e->token.string;
 			if (global_name.len != 0 && global_name != "_") {
 				LLVMMetadataRef llvm_file = lb_get_llvm_metadata(m, e->file);

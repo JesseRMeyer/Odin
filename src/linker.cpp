@@ -988,6 +988,9 @@ try_cross_linking:;
 			link_command_line = gb_string_append_fmt(link_command_line, " %.*s ", LIT(build_context.extra_linker_flags));
 			link_command_line = gb_string_append_fmt(link_command_line, " %s ", link_settings);
 
+			if (build_context.ODIN_DEBUG && build_context.compress_debug_sections && !is_osx) {
+				link_command_line = gb_string_appendc(link_command_line, " -Wl,--compress-debug-sections=zstd ");
+			}
 
 			if (is_android) {
 				TIME_SECTION("Linking");
