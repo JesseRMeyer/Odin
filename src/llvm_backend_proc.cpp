@@ -669,7 +669,7 @@ gb_internal void lb_begin_procedure_body(lbProcedure *p) {
 						bool do_callee_copy = false;
 
 						if (is_odin_cc) {
-							do_callee_copy = sz <= 16;
+							do_callee_copy = false;
 							if (build_context.internal_by_value) {
 								do_callee_copy = true;
 							}
@@ -1040,15 +1040,13 @@ gb_internal lbValue lb_emit_conjugate(lbProcedure *p, lbValue val, Type *type) {
 	lbValue res = {};
 	Type *t = val.type;
 	if (is_type_complex(t)) {
-		res = lb_addr_get_ptr(p, lb_add_local_generated(p, type, false));
 		lbValue real = lb_emit_struct_ev(p, val, 0);
 		lbValue imag = lb_emit_struct_ev(p, val, 1);
 		imag = lb_emit_unary_arith(p, Token_Sub, imag, imag.type);
-		lb_emit_store(p, lb_emit_struct_ep(p, res, 0), real);
-		lb_emit_store(p, lb_emit_struct_ep(p, res, 1), imag);
+		LLVMValueRef fields[2] = {real.value, imag.value};
+		return lb_build_aggregate(p, type, fields, 2);
 	} else if (is_type_quaternion(t)) {
 		// @QuaternionLayout
-		res = lb_addr_get_ptr(p, lb_add_local_generated(p, type, false));
 		lbValue real = lb_emit_struct_ev(p, val, 3);
 		lbValue imag = lb_emit_struct_ev(p, val, 0);
 		lbValue jmag = lb_emit_struct_ev(p, val, 1);
@@ -1056,10 +1054,8 @@ gb_internal lbValue lb_emit_conjugate(lbProcedure *p, lbValue val, Type *type) {
 		imag = lb_emit_unary_arith(p, Token_Sub, imag, imag.type);
 		jmag = lb_emit_unary_arith(p, Token_Sub, jmag, jmag.type);
 		kmag = lb_emit_unary_arith(p, Token_Sub, kmag, kmag.type);
-		lb_emit_store(p, lb_emit_struct_ep(p, res, 3), real);
-		lb_emit_store(p, lb_emit_struct_ep(p, res, 0), imag);
-		lb_emit_store(p, lb_emit_struct_ep(p, res, 1), jmag);
-		lb_emit_store(p, lb_emit_struct_ep(p, res, 2), kmag);
+		LLVMValueRef fields[4] = {imag.value, jmag.value, kmag.value, real.value};
+		return lb_build_aggregate(p, type, fields, 4);
 	} else if (is_type_array_like(t)) {
 		res = lb_addr_get_ptr(p, lb_add_local_generated(p, type, true));
 		Type *elem_type = base_array_type(t);
@@ -2412,16 +2408,12 @@ gb_internal lbValue lb_build_builtin_proc(lbProcedure *p, Ast *expr, TypeAndValu
 	case BuiltinProc_complex: {
 		lbValue real = lb_build_expr(p, ce->args[0]);
 		lbValue imag = lb_build_expr(p, ce->args[1]);
-		lbAddr dst_addr = lb_add_local_generated(p, tv.type, false);
-		lbValue dst = lb_addr_get_ptr(p, dst_addr);
 
 		Type *ft = base_complex_elem_type(tv.type);
 		real = lb_emit_conv(p, real, ft);
 		imag = lb_emit_conv(p, imag, ft);
-		lb_emit_store(p, lb_emit_struct_ep(p, dst, 0), real);
-		lb_emit_store(p, lb_emit_struct_ep(p, dst, 1), imag);
-
-		return lb_emit_load(p, dst);
+		LLVMValueRef fields[2] = {real.value, imag.value};
+		return lb_build_aggregate(p, tv.type, fields, 2);
 	}
 
 	case BuiltinProc_quaternion: {
@@ -2448,20 +2440,13 @@ gb_internal lbValue lb_build_builtin_proc(lbProcedure *p, Ast *expr, TypeAndValu
 		}
 
 
-		lbAddr dst_addr = lb_add_local_generated(p, tv.type, false);
-		lbValue dst = lb_addr_get_ptr(p, dst_addr);
-
 		Type *ft = base_complex_elem_type(tv.type);
 		xyzw[0] = lb_emit_conv(p, xyzw[0], ft);
 		xyzw[1] = lb_emit_conv(p, xyzw[1], ft);
 		xyzw[2] = lb_emit_conv(p, xyzw[2], ft);
 		xyzw[3] = lb_emit_conv(p, xyzw[3], ft);
-		lb_emit_store(p, lb_emit_struct_ep(p, dst, 0), xyzw[0]);
-		lb_emit_store(p, lb_emit_struct_ep(p, dst, 1), xyzw[1]);
-		lb_emit_store(p, lb_emit_struct_ep(p, dst, 2), xyzw[2]);
-		lb_emit_store(p, lb_emit_struct_ep(p, dst, 3), xyzw[3]);
-
-		return lb_emit_load(p, dst);
+		LLVMValueRef fields[4] = {xyzw[0].value, xyzw[1].value, xyzw[2].value, xyzw[3].value};
+		return lb_build_aggregate(p, tv.type, fields, 4);
 	}
 
 	case BuiltinProc_real: {
@@ -2534,29 +2519,30 @@ gb_internal lbValue lb_build_builtin_proc(lbProcedure *p, Ast *expr, TypeAndValu
 		}
 
 		GB_ASSERT(is_type_tuple(tv.type));
-		// NOTE(bill): Doesn't need to be zero because it will be initialized in the loops
-		lbValue tuple = lb_addr_get_ptr(p, lb_add_local_generated(p, tv.type, false));
 		if (t->kind == Type_Struct) {
+			isize count = t->Struct.fields.count;
+			LLVMValueRef *fields = gb_alloc_array(temporary_allocator(), LLVMValueRef, count);
 			for_array(src_index, t->Struct.fields) {
 				Entity *field = t->Struct.fields[src_index];
 				i32 field_index = field->Variable.field_index;
 				lbValue f = lb_emit_struct_ev(p, val, field_index);
-				lbValue ep = lb_emit_struct_ep(p, tuple, cast(i32)src_index);
-				lb_emit_store(p, ep, f);
+				fields[src_index] = f.value;
 			}
+			return lb_build_aggregate(p, tv.type, fields, count);
 		} else if (is_type_array_like(t)) {
 			// TODO(bill): Clean-up this code
 			lbValue ap = lb_address_from_load_or_generate_local(p, val);
 			i32 n = cast(i32)get_array_type_count(t);
+			LLVMValueRef *fields = gb_alloc_array(temporary_allocator(), LLVMValueRef, n);
 			for (i32 i = 0; i < n; i++) {
 				lbValue f = lb_emit_load(p, lb_emit_array_epi(p, ap, i));
-				lbValue ep = lb_emit_struct_ep(p, tuple, i);
-				lb_emit_store(p, ep, f);
+				fields[i] = f.value;
 			}
+			return lb_build_aggregate(p, tv.type, fields, n);
 		} else {
 			GB_PANIC("Unknown type of expand_values");
 		}
-		return lb_emit_load(p, tuple);
+		return {};
 	}
 
 	case BuiltinProc_compress_values: {

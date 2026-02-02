@@ -1204,11 +1204,7 @@ gb_internal LLVMMetadataRef lb_get_tbaa_access_tag(lbModule *m, Type *type) {
 	} else if (type->kind == Type_Pointer || type->kind == Type_MultiPointer) {
 		type_node = lb_get_tbaa_type_node(m, "pointer", 7);
 	} else if (type->kind == Type_Enum) {
-		// NOTE(bill): Enums are backed by integer types (e.g. u32). Code can access
-		// the same memory as both the enum type and its backing integer type via
-		// pointer casts. An "enum" TBAA tag would conflict with the backing type's
-		// tag (e.g. "u32") since they are siblings in the TBAA tree.
-		return nullptr;
+		return lb_get_tbaa_access_tag(m, type->Enum.base_type);
 	} else if (type->kind == Type_Slice) {
 		// NOTE(bill): Compound types must not have TBAA tags that conflict with
 		// their field types. See array comment below.
@@ -1232,8 +1228,8 @@ gb_internal LLVMMetadataRef lb_get_tbaa_access_tag(lbModule *m, Type *type) {
 		// field-type loads. A "aggregate" TBAA tag conflicts with element type tags.
 		return nullptr;
 	} else if (type->kind == Type_BitSet) {
-		// NOTE(bill): BitSets are backed by integer types; a "bitset" TBAA tag
-		// would conflict with the underlying integer type's tag.
+		Type *underlying = bit_set_to_int(type);
+		if (underlying) return lb_get_tbaa_access_tag(m, underlying);
 		return nullptr;
 	} else if (type->kind == Type_SimdVector) {
 		type_node = lb_get_tbaa_type_node(m, "simd_vector", 11);

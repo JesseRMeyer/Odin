@@ -4,7 +4,7 @@
 		array_add(&passes, "function(annotation-remarks)");
 		break;
 	case 0:
-		array_add(&passes, "function(dse,simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;no-switch-range-to-icmp;no-switch-to-lookup;keep-loops;no-hoist-common-insts;no-sink-common-insts;no-speculate-blocks;simplify-cond-branch>)");
+		array_add(&passes, "function(sroa<modify-cfg>,dse,simplifycfg<bonus-inst-threshold=1;no-forward-switch-cond;no-switch-range-to-icmp;no-switch-to-lookup;keep-loops;no-hoist-common-insts;no-sink-common-insts;no-speculate-blocks;simplify-cond-branch>)");
 		array_add(&passes, "always-inline");
 		array_add(&passes, "function(annotation-remarks)");
 		break;

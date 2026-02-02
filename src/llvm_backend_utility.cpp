@@ -191,8 +191,16 @@ gb_internal lbValue lb_emit_clamp(lbProcedure *p, Type *t, lbValue x, lbValue mi
 	return z;
 }
 
+gb_internal lbValue lb_build_aggregate(lbProcedure *p, Type *type, LLVMValueRef *fields, isize count) {
+	LLVMValueRef agg = LLVMGetPoison(lb_type(p->module, type));
+	for (isize i = 0; i < count; i++) {
+		agg = LLVMBuildInsertValue(p->builder, agg, fields[i], cast(unsigned)i, "");
+	}
+	return lbValue{agg, type};
+}
+
 gb_internal lbValue lb_emit_string16(lbProcedure *p, lbValue str_elem, lbValue str_len) {
-	if (false && lb_is_const(str_elem) && lb_is_const(str_len)) {
+	if (lb_is_const(str_elem) && lb_is_const(str_len)) {
 		LLVMValueRef values[2] = {
 			str_elem.value,
 			str_len.value,
@@ -202,16 +210,14 @@ gb_internal lbValue lb_emit_string16(lbProcedure *p, lbValue str_elem, lbValue s
 		res.value = llvm_const_named_struct(p->module, t_string16, values, gb_count_of(values));
 		return res;
 	} else {
-		lbAddr res = lb_add_local_generated(p, t_string16, false);
-		lb_emit_store(p, lb_emit_struct_ep(p, res.addr, 0), str_elem);
-		lb_emit_store(p, lb_emit_struct_ep(p, res.addr, 1), str_len);
-		return lb_addr_load(p, res);
+		LLVMValueRef fields[2] = {str_elem.value, str_len.value};
+		return lb_build_aggregate(p, t_string16, fields, 2);
 	}
 }
 
 
 gb_internal lbValue lb_emit_string(lbProcedure *p, lbValue str_elem, lbValue str_len) {
-	if (false && lb_is_const(str_elem) && lb_is_const(str_len)) {
+	if (lb_is_const(str_elem) && lb_is_const(str_len)) {
 		LLVMValueRef values[2] = {
 			str_elem.value,
 			str_len.value,
@@ -221,10 +227,8 @@ gb_internal lbValue lb_emit_string(lbProcedure *p, lbValue str_elem, lbValue str
 		res.value = llvm_const_named_struct(p->module, t_string, values, gb_count_of(values));
 		return res;
 	} else {
-		lbAddr res = lb_add_local_generated(p, t_string, false);
-		lb_emit_store(p, lb_emit_struct_ep(p, res.addr, 0), str_elem);
-		lb_emit_store(p, lb_emit_struct_ep(p, res.addr, 1), str_len);
-		return lb_addr_load(p, res);
+		LLVMValueRef fields[2] = {str_elem.value, str_len.value};
+		return lb_build_aggregate(p, t_string, fields, 2);
 	}
 }
 
@@ -358,17 +362,15 @@ gb_internal lbValue lb_soa_zip(lbProcedure *p, AstCallExpr *ce, TypeAndValue con
 	}
 
 	GB_ASSERT(is_type_soa_struct(tv.type));
-	lbAddr res = lb_add_local_generated(p, tv.type, true);
+	isize field_count = slices.count + 1;
+	LLVMValueRef *fields = gb_alloc_array(temporary_allocator(), LLVMValueRef, field_count);
 	for_array(i, slices) {
 		lbValue src = lb_slice_elem(p, slices[i]);
 		src = lb_emit_conv(p, src, alloc_type_pointer_to_multi_pointer(src.type));
-		lbValue dst = lb_emit_struct_ep(p, res.addr, cast(i32)i);
-		lb_emit_store(p, dst, src);
+		fields[i] = src.value;
 	}
-	lbValue len_dst = lb_emit_struct_ep(p, res.addr, cast(i32)slices.count);
-	lb_emit_store(p, len_dst, len);
-
-	return lb_addr_load(p, res);
+	fields[slices.count] = len.value;
+	return lb_build_aggregate(p, tv.type, fields, field_count);
 }
 
 gb_internal lbValue lb_soa_unzip(lbProcedure *p, AstCallExpr *ce, TypeAndValue const &tv) {

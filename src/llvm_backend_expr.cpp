@@ -239,28 +239,20 @@ gb_internal lbValue lb_emit_unary_arith(lbProcedure *p, TokenKind op, lbValue x,
 		} else if (is_type_float(x.type)) {
 			res.value = LLVMBuildFNeg(p->builder, x.value, "");
 		} else if (is_type_complex(x.type)) {
-			LLVMValueRef v0 = LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 0, ""), "");
-			LLVMValueRef v1 = LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 1, ""), "");
-
-			lbAddr addr = lb_add_local_generated(p, x.type, false);
-			LLVMTypeRef type = llvm_addr_type(p->module, addr.addr);
-			LLVMBuildStore(p->builder, v0, LLVMBuildStructGEP2(p->builder, type, addr.addr.value, 0, ""));
-			LLVMBuildStore(p->builder, v1, LLVMBuildStructGEP2(p->builder, type, addr.addr.value, 1, ""));
-			return lb_addr_load(p, addr);
+			LLVMValueRef fields[2] = {
+				LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 0, ""), ""),
+				LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 1, ""), ""),
+			};
+			return lb_build_aggregate(p, x.type, fields, 2);
 
 		} else if (is_type_quaternion(x.type)) {
-			LLVMValueRef v0 = LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 0, ""), "");
-			LLVMValueRef v1 = LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 1, ""), "");
-			LLVMValueRef v2 = LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 2, ""), "");
-			LLVMValueRef v3 = LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 3, ""), "");
-
-			lbAddr addr = lb_add_local_generated(p, x.type, false);
-			LLVMTypeRef type = llvm_addr_type(p->module, addr.addr);
-			LLVMBuildStore(p->builder, v0, LLVMBuildStructGEP2(p->builder, type, addr.addr.value, 0, ""));
-			LLVMBuildStore(p->builder, v1, LLVMBuildStructGEP2(p->builder, type, addr.addr.value, 1, ""));
-			LLVMBuildStore(p->builder, v2, LLVMBuildStructGEP2(p->builder, type, addr.addr.value, 2, ""));
-			LLVMBuildStore(p->builder, v3, LLVMBuildStructGEP2(p->builder, type, addr.addr.value, 3, ""));
-			return lb_addr_load(p, addr);
+			LLVMValueRef fields[4] = {
+				LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 0, ""), ""),
+				LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 1, ""), ""),
+				LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 2, ""), ""),
+				LLVMBuildFNeg(p->builder, LLVMBuildExtractValue(p->builder, x.value, 3, ""), ""),
+			};
+			return lb_build_aggregate(p, x.type, fields, 4);
 		} else if (is_type_simd_vector(x.type)) {
 			Type *elem = base_array_type(x.type);
 			if (is_type_float(elem)) {
@@ -1485,7 +1477,6 @@ gb_internal lbValue lb_emit_arith(lbProcedure *p, TokenKind op, lbValue lhs, lbV
 			}
 		}
 
-		lbAddr res = lb_add_local_generated(p, type, false); // NOTE: initialized in full later
 		lbValue a = lb_emit_struct_ev(p, lhs, 0);
 		lbValue b = lb_emit_struct_ev(p, lhs, 1);
 		lbValue c = lb_emit_struct_ev(p, rhs, 0);
@@ -1523,10 +1514,8 @@ gb_internal lbValue lb_emit_arith(lbProcedure *p, TokenKind op, lbValue lhs, lbV
 		}
 		}
 
-		lb_emit_store(p, lb_emit_struct_ep(p, res.addr, 0), real);
-		lb_emit_store(p, lb_emit_struct_ep(p, res.addr, 1), imag);
-
-		return lb_addr_load(p, res);
+		LLVMValueRef fields[2] = {real.value, imag.value};
+		return lb_build_aggregate(p, type, fields, 2);
 	} else if (is_type_quaternion(type)) {
 		lhs = lb_emit_conv(p, lhs, type);
 		rhs = lb_emit_conv(p, rhs, type);
@@ -1539,7 +1528,6 @@ gb_internal lbValue lb_emit_arith(lbProcedure *p, TokenKind op, lbValue lhs, lbV
 				immediate_type = t_f32;
 			}
 
-			lbAddr res = lb_add_local_generated(p, type, false); // NOTE: initialized in full later
 			lbValue x0 = lb_emit_struct_ev(p, lhs, 0);
 			lbValue x1 = lb_emit_struct_ev(p, lhs, 1);
 			lbValue x2 = lb_emit_struct_ev(p, lhs, 2);
@@ -1567,11 +1555,6 @@ gb_internal lbValue lb_emit_arith(lbProcedure *p, TokenKind op, lbValue lhs, lbV
 			lbValue z2 = lb_emit_arith(p, op, x2, y2, immediate_type);
 			lbValue z3 = lb_emit_arith(p, op, x3, y3, immediate_type);
 
-			lbValue d0 = lb_emit_struct_ep(p, res.addr, 0);
-			lbValue d1 = lb_emit_struct_ep(p, res.addr, 1);
-			lbValue d2 = lb_emit_struct_ep(p, res.addr, 2);
-			lbValue d3 = lb_emit_struct_ep(p, res.addr, 3);
-
 			if (immediate_type != ft) {
 				z0 = lb_emit_conv(p, z0, ft);
 				z1 = lb_emit_conv(p, z1, ft);
@@ -1579,12 +1562,8 @@ gb_internal lbValue lb_emit_arith(lbProcedure *p, TokenKind op, lbValue lhs, lbV
 				z3 = lb_emit_conv(p, z3, ft);
 			}
 
-			lb_emit_store(p, d0, z0);
-			lb_emit_store(p, d1, z1);
-			lb_emit_store(p, d2, z2);
-			lb_emit_store(p, d3, z3);
-
-			return lb_addr_load(p, res);
+			LLVMValueRef fields[4] = {z0.value, z1.value, z2.value, z3.value};
+			return lb_build_aggregate(p, type, fields, 4);
 		} else if (op == Token_Mul) {
 			TEMPORARY_ALLOCATOR_GUARD();
 
@@ -2233,77 +2212,64 @@ gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t) {
 
 	if (is_type_complex(src) && is_type_complex(dst)) {
 		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, false);
-		lbValue gp = lb_addr_get_ptr(p, gen);
 		lbValue real = lb_emit_conv(p, lb_emit_struct_ev(p, value, 0), ft);
 		lbValue imag = lb_emit_conv(p, lb_emit_struct_ev(p, value, 1), ft);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 0), real);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 1), imag);
-		return lb_addr_load(p, gen);
+		LLVMValueRef fields[2] = {real.value, imag.value};
+		return lb_build_aggregate(p, t, fields, 2);
 	}
 
 	if (is_type_quaternion(src) && is_type_quaternion(dst)) {
 		// @QuaternionLayout
 		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, false);
-		lbValue gp = lb_addr_get_ptr(p, gen);
 		lbValue q0 = lb_emit_conv(p, lb_emit_struct_ev(p, value, 0), ft);
 		lbValue q1 = lb_emit_conv(p, lb_emit_struct_ev(p, value, 1), ft);
 		lbValue q2 = lb_emit_conv(p, lb_emit_struct_ev(p, value, 2), ft);
 		lbValue q3 = lb_emit_conv(p, lb_emit_struct_ev(p, value, 3), ft);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 0), q0);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 1), q1);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 2), q2);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 3), q3);
-		return lb_addr_load(p, gen);
+		LLVMValueRef fields[4] = {q0.value, q1.value, q2.value, q3.value};
+		return lb_build_aggregate(p, t, fields, 4);
 	}
 
 	if (is_type_integer(src) && is_type_complex(dst)) {
 		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, true);
-		lbValue gp = lb_addr_get_ptr(p, gen);
 		lbValue real = lb_emit_conv(p, value, ft);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 0), real);
-		return lb_addr_load(p, gen);
+		LLVMValueRef base = LLVMConstNull(lb_type(m, t));
+		LLVMValueRef agg = LLVMBuildInsertValue(p->builder, base, real.value, 0, "");
+		return lbValue{agg, t};
 	}
 	if (is_type_float(src) && is_type_complex(dst)) {
 		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, true);
-		lbValue gp = lb_addr_get_ptr(p, gen);
 		lbValue real = lb_emit_conv(p, value, ft);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 0), real);
-		return lb_addr_load(p, gen);
+		LLVMValueRef base = LLVMConstNull(lb_type(m, t));
+		LLVMValueRef agg = LLVMBuildInsertValue(p->builder, base, real.value, 0, "");
+		return lbValue{agg, t};
 	}
 
 
 	if (is_type_integer(src) && is_type_quaternion(dst)) {
 		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, true);
-		lbValue gp = lb_addr_get_ptr(p, gen);
 		lbValue real = lb_emit_conv(p, value, ft);
 		// @QuaternionLayout
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 3), real);
-		return lb_addr_load(p, gen);
+		LLVMValueRef base = LLVMConstNull(lb_type(m, t));
+		LLVMValueRef agg = LLVMBuildInsertValue(p->builder, base, real.value, 3, "");
+		return lbValue{agg, t};
 	}
 	if (is_type_float(src) && is_type_quaternion(dst)) {
 		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, true);
-		lbValue gp = lb_addr_get_ptr(p, gen);
 		lbValue real = lb_emit_conv(p, value, ft);
 		// @QuaternionLayout
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 3), real);
-		return lb_addr_load(p, gen);
+		LLVMValueRef base = LLVMConstNull(lb_type(m, t));
+		LLVMValueRef agg = LLVMBuildInsertValue(p->builder, base, real.value, 3, "");
+		return lbValue{agg, t};
 	}
 	if (is_type_complex(src) && is_type_quaternion(dst)) {
 		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, true);
-		lbValue gp = lb_addr_get_ptr(p, gen);
 		lbValue real = lb_emit_conv(p, lb_emit_struct_ev(p, value, 0), ft);
 		lbValue imag = lb_emit_conv(p, lb_emit_struct_ev(p, value, 1), ft);
 		// @QuaternionLayout
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 3), real);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 0), imag);
-		return lb_addr_load(p, gen);
+		LLVMValueRef base = LLVMConstNull(lb_type(m, t));
+		LLVMValueRef agg = LLVMBuildInsertValue(p->builder, base, real.value, 3, "");
+		agg = LLVMBuildInsertValue(p->builder, agg, imag.value, 0, "");
+		return lbValue{agg, t};
 	}
 
 	// float <-> integer
@@ -2845,8 +2811,6 @@ gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t) {
 			return lb_const_nil(p->module, t);
 		}
 
-		lbAddr result = lb_add_local_generated(p, t, true);
-
 		Type *st = default_type(src_type);
 
 		lbValue data = lb_address_from_load_or_generate_local(p, value);
@@ -2855,13 +2819,8 @@ gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t) {
 		data = lb_emit_conv(p, data, t_rawptr);
 
 		lbValue id = lb_typeid(p->module, st);
-		lbValue any_data = lb_emit_struct_ep(p, result.addr, 0);
-		lbValue any_id   = lb_emit_struct_ep(p, result.addr, 1);
-
-		lb_emit_store(p, any_data, data);
-		lb_emit_store(p, any_id,   id);
-
-		return lb_addr_load(p, result);
+		LLVMValueRef fields[2] = {data.value, id.value};
+		return lb_build_aggregate(p, t, fields, 2);
 	}
 
 
@@ -3723,12 +3682,8 @@ gb_internal lbValue lb_build_unary_and(lbProcedure *p, Ast *expr) {
 		lbValue ok = lb_emit_comp_against_nil(p, Token_NotEq, ptr);
 		ok = lb_emit_conv(p, ok, tuple->Tuple.variables[1]->type);
 
-		lbAddr res = lb_add_local_generated(p, tuple, false);
-		lbValue gep0 = lb_emit_struct_ep(p, res.addr, 0);
-		lbValue gep1 = lb_emit_struct_ep(p, res.addr, 1);
-		lb_emit_store(p, gep0, ptr);
-		lb_emit_store(p, gep1, ok);
-		return lb_addr_load(p, res);
+		LLVMValueRef fields[2] = {ptr.value, ok.value};
+		return lb_build_aggregate(p, tuple, fields, 2);
 
 	} else if (is_type_soa_pointer(tv.type)) {
 		ast_node(ie, IndexExpr, ue_expr);
@@ -3793,12 +3748,11 @@ gb_internal lbValue lb_build_unary_and(lbProcedure *p, Ast *expr) {
 				lbValue ok = lb_emit_comp(p, Token_CmpEq, src_tag, dst_tag);
 
 				lbValue data_ptr = lb_emit_conv(p, v, ptr_type);
-				lbAddr res = lb_add_local_generated(p, tuple, true);
-				lbValue gep0 = lb_emit_struct_ep(p, res.addr, 0);
-				lbValue gep1 = lb_emit_struct_ep(p, res.addr, 1);
-				lb_emit_store(p, gep0, lb_emit_select(p, ok, data_ptr, lb_const_nil(p->module, ptr_type)));
-				lb_emit_store(p, gep1, lb_emit_conv(p, ok, ok_type));
-				return lb_addr_load(p, res);
+				LLVMValueRef fields[2] = {
+					lb_emit_select(p, ok, data_ptr, lb_const_nil(p->module, ptr_type)).value,
+					lb_emit_conv(p, ok, ok_type).value,
+				};
+				return lb_build_aggregate(p, tuple, fields, 2);
 			} else if (is_type_any(t)) {
 				lbValue v = e;
 				if (is_type_pointer(v.type)) {
@@ -3811,12 +3765,11 @@ gb_internal lbValue lb_build_unary_and(lbProcedure *p, Ast *expr) {
 
 				lbValue ok = lb_emit_comp(p, Token_CmpEq, any_id, id);
 
-				lbAddr res = lb_add_local_generated(p, tuple, false);
-				lbValue gep0 = lb_emit_struct_ep(p, res.addr, 0);
-				lbValue gep1 = lb_emit_struct_ep(p, res.addr, 1);
-				lb_emit_store(p, gep0, lb_emit_select(p, ok, data_ptr, lb_const_nil(p->module, ptr_type)));
-				lb_emit_store(p, gep1, lb_emit_conv(p, ok, ok_type));
-				return lb_addr_load(p, res);
+				LLVMValueRef fields[2] = {
+					lb_emit_select(p, ok, data_ptr, lb_const_nil(p->module, ptr_type)).value,
+					lb_emit_conv(p, ok, ok_type).value,
+				};
+				return lb_build_aggregate(p, tuple, fields, 2);
 			} else {
 				GB_PANIC("TODO(bill): type assertion %s", type_to_string(type));
 			}
