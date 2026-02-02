@@ -184,6 +184,7 @@ struct lbModule {
 
 	LLVMDIBuilderRef debug_builder;
 	LLVMMetadataRef debug_compile_unit;
+	LLVMMetadataRef debug_empty_subroutine_type; // cached for minimal debug mode
 
 	RecursiveMutex debug_values_mutex;
 	PtrMap<void *, LLVMMetadataRef> debug_values;
@@ -633,6 +634,7 @@ gb_internal LLVMTypeRef OdinLLVMGetArrayElementType(LLVMTypeRef type);
 gb_internal LLVMTypeRef OdinLLVMGetVectorElementType(LLVMTypeRef type);
 
 gb_internal String lb_filepath_ll_for_module(lbModule *m);
+gb_internal String lb_filepath_dwo_for_module(lbModule *m);
 
 gb_internal LLVMTypeRef lb_type_internal_for_procedures_raw(lbModule *m, Type *type);
 

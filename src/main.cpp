@@ -414,6 +414,9 @@ enum BuildFlagKind {
 
 	BuildFlag_Sanitize,
 	BuildFlag_LTO,
+	BuildFlag_DebugMode,
+	BuildFlag_CompressDebugSections,
+	BuildFlag_SplitDwarf,
 
 #if defined(GB_SYSTEM_WINDOWS)
 	BuildFlag_IgnoreVsSearch,
@@ -645,6 +648,9 @@ gb_internal bool parse_build_flags(Array<String> args) {
 
 	add_flag(&build_flags, BuildFlag_Sanitize,                str_lit("sanitize"),                  BuildFlagParam_String,  Command__does_build, true);
 	add_flag(&build_flags, BuildFlag_LTO,                     str_lit("lto"),                       BuildFlagParam_String,  Command__does_build);
+	add_flag(&build_flags, BuildFlag_DebugMode,               str_lit("debug-mode"),                BuildFlagParam_String,  Command__does_check);
+	add_flag(&build_flags, BuildFlag_CompressDebugSections,   str_lit("compress-debug-sections"),   BuildFlagParam_None,    Command__does_build);
+	add_flag(&build_flags, BuildFlag_SplitDwarf,              str_lit("split-dwarf"),               BuildFlagParam_None,    Command__does_build);
 
 
 #if defined(GB_SYSTEM_WINDOWS)
@@ -1650,6 +1656,26 @@ gb_internal bool parse_build_flags(Array<String> args) {
 							}
 							break;
 
+						case BuildFlag_DebugMode:
+							GB_ASSERT(value.kind == ExactValue_String);
+							if (str_eq_ignore_case(value.value_string, str_lit("minimal"))) {
+								build_context.debug_mode = DebugMode_Minimal;
+							} else if (str_eq_ignore_case(value.value_string, str_lit("full"))) {
+								build_context.debug_mode = DebugMode_Full;
+							} else {
+								gb_printf_err("-debug-mode:<string> options are 'full' and 'minimal'\n");
+								bad_flags = true;
+							}
+							break;
+
+						case BuildFlag_CompressDebugSections:
+							build_context.compress_debug_sections = true;
+							break;
+
+						case BuildFlag_SplitDwarf:
+							build_context.split_dwarf = true;
+							break;
+
 
 					#if defined(GB_SYSTEM_WINDOWS)
 						case BuildFlag_IgnoreVsSearch: {
@@ -1825,6 +1851,18 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	if ((build_context.command_kind & (Command_doc | Command_test)) == 0 && build_context.test_all_packages) {
 		gb_printf_err("`-test-all-packages` can only be used with `odin build -build-mode:test`, `odin test`, or `odin doc`.\n");
 		bad_flags = true;
+	}
+
+	if (!build_context.ODIN_DEBUG) {
+		if (build_context.debug_mode == DebugMode_Minimal) {
+			gb_printf_err("Warning: -debug-mode has no effect without -debug\n");
+		}
+		if (build_context.split_dwarf) {
+			gb_printf_err("Warning: -split-dwarf has no effect without -debug\n");
+		}
+		if (build_context.compress_debug_sections) {
+			gb_printf_err("Warning: -compress-debug-sections has no effect without -debug\n");
+		}
 	}
 
 	return !bad_flags;
