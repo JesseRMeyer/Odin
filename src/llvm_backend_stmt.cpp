@@ -787,14 +787,12 @@ gb_internal void lb_build_range_interval(lbProcedure *p, AstBinaryExpr *node,
 	}
 	lb_addr_store(p, value, lower);
 
-	lbAddr index;
+	lbAddr index = {};
 	if (val1_type != nullptr) {
 		Entity *e = entity_of_node(val1);
 		index = lb_add_local(p, val1_type, e, false);
-	} else {
-		index = lb_add_local_generated(p, t_int, false);
+		lb_addr_store(p, index, lb_const_int(m, t_int, 0));
 	}
-	lb_addr_store(p, index, lb_const_int(m, t_int, 0));
 
 	lbBlock *loop = lb_create_block(p, "for.interval.loop");
 	lbBlock *body = lb_create_block(p, "for.interval.body");
@@ -822,9 +820,11 @@ gb_internal void lb_build_range_interval(lbProcedure *p, AstBinaryExpr *node,
 	lb_start_block(p, body);
 
 	lbValue val = lb_addr_load(p, value);
-	lbValue idx = lb_addr_load(p, index);
 	if (val0_type) lb_store_range_stmt_val(p, val0, val);
-	if (val1_type) lb_store_range_stmt_val(p, val1, idx);
+	if (val1_type) {
+		lbValue idx = lb_addr_load(p, index);
+		lb_store_range_stmt_val(p, val1, idx);
+	}
 
 	{
 		// NOTE: this check block will most likely be optimized out, and is here
@@ -863,7 +863,9 @@ gb_internal void lb_build_range_interval(lbProcedure *p, AstBinaryExpr *node,
 
 		lb_start_block(p, post);
 		lb_emit_increment(p, value.addr);
-		lb_emit_increment(p, index.addr);
+		if (val1_type) {
+			lb_emit_increment(p, index.addr);
+		}
 		lb_emit_jump(p, loop);
 	}
 
@@ -2612,6 +2614,29 @@ gb_internal void lb_build_if_stmt(lbProcedure *p, Ast *node) {
 		}
 	} else {
 		lb_start_block(p, then);
+
+		// Emit @llvm.assume for simple nil checks at O1+ to inform the optimizer
+		// that the pointer is non-null within the true branch.
+		// Only for simple identifier expressions to avoid re-evaluating expressions
+		// with side effects (function calls, etc.).
+		if (build_context.optimization_level > 0 && is->cond->kind == Ast_BinaryExpr) {
+			ast_node(be, BinaryExpr, is->cond);
+			Ast *ptr_expr = nullptr;
+			if (be->op.kind == Token_NotEq && is_type_untyped_nil(be->right->tav.type)) {
+				ptr_expr = be->left;
+			} else if (be->op.kind == Token_NotEq && is_type_untyped_nil(be->left->tav.type)) {
+				ptr_expr = be->right;
+			}
+			if (ptr_expr != nullptr && ptr_expr->kind == Ast_Ident) {
+				Type *pt = ptr_expr->tav.type;
+				if (is_type_pointer(pt) || is_type_multi_pointer(pt) || is_type_rawptr(pt) || is_type_proc(pt)) {
+					lbValue assume_ptr = lb_build_expr(p, ptr_expr);
+					LLVMValueRef not_null = LLVMBuildIsNotNull(p->builder, assume_ptr.value, "");
+					LLVMValueRef assume_args[1] = { not_null };
+					lb_call_intrinsic(p, "llvm.assume", assume_args, 1, nullptr, 0);
+				}
+			}
+		}
 
 		lb_build_stmt(p, is->body);
 
