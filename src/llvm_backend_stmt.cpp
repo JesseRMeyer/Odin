@@ -2398,6 +2398,41 @@ gb_internal void lb_build_return_stmt(lbProcedure *p, Slice<Ast *> const &return
 
 	if (return_count == 1) {
 		Entity *e = tuple->variables[0];
+
+		// RVO: for `return call()` in an sret function with no defers,
+		// forward our sret pointer directly to the callee
+		if (res_count == 1 && return_by_pointer && p->defer_stmts.count == 0) {
+			Ast *ret_expr = unparen_expr(return_results[0]);
+			if (ret_expr->kind == Ast_CallExpr) {
+				Ast *proc_expr = unparen_expr(ret_expr->CallExpr.proc);
+				TypeAndValue proc_tv = type_and_value_of_expr(proc_expr);
+				if (proc_tv.mode != Addressing_Type && proc_tv.mode != Addressing_Builtin) {
+					Type *callee_type = base_type(proc_tv.type);
+					if (callee_type != nullptr && callee_type->kind == Type_Proc && callee_type->Proc.results != nullptr) {
+						lbFunctionType *callee_ft = lb_get_function_type(p->module, callee_type);
+						if (callee_ft->ret.kind == lbArg_Indirect) {
+							Type *callee_ret = reduce_tuple_to_single_type(callee_type->Proc.results);
+							if (callee_ret != nullptr && are_types_identical(e->type, callee_ret)) {
+								lbValue sret_ptr = p->return_ptr.addr;
+								lb_build_call_expr(p, ret_expr, &sret_ptr);
+								// Callee wrote directly to our sret pointer.
+								// Store to named result if needed.
+								if (p->type->Proc.has_named_results && e->token.string != "") {
+									res = lb_emit_load(p, p->return_ptr.addr);
+									rw_mutex_shared_lock(&p->module->values_mutex);
+									lbValue found = map_must_get(&p->module->values, e);
+									rw_mutex_shared_unlock(&p->module->values_mutex);
+									lb_emit_store(p, found, lb_emit_conv(p, res, e->type));
+								}
+								LLVMBuildRetVoid(p->builder);
+								return;
+							}
+						}
+					}
+				}
+			}
+		}
+
 		if (res_count == 0) {
 			rw_mutex_shared_lock(&p->module->values_mutex);
 			lbValue found = map_must_get(&p->module->values, e);
@@ -2832,6 +2867,37 @@ gb_internal void lb_build_assign_stmt_array(lbProcedure *p, TokenKind op, lbAddr
 }
 gb_internal void lb_build_assign_stmt(lbProcedure *p, AstAssignStmt *as) {
 	if (as->op.kind == Token_Eq) {
+		// RVO: for single assignments of `x = call()`, forward x's address as sret
+		if (as->lhs.count == 1 && as->rhs.count == 1 && !is_blank_ident(as->lhs[0])) {
+			Ast *rhs_expr = unparen_expr(as->rhs[0]);
+			if (rhs_expr->kind == Ast_CallExpr) {
+				TypeAndValue rhs_tv = type_and_value_of_expr(rhs_expr);
+				if (rhs_tv.type != nullptr) {
+					// Check that the call's proc type returns by sret
+					Ast *proc_expr = unparen_expr(rhs_expr->CallExpr.proc);
+					TypeAndValue proc_tv = type_and_value_of_expr(proc_expr);
+					if (proc_tv.mode != Addressing_Type && proc_tv.mode != Addressing_Builtin) {
+						Type *pt = base_type(proc_tv.type);
+						if (pt != nullptr && pt->kind == Type_Proc && pt->Proc.results != nullptr) {
+							lbFunctionType *callee_ft = lb_get_function_type(p->module, pt);
+							if (callee_ft->ret.kind == lbArg_Indirect) {
+								lbAddr lval = lb_build_addr(p, as->lhs[0]);
+								if (LLVMIsAAllocaInst(lval.addr.value) && lval.kind == lbAddr_Default) {
+									Type *lhs_type = lb_addr_type(lval);
+									Type *callee_ret = reduce_tuple_to_single_type(pt->Proc.results);
+									if (callee_ret != nullptr && are_types_identical(lhs_type, callee_ret)) {
+										lbValue dest = lval.addr;
+										lb_build_call_expr(p, rhs_expr, &dest);
+										return;
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+
 		auto lvals = array_make<lbAddr>(permanent_allocator(), 0, as->lhs.count);
 
 		for (Ast *lhs : as->lhs) {
@@ -3017,6 +3083,31 @@ gb_internal void lb_build_stmt(lbProcedure *p, Ast *node) {
 				}
 			}
 		} else {
+			// RVO: for `x := call()`, forward x's alloca as sret destination
+			if (vd->names.count == 1 && values.count == 1 && !is_blank_ident(vd->names[0])) {
+				Ast *rhs_expr = unparen_expr(values[0]);
+				if (rhs_expr->kind == Ast_CallExpr) {
+					Ast *proc_expr = unparen_expr(rhs_expr->CallExpr.proc);
+					TypeAndValue proc_tv = type_and_value_of_expr(proc_expr);
+					if (proc_tv.mode != Addressing_Type && proc_tv.mode != Addressing_Builtin) {
+						Type *pt = base_type(proc_tv.type);
+						if (pt != nullptr && pt->kind == Type_Proc && pt->Proc.results != nullptr) {
+							lbFunctionType *callee_ft = lb_get_function_type(p->module, pt);
+							if (callee_ft->ret.kind == lbArg_Indirect) {
+								Entity *e = entity_of_node(vd->names[0]);
+								Type *callee_ret = reduce_tuple_to_single_type(pt->Proc.results);
+								if (e != nullptr && callee_ret != nullptr && are_types_identical(e->type, callee_ret)) {
+									lbAddr local = lb_add_local(p, e->type, e, true);
+									lbValue dest = local.addr;
+									lb_build_call_expr(p, rhs_expr, &dest);
+									break;
+								}
+							}
+						}
+					}
+				}
+			}
+
 			auto lvals_preused = slice_make<bool>(temporary_allocator(), vd->names.count);
 			auto lvals = slice_make<lbAddr>(temporary_allocator(), vd->names.count);
 			auto inits = array_make<lbValue>(temporary_allocator(), 0, lvals.count);

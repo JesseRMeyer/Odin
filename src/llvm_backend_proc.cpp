@@ -1060,7 +1060,7 @@ gb_internal lbValue lb_emit_conjugate(lbProcedure *p, lbValue val, Type *type) {
 	return lb_emit_load(p, res);
 }
 
-gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> const &args, ProcInlining inlining, ProcTailing tailing) {
+gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> const &args, ProcInlining inlining, ProcTailing tailing, lbValue *sret_dest) {
 	lbModule *m = p->module;
 
 	Type *pt = base_type(value.type);
@@ -1182,7 +1182,12 @@ gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> c
 		}
 
 		if (return_by_pointer) {
-			lbValue return_ptr = lb_add_local_generated(p, rt, true).addr;
+			lbValue return_ptr = {};
+			if (sret_dest != nullptr) {
+				return_ptr = *sret_dest;
+			} else {
+				return_ptr = lb_add_local_generated(p, rt, true).addr;
+			}
 			lb_emit_call_internal(p, value, return_ptr, processed_args, nullptr, context_ptr, inlining, tailing);
 			result = lb_emit_load(p, return_ptr);
 		} else if (rt != nullptr) {
@@ -4084,13 +4089,13 @@ gb_internal lbValue lb_handle_param_value(lbProcedure *p, Type *parameter_type, 
 }
 
 
-gb_internal lbValue lb_build_call_expr_internal(lbProcedure *p, Ast *expr);
+gb_internal lbValue lb_build_call_expr_internal(lbProcedure *p, Ast *expr, lbValue *sret_dest = nullptr);
 
-gb_internal lbValue lb_build_call_expr(lbProcedure *p, Ast *expr) {
+gb_internal lbValue lb_build_call_expr(lbProcedure *p, Ast *expr, lbValue *sret_dest) {
 	expr = unparen_expr(expr);
 	ast_node(ce, CallExpr, expr);
 
-	lbValue res = lb_build_call_expr_internal(p, expr);
+	lbValue res = lb_build_call_expr_internal(p, expr, sret_dest);
 
 	if (ce->optional_ok_one) {
 		GB_ASSERT(is_type_tuple(res.type));
@@ -4111,7 +4116,7 @@ gb_internal void lb_add_values_to_array(lbProcedure *p, Array<lbValue> *args, lb
 	}
 }
 
-gb_internal lbValue lb_build_call_expr_internal(lbProcedure *p, Ast *expr) {
+gb_internal lbValue lb_build_call_expr_internal(lbProcedure *p, Ast *expr, lbValue *sret_dest) {
 	lbModule *m = p->module;
 
 	TypeAndValue tv = type_and_value_of_expr(expr);
@@ -4437,6 +4442,6 @@ gb_internal lbValue lb_build_call_expr_internal(lbProcedure *p, Ast *expr) {
 		}
 	}
 
-	return lb_emit_call(p, value, call_args, inlining, tailing);
+	return lb_emit_call(p, value, call_args, inlining, tailing, sret_dest);
 }
 
