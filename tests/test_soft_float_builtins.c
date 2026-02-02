@@ -5,7 +5,7 @@
 //
 // Build & run:
 //   cc tests/test_soft_float_builtins.c -o test_soft_float_builtins \
-//      $(llvm-config --cflags --ldflags --libs core executionengine native) -lm \
+//      $(llvm-config --cflags --ldflags --libs core analysis executionengine native) -lm \
 //      && ./test_soft_float_builtins
 
 #include <llvm-c/Core.h>
@@ -14,7 +14,6 @@
 #include <llvm-c/Target.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <math.h>
 
@@ -73,26 +72,34 @@ static uint16_t ref_f32_to_f16(float value) {
 }
 
 // ---------------------------------------------------------------------------
-// Emit the same IR as lb_emit_lto_soft_float_builtins
+// Emit the same IR as lb_emit_lto_soft_float_builtins, plus JIT-callable
+// test wrappers that use i16 instead of half at the C boundary.
 // ---------------------------------------------------------------------------
 
 static void emit_builtins(LLVMModuleRef mod, LLVMContextRef ctx) {
-	LLVMTypeRef i16_type = LLVMInt16TypeInContext(ctx);
-	LLVMTypeRef i32_type = LLVMInt32TypeInContext(ctx);
-	LLVMTypeRef f32_type = LLVMFloatTypeInContext(ctx);
+	LLVMTypeRef i16_type  = LLVMInt16TypeInContext(ctx);
+	LLVMTypeRef i32_type  = LLVMInt32TypeInContext(ctx);
+	LLVMTypeRef f32_type  = LLVMFloatTypeInContext(ctx);
+	LLVMTypeRef half_type = LLVMHalfTypeInContext(ctx);
 
-	// __extendhfsf2: i16 -> float
+	// Use half for the external ABI (matches LLVM 15+ convention)
+	LLVMTypeRef h_type = half_type;
+
+	// __extendhfsf2: half -> float
+	LLVMValueRef extend_fn;
 	{
-		LLVMTypeRef param_types[] = { i16_type };
+		LLVMTypeRef param_types[] = { h_type };
 		LLVMTypeRef fn_type = LLVMFunctionType(f32_type, param_types, 1, 0);
-		LLVMValueRef fn = LLVMAddFunction(mod, "__extendhfsf2", fn_type);
-		LLVMSetLinkage(fn, LLVMWeakAnyLinkage);
+		extend_fn = LLVMAddFunction(mod, "__extendhfsf2", fn_type);
+		LLVMSetLinkage(extend_fn, LLVMWeakAnyLinkage);
 
-		LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
+		LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, extend_fn, "entry");
 		LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
 		LLVMPositionBuilderAtEnd(b, entry);
 
-		LLVMValueRef value = LLVMGetParam(fn, 0);
+		LLVMValueRef param = LLVMGetParam(extend_fn, 0);
+		LLVMValueRef value = LLVMBuildBitCast(b, param, i16_type, "to_i16");
+
 		LLVMValueRef magic_i32 = LLVMConstInt(i32_type, (254u - 15u) << 23, 0);
 		LLVMValueRef magic_f32 = LLVMBuildBitCast(b, magic_i32, f32_type, "magic");
 		LLVMValueRef inf_i32 = LLVMConstInt(i32_type, (127u + 16u) << 23, 0);
@@ -114,33 +121,34 @@ static void emit_builtins(LLVMModuleRef mod, LLVMContextRef ctx) {
 		LLVMDisposeBuilder(b);
 	}
 
-	// __truncsfhf2: float -> i16
+	// __truncsfhf2: float -> half
+	LLVMValueRef trunc_fn;
 	{
 		LLVMTypeRef param_types[] = { f32_type };
-		LLVMTypeRef fn_type = LLVMFunctionType(i16_type, param_types, 1, 0);
-		LLVMValueRef fn = LLVMAddFunction(mod, "__truncsfhf2", fn_type);
-		LLVMSetLinkage(fn, LLVMWeakAnyLinkage);
+		LLVMTypeRef fn_type = LLVMFunctionType(h_type, param_types, 1, 0);
+		trunc_fn = LLVMAddFunction(mod, "__truncsfhf2", fn_type);
+		LLVMSetLinkage(trunc_fn, LLVMWeakAnyLinkage);
 
-		LLVMBasicBlockRef entry          = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
-		LLVMBasicBlockRef bb_denorm      = LLVMAppendBasicBlockInContext(ctx, fn, "denorm");
-		LLVMBasicBlockRef bb_denorm_round = LLVMAppendBasicBlockInContext(ctx, fn, "denorm_round");
-		LLVMBasicBlockRef bb_denorm_end  = LLVMAppendBasicBlockInContext(ctx, fn, "denorm_end");
-		LLVMBasicBlockRef bb_tiny_ret    = LLVMAppendBasicBlockInContext(ctx, fn, "tiny_ret");
-		LLVMBasicBlockRef bb_inf_nan     = LLVMAppendBasicBlockInContext(ctx, fn, "inf_nan");
-		LLVMBasicBlockRef bb_inf         = LLVMAppendBasicBlockInContext(ctx, fn, "inf");
-		LLVMBasicBlockRef bb_inf_ret2    = LLVMAppendBasicBlockInContext(ctx, fn, "inf_ret");
-		LLVMBasicBlockRef bb_nan         = LLVMAppendBasicBlockInContext(ctx, fn, "nan");
-		LLVMBasicBlockRef bb_normal      = LLVMAppendBasicBlockInContext(ctx, fn, "normal");
-		LLVMBasicBlockRef bb_norm_round  = LLVMAppendBasicBlockInContext(ctx, fn, "norm_round");
-		LLVMBasicBlockRef bb_norm_carry  = LLVMAppendBasicBlockInContext(ctx, fn, "norm_carry");
-		LLVMBasicBlockRef bb_norm_end    = LLVMAppendBasicBlockInContext(ctx, fn, "norm_end");
-		LLVMBasicBlockRef bb_overflow    = LLVMAppendBasicBlockInContext(ctx, fn, "overflow");
-		LLVMBasicBlockRef bb_norm_done   = LLVMAppendBasicBlockInContext(ctx, fn, "norm_done");
+		LLVMBasicBlockRef entry          = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "entry");
+		LLVMBasicBlockRef bb_denorm      = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "denorm");
+		LLVMBasicBlockRef bb_denorm_round = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "denorm_round");
+		LLVMBasicBlockRef bb_denorm_end  = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "denorm_end");
+		LLVMBasicBlockRef bb_tiny_ret    = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "tiny_ret");
+		LLVMBasicBlockRef bb_inf_nan     = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "inf_nan");
+		LLVMBasicBlockRef bb_inf         = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "inf");
+		LLVMBasicBlockRef bb_inf_ret2    = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "inf_ret");
+		LLVMBasicBlockRef bb_nan         = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "nan");
+		LLVMBasicBlockRef bb_normal      = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "normal");
+		LLVMBasicBlockRef bb_norm_round  = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "norm_round");
+		LLVMBasicBlockRef bb_norm_carry  = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "norm_carry");
+		LLVMBasicBlockRef bb_norm_end    = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "norm_end");
+		LLVMBasicBlockRef bb_overflow    = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "overflow");
+		LLVMBasicBlockRef bb_norm_done   = LLVMAppendBasicBlockInContext(ctx, trunc_fn, "norm_done");
 
 		LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
 
 		LLVMPositionBuilderAtEnd(b, entry);
-		LLVMValueRef value = LLVMGetParam(fn, 0);
+		LLVMValueRef value = LLVMGetParam(trunc_fn, 0);
 		LLVMValueRef i = LLVMBuildBitCast(b, value, i32_type, "i");
 		LLVMValueRef s = LLVMBuildLShr(b, i, LLVMConstInt(i32_type, 16, 0), "s_shift");
 		s = LLVMBuildAnd(b, s, LLVMConstInt(i32_type, 0x8000, 0), "s");
@@ -151,12 +159,18 @@ static void emit_builtins(LLVMModuleRef mod, LLVMContextRef ctx) {
 		LLVMValueRef e_le_0 = LLVMBuildICmp(b, LLVMIntSLE, e, LLVMConstInt(i32_type, 0, 0), "e_le_0");
 		LLVMBuildCondBr(b, e_le_0, bb_denorm, bb_inf_nan);
 
+		// Helper macro: trunc i32 to i16, then bitcast to half for return
+		#define RET_HALF(val, name) do { \
+			LLVMValueRef _i16 = LLVMBuildTrunc(b, (val), i16_type, (name)); \
+			LLVMBuildRet(b, LLVMBuildBitCast(b, _i16, half_type, "to_half")); \
+		} while(0)
+
 		LLVMPositionBuilderAtEnd(b, bb_denorm);
 		LLVMValueRef e_lt_neg10 = LLVMBuildICmp(b, LLVMIntSLT, e, LLVMConstInt(i32_type, (uint64_t)(int32_t)-10, 0), "e_lt_neg10");
 		LLVMBuildCondBr(b, e_lt_neg10, bb_tiny_ret, bb_denorm_round);
 
 		LLVMPositionBuilderAtEnd(b, bb_tiny_ret);
-		LLVMBuildRet(b, LLVMBuildTrunc(b, s, i16_type, "tiny_ret_val"));
+		RET_HALF(s, "tiny_ret_val");
 
 		LLVMPositionBuilderAtEnd(b, bb_denorm_round);
 		LLVMValueRef m_or = LLVMBuildOr(b, m, LLVMConstInt(i32_type, 0x00800000, 0), "m_or");
@@ -171,7 +185,7 @@ static void emit_builtins(LLVMModuleRef mod, LLVMContextRef ctx) {
 		LLVMValueRef m_denorm = LLVMBuildSelect(b, needs_round, m_rounded, m_shifted, "m_denorm");
 		LLVMValueRef m_final_d = LLVMBuildLShr(b, m_denorm, LLVMConstInt(i32_type, 13, 0), "m_final_d");
 		LLVMValueRef res_d = LLVMBuildOr(b, s, m_final_d, "res_d");
-		LLVMBuildRet(b, LLVMBuildTrunc(b, res_d, i16_type, "res_d_i16"));
+		RET_HALF(res_d, "res_d_i16");
 
 		LLVMPositionBuilderAtEnd(b, bb_inf_nan);
 		LLVMValueRef e_is_inf_nan = LLVMBuildICmp(b, LLVMIntEQ, e, LLVMConstInt(i32_type, 0xFF - 112, 0), "e_is_inf_nan");
@@ -182,7 +196,7 @@ static void emit_builtins(LLVMModuleRef mod, LLVMContextRef ctx) {
 		LLVMBuildCondBr(b, m_is_zero, bb_inf_ret2, bb_nan);
 
 		LLVMPositionBuilderAtEnd(b, bb_inf_ret2);
-		LLVMBuildRet(b, LLVMBuildTrunc(b, LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, 0), "inf_val"), i16_type, "inf_ret_val"));
+		RET_HALF(LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, 0), "inf_val"), "inf_ret_val");
 
 		LLVMPositionBuilderAtEnd(b, bb_nan);
 		LLVMValueRef m_nan = LLVMBuildLShr(b, m, LLVMConstInt(i32_type, 13, 0), "m_nan");
@@ -191,7 +205,7 @@ static void emit_builtins(LLVMModuleRef mod, LLVMContextRef ctx) {
 		LLVMValueRef res_nan = LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, 0), "res_nan_1");
 		res_nan = LLVMBuildOr(b, res_nan, m_nan, "res_nan_2");
 		res_nan = LLVMBuildOr(b, res_nan, m_nan_fix, "res_nan");
-		LLVMBuildRet(b, LLVMBuildTrunc(b, res_nan, i16_type, "res_nan_i16"));
+		RET_HALF(res_nan, "res_nan_i16");
 
 		LLVMPositionBuilderAtEnd(b, bb_normal);
 		LLVMValueRef norm_round_bit = LLVMBuildAnd(b, m, LLVMConstInt(i32_type, 0x1000, 0), "norm_round_bit");
@@ -223,15 +237,66 @@ static void emit_builtins(LLVMModuleRef mod, LLVMContextRef ctx) {
 		LLVMBuildCondBr(b, e_gt_30, bb_overflow, bb_norm_done);
 
 		LLVMPositionBuilderAtEnd(b, bb_overflow);
-		LLVMBuildRet(b, LLVMBuildTrunc(b, LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, 0), "res_ovf"), i16_type, "res_ovf_i16"));
+		RET_HALF(LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, 0), "res_ovf"), "res_ovf_i16");
 
 		LLVMPositionBuilderAtEnd(b, bb_norm_done);
 		LLVMValueRef e_shifted = LLVMBuildShl(b, e_phi, LLVMConstInt(i32_type, 10, 0), "e_shifted");
 		LLVMValueRef m_shifted2 = LLVMBuildLShr(b, m_phi, LLVMConstInt(i32_type, 13, 0), "m_shifted2");
 		LLVMValueRef res_n = LLVMBuildOr(b, s, e_shifted, "res_n_1");
 		res_n = LLVMBuildOr(b, res_n, m_shifted2, "res_n");
-		LLVMBuildRet(b, LLVMBuildTrunc(b, res_n, i16_type, "res_n_i16"));
+		RET_HALF(res_n, "res_n_i16");
 
+		#undef RET_HALF
+		LLVMDisposeBuilder(b);
+	}
+
+	// --- Test wrappers with i16 interface (callable from C via JIT) ---
+
+	// Explicit function types for Call2 (opaque pointers in LLVM 15+)
+	LLVMTypeRef extend_callee_type;
+	{
+		LLVMTypeRef p[] = { h_type };
+		extend_callee_type = LLVMFunctionType(f32_type, p, 1, 0);
+	}
+	LLVMTypeRef trunc_callee_type;
+	{
+		LLVMTypeRef p[] = { f32_type };
+		trunc_callee_type = LLVMFunctionType(h_type, p, 1, 0);
+	}
+
+	// test_extend(i16) -> float: bitcasts i16 to half, calls __extendhfsf2
+	{
+		LLVMTypeRef param_types[] = { i16_type };
+		LLVMTypeRef fn_type = LLVMFunctionType(f32_type, param_types, 1, 0);
+		LLVMValueRef fn = LLVMAddFunction(mod, "test_extend", fn_type);
+
+		LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
+		LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
+		LLVMPositionBuilderAtEnd(b, entry);
+
+		LLVMValueRef arg = LLVMGetParam(fn, 0);
+		LLVMValueRef as_half = LLVMBuildBitCast(b, arg, half_type, "as_half");
+		LLVMValueRef args[] = { as_half };
+		LLVMValueRef result = LLVMBuildCall2(b, extend_callee_type, extend_fn, args, 1, "result");
+		LLVMBuildRet(b, result);
+		LLVMDisposeBuilder(b);
+	}
+
+	// test_trunc(float) -> i16: calls __truncsfhf2, bitcasts half result to i16
+	{
+		LLVMTypeRef param_types[] = { f32_type };
+		LLVMTypeRef fn_type = LLVMFunctionType(i16_type, param_types, 1, 0);
+		LLVMValueRef fn = LLVMAddFunction(mod, "test_trunc", fn_type);
+
+		LLVMBasicBlockRef entry = LLVMAppendBasicBlockInContext(ctx, fn, "entry");
+		LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
+		LLVMPositionBuilderAtEnd(b, entry);
+
+		LLVMValueRef arg = LLVMGetParam(fn, 0);
+		LLVMValueRef args[] = { arg };
+		LLVMValueRef half_result = LLVMBuildCall2(b, trunc_callee_type, trunc_fn, args, 1, "half_result");
+		LLVMValueRef as_i16 = LLVMBuildBitCast(b, half_result, i16_type, "as_i16");
+		LLVMBuildRet(b, as_i16);
 		LLVMDisposeBuilder(b);
 	}
 }
@@ -277,11 +342,12 @@ int main(void) {
 		return 1;
 	}
 
-	typedef float    (*extend_fn)(uint16_t);
-	typedef uint16_t (*trunc_fn)(float);
+	typedef float    (*extend_fn_t)(uint16_t);
+	typedef uint16_t (*trunc_fn_t)(float);
 
-	extend_fn jit_extend = (extend_fn)(uintptr_t)LLVMGetFunctionAddress(ee, "__extendhfsf2");
-	trunc_fn  jit_trunc  = (trunc_fn)(uintptr_t)LLVMGetFunctionAddress(ee, "__truncsfhf2");
+	// Use the test wrappers which have i16-based C calling convention
+	extend_fn_t jit_extend = (extend_fn_t)(uintptr_t)LLVMGetFunctionAddress(ee, "test_extend");
+	trunc_fn_t  jit_trunc  = (trunc_fn_t)(uintptr_t)LLVMGetFunctionAddress(ee, "test_trunc");
 
 	if (!jit_extend || !jit_trunc) {
 		fprintf(stderr, "FAIL: could not resolve JIT symbols\n");
@@ -292,7 +358,6 @@ int main(void) {
 	int tests = 0;
 
 	// --- Test __extendhfsf2 (f16 -> f32) ---
-
 	// Test every possible f16 bit pattern (only 65536 of them)
 	for (uint32_t h = 0; h < 0x10000; h++) {
 		uint16_t h16 = (uint16_t)h;
@@ -302,7 +367,6 @@ int main(void) {
 		uint32_t exp_bits = float_bits(expected);
 		uint32_t got_bits = float_bits(got);
 
-		// Compare bitwise (handles NaN correctly)
 		if (exp_bits != got_bits) {
 			if (failures < 20) {
 				fprintf(stderr, "FAIL extend 0x%04X: expected 0x%08X, got 0x%08X\n",
@@ -316,13 +380,9 @@ int main(void) {
 		(failures == 0) ? "OK  " : "FAIL", tests - failures, tests);
 
 	// --- Test __truncsfhf2 (f32 -> f16) ---
-
-	// Structured test vectors covering all code paths
 	struct { float f; const char *desc; } trunc_tests[] = {
-		// Zeros
 		{ 0.0f,  "+0" },
 		{ -0.0f, "-0" },
-		// Normal values
 		{ 1.0f,   "1.0" },
 		{ -1.0f,  "-1.0" },
 		{ 0.5f,   "0.5" },
@@ -331,19 +391,14 @@ int main(void) {
 		{ 65504.0f, "max normal f16" },
 		{ -65504.0f, "-max normal f16" },
 		{ 0.00006103515625f, "min normal f16" },
-		// Subnormals
 		{ 5.96046448e-08f, "min subnormal f16" },
 		{ 0.000060975552f, "max subnormal f16" },
-		// Overflow -> inf
 		{ 100000.0f, "overflow to inf" },
 		{ -100000.0f, "overflow to -inf" },
-		// Infinity
 		{ INFINITY,  "+inf" },
 		{ -INFINITY, "-inf" },
-		// Tiny (e < -10 path)
 		{ 1e-10f,  "tiny positive" },
 		{ -1e-10f, "tiny negative" },
-		// Values that exercise rounding
 		{ 1.0009765625f, "round-down boundary" },
 		{ 1.0019531250f, "round-up boundary" },
 		{ 0.333333f, "1/3" },
@@ -352,7 +407,6 @@ int main(void) {
 	};
 
 	int trunc_failures = 0;
-	int trunc_tests_count = 0;
 	int n_trunc_structured = (int)(sizeof(trunc_tests) / sizeof(trunc_tests[0]));
 
 	for (int i = 0; i < n_trunc_structured; i++) {
@@ -364,50 +418,42 @@ int main(void) {
 				trunc_tests[i].desc, float_bits(f), expected, got);
 			trunc_failures++;
 		}
-		trunc_tests_count++;
 	}
 
-	// Also test NaN
+	// NaN tests
 	{
-		float nan_val = bits_float(0x7FC00000); // quiet NaN
+		float nan_val = bits_float(0x7FC00000);
 		uint16_t expected = ref_f32_to_f16(nan_val);
 		uint16_t got      = jit_trunc(nan_val);
 		if (expected != got) {
-			fprintf(stderr, "FAIL trunc qNaN (0x%08X): expected 0x%04X, got 0x%04X\n",
-				float_bits(nan_val), expected, got);
+			fprintf(stderr, "FAIL trunc qNaN: expected 0x%04X, got 0x%04X\n", expected, got);
 			trunc_failures++;
 		}
-		trunc_tests_count++;
 
-		float snan_val = bits_float(0x7F800001); // signaling NaN
+		float snan_val = bits_float(0x7F800001);
 		expected = ref_f32_to_f16(snan_val);
 		got      = jit_trunc(snan_val);
 		if (expected != got) {
-			fprintf(stderr, "FAIL trunc sNaN (0x%08X): expected 0x%04X, got 0x%04X\n",
-				float_bits(snan_val), expected, got);
+			fprintf(stderr, "FAIL trunc sNaN: expected 0x%04X, got 0x%04X\n", expected, got);
 			trunc_failures++;
 		}
-		trunc_tests_count++;
 	}
 
-	// Exhaustive round-trip: for every f16 value, trunc(extend(h)) == h
+	// Exhaustive round-trip: for every non-NaN f16 value, trunc(extend(h)) == h
 	int roundtrip_failures = 0;
 	for (uint32_t h = 0; h < 0x10000; h++) {
 		uint16_t h16 = (uint16_t)h;
-		// Skip NaN values -- multiple f16 NaN patterns may collapse
 		if ((h16 & 0x7C00) == 0x7C00 && (h16 & 0x03FF) != 0) continue;
 
 		float f = jit_extend(h16);
 		uint16_t back = jit_trunc(f);
 		if (back != h16) {
 			if (roundtrip_failures < 10) {
-				fprintf(stderr, "FAIL roundtrip 0x%04X -> %g -> 0x%04X\n",
-					h16, f, back);
+				fprintf(stderr, "FAIL roundtrip 0x%04X -> %g -> 0x%04X\n", h16, f, back);
 			}
 			roundtrip_failures++;
 		}
 	}
-	trunc_tests_count += (0x10000 - 2046); // approximate non-NaN count
 
 	printf("%s   __truncsfhf2: %d structured, %d roundtrip failures\n",
 		(trunc_failures == 0 && roundtrip_failures == 0) ? "OK  " : "FAIL",
@@ -416,7 +462,7 @@ int main(void) {
 	int total_failures = failures + trunc_failures + roundtrip_failures;
 	printf("\n%s\n", total_failures == 0 ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
 
-	LLVMDisposeExecutionEngine(ee); // also disposes mod
+	LLVMDisposeExecutionEngine(ee);
 	LLVMContextDispose(ctx);
 
 	return total_failures != 0;

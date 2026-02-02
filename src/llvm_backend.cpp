@@ -3008,13 +3008,24 @@ gb_internal void lb_emit_lto_soft_float_builtins(lbModule *m) {
 	LLVMModuleRef mod = m->mod;
 	LLVMContextRef ctx = m->ctx;
 
-	LLVMTypeRef i16_type = LLVMInt16TypeInContext(ctx);
-	LLVMTypeRef i32_type = LLVMInt32TypeInContext(ctx);
-	LLVMTypeRef f32_type = LLVMFloatTypeInContext(ctx);
+	LLVMTypeRef i16_type  = LLVMInt16TypeInContext(ctx);
+	LLVMTypeRef i32_type  = LLVMInt32TypeInContext(ctx);
+	LLVMTypeRef f32_type  = LLVMFloatTypeInContext(ctx);
+	LLVMTypeRef half_type = LLVMHalfTypeInContext(ctx);
 
-	// __extendhfsf2: i16 -> float (f16 to f32 conversion)
+	// LLVM 15+ changed the ABI: these builtins use 'half' (XMM0) not 'i16' (GPR).
+	// Use 'half' for the external signature and bitcast to i16 internally.
+#if LLVM_VERSION_MAJOR >= 15
+	LLVMTypeRef h_param_type = half_type;
+	LLVMTypeRef h_ret_type   = half_type;
+#else
+	LLVMTypeRef h_param_type = i16_type;
+	LLVMTypeRef h_ret_type   = i16_type;
+#endif
+
+	// __extendhfsf2: half -> float (f16 to f32 conversion)
 	{
-		LLVMTypeRef param_types[] = { i16_type };
+		LLVMTypeRef param_types[] = { h_param_type };
 		LLVMTypeRef fn_type = LLVMFunctionType(f32_type, param_types, 1, false);
 		LLVMValueRef fn = LLVMAddFunction(mod, "__extendhfsf2", fn_type);
 		LLVMSetLinkage(fn, LLVMWeakAnyLinkage);
@@ -3023,7 +3034,10 @@ gb_internal void lb_emit_lto_soft_float_builtins(lbModule *m) {
 		LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
 		LLVMPositionBuilderAtEnd(b, entry);
 
-		LLVMValueRef value = LLVMGetParam(fn, 0); // i16
+		LLVMValueRef param = LLVMGetParam(fn, 0);
+		LLVMValueRef value = (h_param_type == half_type)
+			? LLVMBuildBitCast(b, param, i16_type, "to_i16")
+			: param;
 
 		// magic = bitcast((254-15)<<23, float)
 		LLVMValueRef magic_i32 = LLVMConstInt(i32_type, (254u - 15u) << 23, false);
@@ -3064,10 +3078,10 @@ gb_internal void lb_emit_lto_soft_float_builtins(lbModule *m) {
 		LLVMDisposeBuilder(b);
 	}
 
-	// __truncsfhf2: float -> i16 (f32 to f16 conversion)
+	// __truncsfhf2: float -> half (f32 to f16 conversion)
 	{
 		LLVMTypeRef param_types[] = { f32_type };
-		LLVMTypeRef fn_type = LLVMFunctionType(i16_type, param_types, 1, false);
+		LLVMTypeRef fn_type = LLVMFunctionType(h_ret_type, param_types, 1, false);
 		LLVMValueRef fn = LLVMAddFunction(mod, "__truncsfhf2", fn_type);
 		LLVMSetLinkage(fn, LLVMWeakAnyLinkage);
 
@@ -3088,6 +3102,15 @@ gb_internal void lb_emit_lto_soft_float_builtins(lbModule *m) {
 		LLVMBasicBlockRef bb_norm_done   = LLVMAppendBasicBlockInContext(ctx, fn, "norm_done");
 
 		LLVMBuilderRef b = LLVMCreateBuilderInContext(ctx);
+
+		// Helper: truncate i32 result to the return type (i16 or half)
+		auto ret_i32 = [&](LLVMValueRef v, const char *name) {
+			LLVMValueRef i16_val = LLVMBuildTrunc(b, v, i16_type, name);
+			if (h_ret_type == half_type) {
+				return LLVMBuildBitCast(b, i16_val, half_type, "to_half");
+			}
+			return i16_val;
+		};
 
 		// --- entry ---
 		LLVMPositionBuilderAtEnd(b, entry);
@@ -3110,7 +3133,7 @@ gb_internal void lb_emit_lto_soft_float_builtins(lbModule *m) {
 
 		// --- tiny_ret: return s ---
 		LLVMPositionBuilderAtEnd(b, bb_tiny_ret);
-		LLVMBuildRet(b, LLVMBuildTrunc(b, s, i16_type, "tiny_ret_val"));
+		LLVMBuildRet(b, ret_i32(s, "tiny_ret_val"));
 
 		// --- denorm_round ---
 		LLVMPositionBuilderAtEnd(b, bb_denorm_round);
@@ -3127,7 +3150,7 @@ gb_internal void lb_emit_lto_soft_float_builtins(lbModule *m) {
 		LLVMValueRef m_denorm = LLVMBuildSelect(b, needs_round, m_rounded, m_shifted, "m_denorm");
 		LLVMValueRef m_final_d = LLVMBuildLShr(b, m_denorm, LLVMConstInt(i32_type, 13, false), "m_final_d");
 		LLVMValueRef res_d = LLVMBuildOr(b, s, m_final_d, "res_d");
-		LLVMBuildRet(b, LLVMBuildTrunc(b, res_d, i16_type, "res_d_i16"));
+		LLVMBuildRet(b, ret_i32(res_d, "res_d_i16"));
 
 		// --- inf_nan ---
 		LLVMPositionBuilderAtEnd(b, bb_inf_nan);
@@ -3141,7 +3164,7 @@ gb_internal void lb_emit_lto_soft_float_builtins(lbModule *m) {
 
 		// --- inf_ret: return s | 0x7C00 ---
 		LLVMPositionBuilderAtEnd(b, bb_inf_ret2);
-		LLVMBuildRet(b, LLVMBuildTrunc(b, LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, false), "inf_val"), i16_type, "inf_ret_val"));
+		LLVMBuildRet(b, ret_i32(LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, false), "inf_val"), "inf_ret_val"));
 
 		// --- nan ---
 		LLVMPositionBuilderAtEnd(b, bb_nan);
@@ -3151,7 +3174,7 @@ gb_internal void lb_emit_lto_soft_float_builtins(lbModule *m) {
 		LLVMValueRef res_nan = LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, false), "res_nan_1");
 		res_nan = LLVMBuildOr(b, res_nan, m_nan, "res_nan_2");
 		res_nan = LLVMBuildOr(b, res_nan, m_nan_fix, "res_nan");
-		LLVMBuildRet(b, LLVMBuildTrunc(b, res_nan, i16_type, "res_nan_i16"));
+		LLVMBuildRet(b, ret_i32(res_nan, "res_nan_i16"));
 
 		// --- normal ---
 		LLVMPositionBuilderAtEnd(b, bb_normal);
@@ -3188,7 +3211,7 @@ gb_internal void lb_emit_lto_soft_float_builtins(lbModule *m) {
 
 		// --- overflow ---
 		LLVMPositionBuilderAtEnd(b, bb_overflow);
-		LLVMBuildRet(b, LLVMBuildTrunc(b, LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, false), "res_ovf"), i16_type, "res_ovf_i16"));
+		LLVMBuildRet(b, ret_i32(LLVMBuildOr(b, s, LLVMConstInt(i32_type, 0x7C00, false), "res_ovf"), "res_ovf_i16"));
 
 		// --- norm_done ---
 		LLVMPositionBuilderAtEnd(b, bb_norm_done);
@@ -3196,7 +3219,7 @@ gb_internal void lb_emit_lto_soft_float_builtins(lbModule *m) {
 		LLVMValueRef m_shifted2 = LLVMBuildLShr(b, m_phi, LLVMConstInt(i32_type, 13, false), "m_shifted2");
 		LLVMValueRef res_n = LLVMBuildOr(b, s, e_shifted, "res_n_1");
 		res_n = LLVMBuildOr(b, res_n, m_shifted2, "res_n");
-		LLVMBuildRet(b, LLVMBuildTrunc(b, res_n, i16_type, "res_n_i16"));
+		LLVMBuildRet(b, ret_i32(res_n, "res_n_i16"));
 
 		LLVMDisposeBuilder(b);
 	}
