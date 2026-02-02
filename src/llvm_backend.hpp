@@ -191,9 +191,9 @@ struct lbModule {
 
 	// TBAA metadata
 	LLVMMetadataRef tbaa_root;
-	LLVMMetadataRef tbaa_omnipotent;
 	unsigned        tbaa_kind_id;
 	RecursiveMutex  tbaa_mutex;
+	StringMap<LLVMMetadataRef>      tbaa_type_nodes;
 	PtrMap<Type *, LLVMMetadataRef> tbaa_access_tags;
 
 	StringMap<lbAddr> objc_classes;

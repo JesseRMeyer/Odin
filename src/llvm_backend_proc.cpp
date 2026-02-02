@@ -194,7 +194,7 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 	}
 
 	// mustprogress — tells LLVM the function makes forward progress (enables loop optimizations)
-	if (!pt->Proc.diverging) {
+	if (!pt->Proc.diverging && build_context.optimization_level > 0) {
 		lb_add_attribute_to_proc(m, p->value, "mustprogress");
 	}
 

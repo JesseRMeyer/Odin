@@ -140,11 +140,8 @@ gb_internal WORKER_TASK_PROC(lb_init_module_worker_proc) {
 		LLVMMetadataRef root_str = LLVMMDStringInContext2(m->ctx, "Odin TBAA", 9);
 		m->tbaa_root = LLVMMDNodeInContext2(m->ctx, &root_str, 1);
 
-		LLVMMetadataRef omni_str = LLVMMDStringInContext2(m->ctx, "omnipotent char", 15);
-		LLVMMetadataRef omni_ops[3] = { omni_str, m->tbaa_root, LLVMValueAsMetadata(LLVMConstInt(LLVMInt64TypeInContext(m->ctx), 0, false)) };
-		m->tbaa_omnipotent = LLVMMDNodeInContext2(m->ctx, omni_ops, 3);
-
 		m->tbaa_kind_id = LLVMGetMDKindIDInContext(m->ctx, "tbaa", 4);
+		string_map_init(&m->tbaa_type_nodes);
 		map_init(&m->tbaa_access_tags);
 	}
 
@@ -1127,9 +1124,16 @@ gb_internal void lb_addr_store(lbProcedure *p, lbAddr addr, lbValue value) {
 }
 
 gb_internal LLVMMetadataRef lb_get_tbaa_type_node(lbModule *m, char const *name, isize name_len) {
+	String key = make_string(cast(u8 const *)name, name_len);
+	LLVMMetadataRef *found = string_map_get(&m->tbaa_type_nodes, key);
+	if (found) {
+		return *found;
+	}
 	LLVMMetadataRef name_md = LLVMMDStringInContext2(m->ctx, name, name_len);
 	LLVMMetadataRef ops[3] = { name_md, m->tbaa_root, LLVMValueAsMetadata(LLVMConstInt(LLVMInt64TypeInContext(m->ctx), 0, false)) };
-	return LLVMMDNodeInContext2(m->ctx, ops, 3);
+	LLVMMetadataRef node = LLVMMDNodeInContext2(m->ctx, ops, 3);
+	string_map_set(&m->tbaa_type_nodes, key, node);
+	return node;
 }
 
 gb_internal LLVMMetadataRef lb_make_tbaa_access_tag(lbModule *m, LLVMMetadataRef type_node) {
