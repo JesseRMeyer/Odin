@@ -39,7 +39,7 @@ count_zeros          :: proc(x: $T) -> T where type_is_integer(T) || type_is_sim
 count_trailing_zeros :: proc(x: $T) -> T where type_is_integer(T) || type_is_simd_vector(T) ---
 count_leading_zeros  :: proc(x: $T) -> T where type_is_integer(T) || type_is_simd_vector(T) ---
 reverse_bits         :: proc(x: $T) -> T where type_is_integer(T) || type_is_simd_vector(T) ---
-byte_swap            :: proc(x: $T) -> T where type_is_integer(T) || type_is_float(T) ---
+byte_swap            :: proc(x: $T) -> T where type_is_integer(T) || type_is_float(T) || type_is_simd_vector(T) ---
 
 overflow_add :: proc(lhs, rhs: $T) -> (T, bool) where type_is_integer(T) #optional_ok ---
 overflow_sub :: proc(lhs, rhs: $T) -> (T, bool) where type_is_integer(T) #optional_ok ---
@@ -254,7 +254,8 @@ constant_round :: proc($v: $T) -> T where type_is_integer(T) || type_is_float(T)
 simd_add  :: proc(a, b: #simd[N]T) -> #simd[N]T ---
 simd_sub  :: proc(a, b: #simd[N]T) -> #simd[N]T ---
 simd_mul  :: proc(a, b: #simd[N]T) -> #simd[N]T ---
-simd_div  :: proc(a, b: #simd[N]T) -> #simd[N]T where type_is_float(T) ---
+simd_div  :: proc(a, b: #simd[N]T) -> #simd[N]T ---
+simd_rem  :: proc(a, b: #simd[N]T) -> #simd[N]T where type_is_integer(T) ---
 
 simd_saturating_add  :: proc(a, b: #simd[N]T) -> #simd[N]T where type_is_integer(T) ---
 simd_saturating_sub  :: proc(a, b: #simd[N]T) -> #simd[N]T where type_is_integer(T) ---
@@ -273,10 +274,34 @@ simd_bit_and     :: proc(a, b: #simd[N]T) -> #simd[N]T ---
 simd_bit_or      :: proc(a, b: #simd[N]T) -> #simd[N]T ---
 simd_bit_xor     :: proc(a, b: #simd[N]T) -> #simd[N]T ---
 simd_bit_and_not :: proc(a, b: #simd[N]T) -> #simd[N]T ---
+simd_bit_not     :: proc(a: #simd[N]T) -> #simd[N]T where type_is_integer(T) || type_is_boolean(T) ---
 
 simd_neg  :: proc(a: #simd[N]T) -> #simd[N]T ---
 
 simd_abs :: proc(a: #simd[N]T) -> #simd[N]T ---
+
+// Per-lane copysign (IEEE 754): result has magnitude of mag and sign of sgn.
+simd_copysign :: proc(mag, sgn: #simd[N]T) -> #simd[N]T where type_is_float(T) ---
+
+// Exact reciprocal: result = 1/a.
+// Produces bit-exact results across all platforms.
+simd_rcp :: proc(a: #simd[N]T) -> #simd[N]T where type_is_float(T) ---
+
+// Fast approximate reciprocal: result ≈ 1/a.
+// On x86 with f32x4 or f32x8, uses hardware reciprocal instruction (~12-bit precision).
+// On other targets or element types, falls back to exact division.
+// Use when speed matters more than precision; results may vary across platforms.
+simd_rcp_fast :: proc(a: #simd[N]T) -> #simd[N]T where type_is_float(T) ---
+
+// Exact reciprocal square root: result = 1/sqrt(a).
+// Produces bit-exact results across all platforms.
+simd_rsqrt :: proc(a: #simd[N]T) -> #simd[N]T where type_is_float(T) ---
+
+// Fast approximate reciprocal square root: result ≈ 1/sqrt(a).
+// On x86 with f32x4 or f32x8, uses hardware rsqrt instruction (~12-bit precision).
+// On other targets or element types, falls back to exact computation.
+// Use when speed matters more than precision; results may vary across platforms.
+simd_rsqrt_fast :: proc(a: #simd[N]T) -> #simd[N]T where type_is_float(T) ---
 
 simd_min   :: proc(a, b: #simd[N]T) -> #simd[N]T ---
 simd_max   :: proc(a, b: #simd[N]T) -> #simd[N]T ---
@@ -326,6 +351,45 @@ simd_masked_expand_load    :: proc(ptr: rawptr, val: #simd[N]T, mask: #simd[N]U)
 simd_masked_compress_store :: proc(ptr: rawptr, val: #simd[N]T, mask: #simd[N]U)              where type_is_integer(U) || type_is_boolean(U) ---
 
 simd_indices :: proc($T: typeid/#simd[$N]$E) -> T where type_is_numeric(T) ---
+
+// Integer sign-extension: each lane sign-extends to a wider integer.
+simd_sext :: proc(a: #simd[N]T, $Out: typeid/#simd[N]U) -> #simd[N]U where type_is_integer(T), type_is_integer(U) ---
+// Integer zero-extension: each lane zero-extends to a wider integer.
+simd_zext :: proc(a: #simd[N]T, $Out: typeid/#simd[N]U) -> #simd[N]U where type_is_integer(T), type_is_integer(U) ---
+// Integer narrowing: each lane truncates to a narrower integer (no clamping).
+simd_narrow :: proc(a: #simd[N]T, $Out: typeid/#simd[N]U) -> #simd[N]U where type_is_integer(T), type_is_integer(U) ---
+// Signed saturating narrow: each lane clamps to signed destination range, then truncates.
+simd_narrow_sat :: proc(a: #simd[N]T, $Out: typeid/#simd[N]U) -> #simd[N]U where type_is_integer(T), type_is_integer(U) ---
+// Unsigned saturating narrow: each lane clamps to unsigned destination range (negatives become 0), then truncates.
+simd_narrow_usat :: proc(a: #simd[N]T, $Out: typeid/#simd[N]U) -> #simd[N]U where type_is_integer(T), type_is_integer(U) ---
+// Float to integer conversion (truncation toward zero, saturating).
+// Out-of-range values clamp to the integer min/max; NaN maps to 0.
+simd_ftoi :: proc(a: #simd[N]T, $Out: typeid/#simd[N]U) -> #simd[N]U where type_is_float(T), type_is_integer(U) ---
+// Integer to float conversion.
+simd_itof :: proc(a: #simd[N]T, $Out: typeid/#simd[N]U) -> #simd[N]U where type_is_integer(T), type_is_float(U) ---
+// Float precision extension (e.g. f32 -> f64).
+simd_fpext :: proc(a: #simd[N]T, $Out: typeid/#simd[N]U) -> #simd[N]U where type_is_float(T), type_is_float(U) ---
+// Float precision truncation (e.g. f64 -> f32).
+simd_fptrunc :: proc(a: #simd[N]T, $Out: typeid/#simd[N]U) -> #simd[N]U where type_is_float(T), type_is_float(U) ---
+
+// Horizontal pairwise add: adds adjacent pairs of elements.
+// Given input [a0, a1, a2, a3, ...], returns [a0+a1, a2+a3, ...].
+// The output vector has half the lane count of the input.
+//
+// NOTE: This differs from x86's haddps which takes two vectors and interleaves
+// their horizontal sums. This intrinsic operates on a single vector and is
+// designed to compose well for iterative reduction (apply repeatedly to sum
+// all elements).
+//
+// Example: simd_hadd([1, 2, 3, 4]) = [3, 7]  (1+2=3, 3+4=7)
+simd_hadd :: proc(a: #simd[N]T) -> #simd[N/2]T where type_is_integer(T) || type_is_float(T) ---
+
+// Horizontal pairwise subtract: subtracts adjacent pairs of elements.
+// Given input [a0, a1, a2, a3, ...], returns [a0-a1, a2-a3, ...].
+// The output vector has half the lane count of the input.
+//
+// Example: simd_hsub([4, 1, 6, 2]) = [3, 4]  (4-1=3, 6-2=4)
+simd_hsub :: proc(a: #simd[N]T) -> #simd[N/2]T where type_is_integer(T) || type_is_float(T) ---
 
 simd_shuffle :: proc(a, b: #simd[N]T, indices: ..int) -> #simd[len(indices)]T ---
 simd_select  :: proc(cond: #simd[N]boolean_or_integer, true, false: #simd[N]T) -> #simd[N]T ---

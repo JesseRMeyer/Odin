@@ -1356,6 +1356,137 @@ gb_internal lbValue lb_build_builtin_simd_proc(lbProcedure *p, Ast *expr, TypeAn
 		res.value = LLVMConstVector(scalars, cast(unsigned)count);
 		return res;
 	}
+
+	// Type conversion intrinsics: arg[0] is value, arg[1] is type (must not lb_build_expr on it)
+	case BuiltinProc_simd_sext:
+	case BuiltinProc_simd_zext:
+	case BuiltinProc_simd_narrow:
+	case BuiltinProc_simd_narrow_sat:
+	case BuiltinProc_simd_narrow_usat:
+	case BuiltinProc_simd_ftoi:
+	case BuiltinProc_simd_itof:
+	case BuiltinProc_simd_fpext:
+	case BuiltinProc_simd_fptrunc:
+	{
+		lbValue arg0 = lb_build_expr(p, ce->args[0]);
+		Type *src_elem = base_array_type(arg0.type);
+
+		switch (builtin_id) {
+		case BuiltinProc_simd_sext:
+			res.value = LLVMBuildSExt(p->builder, arg0.value, lb_type(m, res.type), "");
+			break;
+		case BuiltinProc_simd_zext:
+			res.value = LLVMBuildZExt(p->builder, arg0.value, lb_type(m, res.type), "");
+			break;
+		case BuiltinProc_simd_narrow:
+			res.value = LLVMBuildTrunc(p->builder, arg0.value, lb_type(m, res.type), "");
+			break;
+		case BuiltinProc_simd_narrow_sat:
+		case BuiltinProc_simd_narrow_usat:
+		{
+			// Saturating narrow: clamp each lane to the destination range, then truncate.
+			//
+			// Signedness considerations:
+			// - src_signed: determines comparison predicates (signed vs unsigned compare)
+			// - dst_unsigned (narrow_usat): clamp to [0, 2^n-1] instead of [-(2^(n-1)), 2^(n-1)-1]
+			//
+			// For unsigned source with signed saturation (narrow_sat):
+			//   Min clamp is skipped entirely since unsigned values are always >= 0.
+			//   Only the max clamp (positive bound) is needed.
+			//
+			// For signed source with unsigned saturation (narrow_usat):
+			//   Negative values are explicitly clamped to 0 first using a signed comparison.
+
+			Type *dst_elem = base_array_type(res.type);
+			bool src_signed = !is_type_unsigned(src_elem);
+			bool dst_unsigned = (builtin_id == BuiltinProc_simd_narrow_usat);
+			i64 dst_bits = 8*type_size_of(dst_elem);
+			LLVMTypeRef src_vec_type = lb_type(m, arg0.type);
+			unsigned vec_len = LLVMGetVectorSize(src_vec_type);
+			LLVMTypeRef elem_type = LLVMGetElementType(src_vec_type);
+
+			// Helper: create a constant splat vector
+			#define CONST_INT_SPLAT(val, sign_ext) do { \
+				LLVMValueRef scalar = LLVMConstInt(elem_type, val, sign_ext); \
+				LLVMValueRef *elems = gb_alloc_array(temporary_allocator(), LLVMValueRef, vec_len); \
+				for (unsigned _i = 0; _i < vec_len; _i++) elems[_i] = scalar; \
+				splat = LLVMConstVector(elems, vec_len); \
+			} while(0)
+
+			LLVMValueRef clamped = arg0.value;
+			LLVMValueRef splat;
+
+			if (!dst_unsigned) {
+				// Signed saturation: clamp to [-(2^(n-1)), 2^(n-1)-1]
+				i64 min_val = -(1LL << (dst_bits - 1));
+				i64 max_val = (1LL << (dst_bits - 1)) - 1;
+
+				// Min clamp only needed for signed sources.
+				// Unsigned sources are always >= 0, which is always >= min_val (negative).
+				if (src_signed) {
+					CONST_INT_SPLAT(cast(unsigned long long)min_val, true);
+					LLVMValueRef min_splat = splat;
+					LLVMValueRef too_low = LLVMBuildICmp(p->builder, LLVMIntSLT, clamped, min_splat, "");
+					clamped = LLVMBuildSelect(p->builder, too_low, min_splat, clamped, "");
+				}
+
+				// Max clamp for all sources
+				LLVMIntPredicate gt_pred = src_signed ? LLVMIntSGT : LLVMIntUGT;
+				CONST_INT_SPLAT(cast(unsigned long long)max_val, false);
+				LLVMValueRef max_splat = splat;
+				LLVMValueRef too_high = LLVMBuildICmp(p->builder, gt_pred, clamped, max_splat, "");
+				clamped = LLVMBuildSelect(p->builder, too_high, max_splat, clamped, "");
+			} else {
+				// Unsigned saturation: clamp to [0, 2^n-1]
+				u64 max_val = (dst_bits == 64) ? ~(u64)0 : ((u64)1 << dst_bits) - 1;
+
+				// Clamp negatives to 0 (only matters for signed source)
+				if (src_signed) {
+					CONST_INT_SPLAT(0, false);
+					LLVMValueRef zero_splat = splat;
+					LLVMValueRef neg = LLVMBuildICmp(p->builder, LLVMIntSLT, clamped, zero_splat, "");
+					clamped = LLVMBuildSelect(p->builder, neg, zero_splat, clamped, "");
+				}
+
+				LLVMIntPredicate gt_pred = src_signed ? LLVMIntSGT : LLVMIntUGT;
+				CONST_INT_SPLAT(max_val, false);
+				LLVMValueRef max_splat = splat;
+				LLVMValueRef too_high = LLVMBuildICmp(p->builder, gt_pred, clamped, max_splat, "");
+				clamped = LLVMBuildSelect(p->builder, too_high, max_splat, clamped, "");
+			}
+
+			#undef CONST_INT_SPLAT
+
+			res.value = LLVMBuildTrunc(p->builder, clamped, lb_type(m, res.type), "");
+			break;
+		}
+		case BuiltinProc_simd_ftoi:
+		{
+			Type *dst_elem = base_array_type(res.type);
+			LLVMTypeRef dst_type = lb_type(m, res.type);
+			LLVMTypeRef src_type = LLVMTypeOf(arg0.value);
+			char const *name = is_type_unsigned(dst_elem) ? "llvm.fptoui.sat" : "llvm.fptosi.sat";
+			LLVMTypeRef types[2] = {dst_type, src_type};
+			LLVMValueRef args[1] = {arg0.value};
+			res.value = lb_call_intrinsic(p, name, args, 1, types, 2);
+			break;
+		}
+		case BuiltinProc_simd_itof:
+			if (is_type_unsigned(src_elem)) {
+				res.value = LLVMBuildUIToFP(p->builder, arg0.value, lb_type(m, res.type), "");
+			} else {
+				res.value = LLVMBuildSIToFP(p->builder, arg0.value, lb_type(m, res.type), "");
+			}
+			break;
+		case BuiltinProc_simd_fpext:
+			res.value = LLVMBuildFPExt(p->builder, arg0.value, lb_type(m, res.type), "");
+			break;
+		case BuiltinProc_simd_fptrunc:
+			res.value = LLVMBuildFPTrunc(p->builder, arg0.value, lb_type(m, res.type), "");
+			break;
+		}
+		return res;
+	}
 	}
 
 	lbValue arg0 = {}; if (ce->args.count > 0) arg0 = lb_build_expr(p, ce->args[0]);
@@ -1381,6 +1512,7 @@ gb_internal lbValue lb_build_builtin_simd_proc(lbProcedure *p, Ast *expr, TypeAn
 			case BuiltinProc_simd_sub: op_code = LLVMFSub; break;
 			case BuiltinProc_simd_mul: op_code = LLVMFMul; break;
 			case BuiltinProc_simd_div: op_code = LLVMFDiv; break;
+			case BuiltinProc_simd_rem: GB_PANIC("simd_rem is not supported for float elements"); break;
 			}
 		} else {
 			switch (builtin_id) {
@@ -1461,6 +1593,9 @@ gb_internal lbValue lb_build_builtin_simd_proc(lbProcedure *p, Ast *expr, TypeAn
 			return res;
 		}
 		break;
+	case BuiltinProc_simd_bit_not:
+		res.value = LLVMBuildNot(p->builder, arg0.value, "");
+		return res;
 	case BuiltinProc_simd_neg:
 		if (is_float) {
 			res.value = LLVMBuildFNeg(p->builder, arg0.value, "");
@@ -1470,33 +1605,160 @@ gb_internal lbValue lb_build_builtin_simd_proc(lbProcedure *p, Ast *expr, TypeAn
 		return res;
 	case BuiltinProc_simd_abs:
 		if (is_float) {
-			LLVMValueRef pos = arg0.value;
-			LLVMValueRef neg = LLVMBuildFNeg(p->builder, pos, "");
-			LLVMValueRef cond = LLVMBuildFCmp(p->builder, LLVMRealOGT, pos, neg, "");
-			res.value = LLVMBuildSelect(p->builder, cond, pos, neg, "");
+			char const *name = "llvm.fabs";
+			LLVMTypeRef types[1] = {lb_type(p->module, res.type)};
+			LLVMValueRef args[1] = {arg0.value};
+			res.value = lb_call_intrinsic(p, name, args, 1, types, 1);
+		} else if (!is_signed) {
+			// Unsigned abs is identity
+			res.value = arg0.value;
 		} else {
-			LLVMValueRef pos = arg0.value;
-			LLVMValueRef neg = LLVMBuildNeg(p->builder, pos, "");
-			LLVMValueRef cond = LLVMBuildICmp(p->builder, is_signed ? LLVMIntSGT : LLVMIntUGT, pos, neg, "");
-			res.value = LLVMBuildSelect(p->builder, cond, pos, neg, "");
+			// Signed integer abs
+			LLVMTypeRef types[1] = {lb_type(p->module, res.type)};
+			LLVMValueRef args[2] = {
+				arg0.value,
+				LLVMConstInt(LLVMInt1TypeInContext(m->ctx), 0, false), // is_int_min_poison = false
+			};
+			res.value = lb_call_intrinsic(p, "llvm.abs", args, 2, types, 1);
 		}
 		return res;
 	case BuiltinProc_simd_min:
-		if (is_float) {
-			return lb_emit_min(p, res.type, arg0, arg1);
-		} else {
-			LLVMValueRef cond = LLVMBuildICmp(p->builder, is_signed ? LLVMIntSLT : LLVMIntULT, arg0.value, arg1.value, "");
-			res.value = LLVMBuildSelect(p->builder, cond, arg0.value, arg1.value, "");
-		}
-		return res;
+		return lb_emit_min(p, res.type, arg0, arg1);
 	case BuiltinProc_simd_max:
-		if (is_float) {
-			return lb_emit_max(p, res.type, arg0, arg1);
-		} else {
-			LLVMValueRef cond = LLVMBuildICmp(p->builder, is_signed ? LLVMIntSGT : LLVMIntUGT, arg0.value, arg1.value, "");
-			res.value = LLVMBuildSelect(p->builder, cond, arg0.value, arg1.value, "");
+		return lb_emit_max(p, res.type, arg0, arg1);
+	case BuiltinProc_simd_copysign:
+		{
+			char const *name = "llvm.copysign";
+			LLVMTypeRef types[1] = {lb_type(m, res.type)};
+			LLVMValueRef args[2] = {arg0.value, arg1.value};
+			res.value = lb_call_intrinsic(p, name, args, 2, types, 1);
+			return res;
 		}
-		return res;
+	case BuiltinProc_simd_rcp:
+		{
+			// Exact reciprocal: 1.0 / a (bit-exact across all platforms)
+			LLVMTypeRef vec_type = lb_type(m, res.type);
+			unsigned vec_len = LLVMGetVectorSize(vec_type);
+			LLVMValueRef one = LLVMConstReal(LLVMGetElementType(vec_type), 1.0);
+			LLVMValueRef *ones = gb_alloc_array(temporary_allocator(), LLVMValueRef, vec_len);
+			for (unsigned i = 0; i < vec_len; i++) ones[i] = one;
+			LLVMValueRef ones_vec = LLVMConstVector(ones, vec_len);
+			res.value = LLVMBuildFDiv(p->builder, ones_vec, arg0.value, "");
+			return res;
+		}
+	case BuiltinProc_simd_rcp_fast:
+		{
+			// Fast approximate reciprocal: uses hardware intrinsics where available
+			LLVMTypeRef vec_type = lb_type(m, res.type);
+			unsigned vec_len = LLVMGetVectorSize(vec_type);
+			i64 elem_sz = type_size_of(elem);
+			bool is_x86 = (build_context.metrics.arch == TargetArch_amd64 || build_context.metrics.arch == TargetArch_i386);
+
+			// x86 f32: use hardware approximate reciprocal (rcpps, ~12-bit precision)
+			// SSE rcpps works on 4-lane, AVX vrcpps works on 8-lane (requires AVX)
+			if (is_x86 && elem_sz == 4 && vec_len == 4) {
+				LLVMValueRef args[1] = {arg0.value};
+				res.value = lb_call_intrinsic(p, "llvm.x86.sse.rcp.ps", args, 1, nullptr, 0);
+			} else if (is_x86 && elem_sz == 4 && vec_len == 8 && check_target_feature_is_enabled(str_lit("avx"), nullptr)) {
+				LLVMValueRef args[1] = {arg0.value};
+				res.value = lb_call_intrinsic(p, "llvm.x86.avx.rcp.ps.256", args, 1, nullptr, 0);
+			} else {
+				// Fallback: exact 1.0 / a
+				LLVMValueRef one = LLVMConstReal(LLVMGetElementType(vec_type), 1.0);
+				LLVMValueRef *ones = gb_alloc_array(temporary_allocator(), LLVMValueRef, vec_len);
+				for (unsigned i = 0; i < vec_len; i++) ones[i] = one;
+				LLVMValueRef ones_vec = LLVMConstVector(ones, vec_len);
+				res.value = LLVMBuildFDiv(p->builder, ones_vec, arg0.value, "");
+			}
+			return res;
+		}
+	case BuiltinProc_simd_rsqrt:
+		{
+			// Exact reciprocal sqrt: 1.0 / sqrt(a) (bit-exact across all platforms)
+			LLVMTypeRef vec_type = lb_type(m, res.type);
+			unsigned vec_len = LLVMGetVectorSize(vec_type);
+
+			char const *sqrt_name = "llvm.sqrt";
+			LLVMTypeRef types[1] = {vec_type};
+			LLVMValueRef sqrt_args[1] = {arg0.value};
+			LLVMValueRef sqrt_val = lb_call_intrinsic(p, sqrt_name, sqrt_args, 1, types, 1);
+
+			LLVMValueRef one = LLVMConstReal(LLVMGetElementType(vec_type), 1.0);
+			LLVMValueRef *ones = gb_alloc_array(temporary_allocator(), LLVMValueRef, vec_len);
+			for (unsigned i = 0; i < vec_len; i++) ones[i] = one;
+			LLVMValueRef ones_vec = LLVMConstVector(ones, vec_len);
+			res.value = LLVMBuildFDiv(p->builder, ones_vec, sqrt_val, "");
+			return res;
+		}
+	case BuiltinProc_simd_rsqrt_fast:
+		{
+			// Fast approximate reciprocal sqrt: uses hardware intrinsics where available
+			LLVMTypeRef vec_type = lb_type(m, res.type);
+			unsigned vec_len = LLVMGetVectorSize(vec_type);
+			i64 elem_sz = type_size_of(elem);
+			bool is_x86 = (build_context.metrics.arch == TargetArch_amd64 || build_context.metrics.arch == TargetArch_i386);
+
+			// x86 f32: use hardware approximate reciprocal sqrt (rsqrtps, ~12-bit precision)
+			// SSE rsqrtps works on 4-lane, AVX vrsqrtps works on 8-lane (requires AVX)
+			if (is_x86 && elem_sz == 4 && vec_len == 4) {
+				LLVMValueRef args[1] = {arg0.value};
+				res.value = lb_call_intrinsic(p, "llvm.x86.sse.rsqrt.ps", args, 1, nullptr, 0);
+			} else if (is_x86 && elem_sz == 4 && vec_len == 8 && check_target_feature_is_enabled(str_lit("avx"), nullptr)) {
+				LLVMValueRef args[1] = {arg0.value};
+				res.value = lb_call_intrinsic(p, "llvm.x86.avx.rsqrt.ps.256", args, 1, nullptr, 0);
+			} else {
+				// Fallback: exact 1.0 / sqrt(a)
+				char const *sqrt_name = "llvm.sqrt";
+				LLVMTypeRef types[1] = {vec_type};
+				LLVMValueRef sqrt_args[1] = {arg0.value};
+				LLVMValueRef sqrt_val = lb_call_intrinsic(p, sqrt_name, sqrt_args, 1, types, 1);
+
+				LLVMValueRef one = LLVMConstReal(LLVMGetElementType(vec_type), 1.0);
+				LLVMValueRef *ones = gb_alloc_array(temporary_allocator(), LLVMValueRef, vec_len);
+				for (unsigned i = 0; i < vec_len; i++) ones[i] = one;
+				LLVMValueRef ones_vec = LLVMConstVector(ones, vec_len);
+				res.value = LLVMBuildFDiv(p->builder, ones_vec, sqrt_val, "");
+			}
+			return res;
+		}
+
+	// Horizontal pairwise operations
+	case BuiltinProc_simd_hadd:
+	case BuiltinProc_simd_hsub:
+		{
+			i64 src_count = base_type(arg0.type)->SimdVector.count;
+			i64 half = src_count / 2;
+
+			// Build even/odd shuffle masks
+			LLVMValueRef *even_indices = gb_alloc_array(temporary_allocator(), LLVMValueRef, half);
+			LLVMValueRef *odd_indices  = gb_alloc_array(temporary_allocator(), LLVMValueRef, half);
+			for (i64 i = 0; i < half; i++) {
+				even_indices[i] = LLVMConstInt(LLVMInt32TypeInContext(m->ctx), cast(unsigned long long)(2*i), false);
+				odd_indices[i]  = LLVMConstInt(LLVMInt32TypeInContext(m->ctx), cast(unsigned long long)(2*i + 1), false);
+			}
+			LLVMValueRef even_mask = LLVMConstVector(even_indices, cast(unsigned)half);
+			LLVMValueRef odd_mask  = LLVMConstVector(odd_indices, cast(unsigned)half);
+
+			LLVMValueRef poison = LLVMGetPoison(lb_type(m, arg0.type));
+			LLVMValueRef even = LLVMBuildShuffleVector(p->builder, arg0.value, poison, even_mask, "");
+			LLVMValueRef odd  = LLVMBuildShuffleVector(p->builder, arg0.value, poison, odd_mask, "");
+
+			if (is_float) {
+				if (builtin_id == BuiltinProc_simd_hadd) {
+					res.value = LLVMBuildFAdd(p->builder, even, odd, "");
+				} else {
+					res.value = LLVMBuildFSub(p->builder, even, odd, "");
+				}
+			} else {
+				if (builtin_id == BuiltinProc_simd_hadd) {
+					res.value = LLVMBuildAdd(p->builder, even, odd, "");
+				} else {
+					res.value = LLVMBuildSub(p->builder, even, odd, "");
+				}
+			}
+			return res;
+		}
+
 	case BuiltinProc_simd_lanes_eq:
 	case BuiltinProc_simd_lanes_ne:
 	case BuiltinProc_simd_lanes_lt:
@@ -2685,10 +2947,16 @@ gb_internal lbValue lb_build_builtin_proc(lbProcedure *p, Ast *expr, TypeAndValu
 			return lb_emit_transmute(p, abs, t);
 		}
 
-		lbValue zero = lb_const_nil(p->module, t);
-		lbValue cond = lb_emit_comp(p, Token_Lt, x, zero);
-		lbValue neg = lb_emit_unary_arith(p, Token_Sub, x, t);
-		return lb_emit_select(p, cond, neg, x);
+		// Signed integer abs
+		LLVMTypeRef types[1] = {lb_type(p->module, t)};
+		LLVMValueRef args[2] = {
+			x.value,
+			LLVMConstInt(LLVMInt1TypeInContext(p->module->ctx), 0, false), // is_int_min_poison = false
+		};
+		lbValue res = {};
+		res.value = lb_call_intrinsic(p, "llvm.abs", args, 2, types, 1);
+		res.type = t;
+		return res;
 	}
 
 	case BuiltinProc_clamp:

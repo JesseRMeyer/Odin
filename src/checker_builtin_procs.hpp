@@ -161,9 +161,16 @@ BuiltinProc__simd_begin,
 	BuiltinProc_simd_bit_or,
 	BuiltinProc_simd_bit_xor,
 	BuiltinProc_simd_bit_and_not,
+	BuiltinProc_simd_bit_not,
 
 	BuiltinProc_simd_neg,
 	BuiltinProc_simd_abs,
+
+	BuiltinProc_simd_copysign,
+	BuiltinProc_simd_rcp,
+	BuiltinProc_simd_rcp_fast,
+	BuiltinProc_simd_rsqrt,
+	BuiltinProc_simd_rsqrt_fast,
 
 	BuiltinProc_simd_min,
 	BuiltinProc_simd_max,
@@ -220,6 +227,19 @@ BuiltinProc__simd_begin,
 	BuiltinProc_simd_masked_compress_store,
 
 	BuiltinProc_simd_indices,
+
+	BuiltinProc_simd_sext,
+	BuiltinProc_simd_zext,
+	BuiltinProc_simd_narrow,
+	BuiltinProc_simd_narrow_sat,
+	BuiltinProc_simd_narrow_usat,
+	BuiltinProc_simd_ftoi,
+	BuiltinProc_simd_itof,
+	BuiltinProc_simd_fpext,
+	BuiltinProc_simd_fptrunc,
+
+	BuiltinProc_simd_hadd,
+	BuiltinProc_simd_hsub,
 
 
 	// Platform specific SIMD intrinsics
@@ -540,10 +560,17 @@ gb_global BuiltinProc builtin_procs[BuiltinProc_COUNT] = {
 	{STR_LIT("simd_bit_or"),  2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
 	{STR_LIT("simd_bit_xor"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
 	{STR_LIT("simd_bit_and_not"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_bit_not"), 1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
 
 	{STR_LIT("simd_neg"), 1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
 
 	{STR_LIT("simd_abs"), 1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+
+	{STR_LIT("simd_copysign"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_rcp"), 1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_rcp_fast"), 1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_rsqrt"), 1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_rsqrt_fast"), 1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
 
 	{STR_LIT("simd_min"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
 	{STR_LIT("simd_max"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
@@ -601,6 +628,19 @@ gb_global BuiltinProc builtin_procs[BuiltinProc_COUNT] = {
 	{STR_LIT("simd_masked_compress_store"), 3, false, Expr_Stmt, BuiltinProcPkg_intrinsics},
 
 	{STR_LIT("simd_indices"), 1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+
+	{STR_LIT("simd_sext"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_zext"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_narrow"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_narrow_sat"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_narrow_usat"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_ftoi"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_itof"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_fpext"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_fptrunc"), 2, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+
+	{STR_LIT("simd_hadd"), 1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
+	{STR_LIT("simd_hsub"), 1, false, Expr_Expr, BuiltinProcPkg_intrinsics},
 
 	{STR_LIT("simd_x86__MM_SHUFFLE"), 4, false, Expr_Expr, BuiltinProcPkg_intrinsics},
 

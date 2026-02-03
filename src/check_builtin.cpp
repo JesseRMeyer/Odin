@@ -778,6 +778,7 @@ gb_internal bool check_builtin_simd_operation(CheckerContext *c, Operand *operan
 	case BuiltinProc_simd_sub:
 	case BuiltinProc_simd_mul:
 	case BuiltinProc_simd_div:
+	case BuiltinProc_simd_rem:
 	case BuiltinProc_simd_min:
 	case BuiltinProc_simd_max:
 		{
@@ -810,9 +811,9 @@ gb_internal bool check_builtin_simd_operation(CheckerContext *c, Operand *operan
 				return false;
 			}
 
-			if (id == BuiltinProc_simd_div && is_type_integer(elem)) {
+			if (id == BuiltinProc_simd_rem && is_type_float(elem)) {
 				gbString xs = type_to_string(x.type);
-				error(x.expr, "'%.*s' is not supported for integer elements, got '%s'", LIT(builtin_name), xs);
+				error(x.expr, "'%.*s' requires integer elements, got '%s'", LIT(builtin_name), xs);
 				gb_string_free(xs);
 				// don't return
 			}
@@ -926,6 +927,30 @@ gb_internal bool check_builtin_simd_operation(CheckerContext *c, Operand *operan
 			return true;
 		}
 
+	// Unary (integer or boolean, bitwise complement)
+	case BuiltinProc_simd_bit_not:
+		{
+			Operand x = {};
+			check_expr(c, &x, ce->args[0]);
+			if (x.mode == Addressing_Invalid) {
+				return false;
+			}
+			if (!is_type_simd_vector(x.type)) {
+				error(x.expr, "'%.*s' expected a simd vector type", LIT(builtin_name));
+				return false;
+			}
+			Type *elem = base_array_type(x.type);
+			if (!is_type_integer(elem) && !is_type_boolean(elem)) {
+				gbString xs = type_to_string(x.type);
+				error(x.expr, "'%.*s' expected a #simd type with an integer or boolean element, got '%s'", LIT(builtin_name), xs);
+				gb_string_free(xs);
+				return false;
+			}
+			operand->mode = Addressing_Value;
+			operand->type = x.type;
+			return true;
+		}
+
 	// Unary
 	case BuiltinProc_simd_neg:
 	case BuiltinProc_simd_abs:
@@ -943,6 +968,66 @@ gb_internal bool check_builtin_simd_operation(CheckerContext *c, Operand *operan
 			if (!is_type_integer(elem) && !is_type_float(elem)) {
 				gbString xs = type_to_string(x.type);
 				error(x.expr, "'%.*s' expected a #simd type with an integer or floating point element, got '%s'", LIT(builtin_name), xs);
+				gb_string_free(xs);
+				return false;
+			}
+			operand->mode = Addressing_Value;
+			operand->type = x.type;
+			return true;
+		}
+
+	// Float binary: copysign
+	case BuiltinProc_simd_copysign:
+		{
+			Operand x = {};
+			Operand y = {};
+			check_expr(c, &x, ce->args[0]);
+			if (x.mode == Addressing_Invalid) return false;
+			check_expr_with_type_hint(c, &y, ce->args[1], x.type);
+			if (y.mode == Addressing_Invalid) return false;
+			convert_to_typed(c, &y, x.type);
+			if (y.mode == Addressing_Invalid) return false;
+			if (!is_type_simd_vector(x.type)) {
+				error(x.expr, "'%.*s' expected a simd vector type", LIT(builtin_name));
+				return false;
+			}
+			if (!are_types_identical(x.type, y.type)) {
+				gbString xs = type_to_string(x.type);
+				gbString ys = type_to_string(y.type);
+				error(x.expr, "'%.*s' expected 2 arguments of the same type, got '%s' vs '%s'", LIT(builtin_name), xs, ys);
+				gb_string_free(ys);
+				gb_string_free(xs);
+				return false;
+			}
+			Type *elem = base_array_type(x.type);
+			if (!is_type_float(elem)) {
+				gbString xs = type_to_string(x.type);
+				error(x.expr, "'%.*s' expected a #simd type with a floating point element, got '%s'", LIT(builtin_name), xs);
+				gb_string_free(xs);
+				return false;
+			}
+			operand->mode = Addressing_Value;
+			operand->type = x.type;
+			return true;
+		}
+
+	// Float unary: rcp, rsqrt (and _fast variants)
+	case BuiltinProc_simd_rcp:
+	case BuiltinProc_simd_rcp_fast:
+	case BuiltinProc_simd_rsqrt:
+	case BuiltinProc_simd_rsqrt_fast:
+		{
+			Operand x = {};
+			check_expr(c, &x, ce->args[0]);
+			if (x.mode == Addressing_Invalid) return false;
+			if (!is_type_simd_vector(x.type)) {
+				error(x.expr, "'%.*s' expected a simd vector type", LIT(builtin_name));
+				return false;
+			}
+			Type *elem = base_array_type(x.type);
+			if (!is_type_float(elem)) {
+				gbString xs = type_to_string(x.type);
+				error(x.expr, "'%.*s' expected a #simd type with a floating point element, got '%s'", LIT(builtin_name), xs);
 				gb_string_free(xs);
 				return false;
 			}
@@ -1135,6 +1220,158 @@ gb_internal bool check_builtin_simd_operation(CheckerContext *c, Operand *operan
 
 			operand->mode = Addressing_Value;
 			operand->type = x.type;
+			return true;
+		}
+
+	// Type conversions: two-type pattern (value + output type)
+	case BuiltinProc_simd_sext:
+	case BuiltinProc_simd_zext:
+	case BuiltinProc_simd_narrow:
+	case BuiltinProc_simd_narrow_sat:
+	case BuiltinProc_simd_narrow_usat:
+	case BuiltinProc_simd_ftoi:
+	case BuiltinProc_simd_itof:
+	case BuiltinProc_simd_fpext:
+	case BuiltinProc_simd_fptrunc:
+		{
+			Operand x = {};
+			check_expr(c, &x, ce->args[0]);
+			if (x.mode == Addressing_Invalid) return false;
+			if (!is_type_simd_vector(x.type)) {
+				error(x.expr, "'%.*s' expected a simd vector type for the first argument", LIT(builtin_name));
+				return false;
+			}
+
+			Operand out = {};
+			check_expr_or_type(c, &out, ce->args[1], nullptr);
+			if (out.mode == Addressing_Invalid) return false;
+			if (out.mode != Addressing_Type) {
+				error(out.expr, "'%.*s' expected a simd vector type for the second argument", LIT(builtin_name));
+				return false;
+			}
+			if (!is_type_simd_vector(out.type)) {
+				error(out.expr, "'%.*s' expected a simd vector type for the second argument", LIT(builtin_name));
+				return false;
+			}
+
+			Type *src_elem = base_array_type(x.type);
+			Type *dst_elem = base_array_type(out.type);
+			i64 src_count = x.type->SimdVector.count;
+			i64 dst_count = out.type->SimdVector.count;
+
+			if (src_count != dst_count) {
+				error(x.expr, "'%.*s' expected input and output to have the same lane count, got %lld vs %lld",
+				      LIT(builtin_name), cast(long long)src_count, cast(long long)dst_count);
+				return false;
+			}
+
+			i64 src_elem_sz = type_size_of(src_elem);
+			i64 dst_elem_sz = type_size_of(dst_elem);
+
+			switch (id) {
+			case BuiltinProc_simd_sext:
+			case BuiltinProc_simd_zext:
+				if (!is_type_integer(src_elem) || !is_type_integer(dst_elem)) {
+					error(x.expr, "'%.*s' requires integer element types", LIT(builtin_name));
+					return false;
+				}
+				if (dst_elem_sz <= src_elem_sz) {
+					error(x.expr, "'%.*s' requires the output element to be wider than the input element", LIT(builtin_name));
+					return false;
+				}
+				break;
+			case BuiltinProc_simd_narrow:
+			case BuiltinProc_simd_narrow_sat:
+			case BuiltinProc_simd_narrow_usat:
+				if (!is_type_integer(src_elem) || !is_type_integer(dst_elem)) {
+					error(x.expr, "'%.*s' requires integer element types", LIT(builtin_name));
+					return false;
+				}
+				if (dst_elem_sz >= src_elem_sz) {
+					error(x.expr, "'%.*s' requires the output element to be narrower than the input element", LIT(builtin_name));
+					return false;
+				}
+				break;
+			case BuiltinProc_simd_ftoi:
+				if (!is_type_float(src_elem)) {
+					error(x.expr, "'%.*s' requires a float input element type", LIT(builtin_name));
+					return false;
+				}
+				if (!is_type_integer(dst_elem)) {
+					error(x.expr, "'%.*s' requires an integer output element type", LIT(builtin_name));
+					return false;
+				}
+				if (src_elem_sz != dst_elem_sz) {
+					error(x.expr, "'%.*s' requires input and output element sizes to match", LIT(builtin_name));
+					return false;
+				}
+				break;
+			case BuiltinProc_simd_itof:
+				if (!is_type_integer(src_elem)) {
+					error(x.expr, "'%.*s' requires an integer input element type", LIT(builtin_name));
+					return false;
+				}
+				if (!is_type_float(dst_elem)) {
+					error(x.expr, "'%.*s' requires a float output element type", LIT(builtin_name));
+					return false;
+				}
+				if (src_elem_sz != dst_elem_sz) {
+					error(x.expr, "'%.*s' requires input and output element sizes to match", LIT(builtin_name));
+					return false;
+				}
+				break;
+			case BuiltinProc_simd_fpext:
+				if (!is_type_float(src_elem) || !is_type_float(dst_elem)) {
+					error(x.expr, "'%.*s' requires float element types", LIT(builtin_name));
+					return false;
+				}
+				if (dst_elem_sz <= src_elem_sz) {
+					error(x.expr, "'%.*s' requires the output element to be wider than the input element", LIT(builtin_name));
+					return false;
+				}
+				break;
+			case BuiltinProc_simd_fptrunc:
+				if (!is_type_float(src_elem) || !is_type_float(dst_elem)) {
+					error(x.expr, "'%.*s' requires float element types", LIT(builtin_name));
+					return false;
+				}
+				if (dst_elem_sz >= src_elem_sz) {
+					error(x.expr, "'%.*s' requires the output element to be narrower than the input element", LIT(builtin_name));
+					return false;
+				}
+				break;
+			}
+
+			operand->mode = Addressing_Value;
+			operand->type = out.type;
+			return true;
+		}
+
+	// Horizontal pairwise operations (output has half lane count)
+	case BuiltinProc_simd_hadd:
+	case BuiltinProc_simd_hsub:
+		{
+			Operand x = {};
+			check_expr(c, &x, ce->args[0]);
+			if (x.mode == Addressing_Invalid) return false;
+			if (!is_type_simd_vector(x.type)) {
+				error(x.expr, "'%.*s' expected a simd vector type", LIT(builtin_name));
+				return false;
+			}
+			Type *elem = base_array_type(x.type);
+			if (!is_type_integer(elem) && !is_type_float(elem)) {
+				gbString xs = type_to_string(x.type);
+				error(x.expr, "'%.*s' expected a #simd type with an integer or floating point element, got '%s'", LIT(builtin_name), xs);
+				gb_string_free(xs);
+				return false;
+			}
+			i64 count = x.type->SimdVector.count;
+			if (count < 2 || (count % 2) != 0) {
+				error(x.expr, "'%.*s' requires an even number of lanes (at least 2), got %lld", LIT(builtin_name), cast(long long)count);
+				return false;
+			}
+			operand->mode = Addressing_Value;
+			operand->type = alloc_type_simd_vector(count/2, elem);
 			return true;
 		}
 
@@ -5324,20 +5561,34 @@ gb_internal bool check_builtin_procedure(CheckerContext *c, Operand *operand, As
 				return false;
 			}
 
-			if (!is_type_integer_like(x.type) && !is_type_float(x.type)) {
+			if (is_type_simd_vector(x.type)) {
+				Type *elem = base_array_type(x.type);
+				if (!is_type_integer(elem)) {
+					gbString xts = type_to_string(x.type);
+					error(x.expr, "'%.*s' on a SIMD vector requires integer element type, got %s", LIT(builtin_name), xts);
+					gb_string_free(xts);
+				}
+				i64 elem_sz = type_size_of(elem);
+				if (elem_sz < 2) {
+					gbString xts = type_to_string(x.type);
+					error(x.expr, "'%.*s' requires element type of at least 2 bytes, got %s with element size of %lld", LIT(builtin_name), xts, cast(long long)elem_sz);
+					gb_string_free(xts);
+				}
+			} else if (!is_type_integer_like(x.type) && !is_type_float(x.type)) {
 				gbString xts = type_to_string(x.type);
-				error(x.expr, "Values passed to '%.*s' must be an integer-like type (integer, boolean, enum, bit_set) or float, got %s", LIT(builtin_name), xts);
+				error(x.expr, "Values passed to '%.*s' must be an integer-like type (integer, boolean, enum, bit_set), float, or SIMD vector of integers, got %s", LIT(builtin_name), xts);
 				gb_string_free(xts);
 			} else if (x.type == t_llvm_bool) {
 				gbString xts = type_to_string(x.type);
 				error(x.expr, "Invalid type passed to '%.*s', got %s", LIT(builtin_name), xts);
 				gb_string_free(xts);
-			}
-			i64 sz = type_size_of(x.type);
-			if (sz < 2) {
-				gbString xts = type_to_string(x.type);
-				error(x.expr, "Type passed to '%.*s' must be at least 2 bytes, got %s with size of %lld", LIT(builtin_name), xts, sz);
-				gb_string_free(xts);
+			} else {
+				i64 sz = type_size_of(x.type);
+				if (sz < 2) {
+					gbString xts = type_to_string(x.type);
+					error(x.expr, "Type passed to '%.*s' must be at least 2 bytes, got %s with size of %lld", LIT(builtin_name), xts, sz);
+					gb_string_free(xts);
+				}
 			}
 
 			operand->mode = Addressing_Value;
