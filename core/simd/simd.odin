@@ -371,14 +371,17 @@ This procedure returns a vector, where each lane holds the quotient (result
 of division) between the corresponding lanes of the vectors `a` and `b`. Each
 lane of the vector `a` is divided by the corresponding lane of the vector `b`.
 
-This operation performs a standard floating-point division for each lane.
+For floating-point vectors, this performs standard IEEE 754 division.
+For integer vectors, this performs truncated division (rounds toward zero).
 
 Inputs:
-- `a`: A float vector.
-- `b`: A float vector to divide by.
+- `a`: A numeric vector (integer or float).
+- `b`: A numeric vector to divide by.
 
 Returns:
 - A vector that is the quotient of two vectors, `a` / `b`.
+
+WARNING: For integer vectors, division by zero is undefined behavior.
 
 Operation:
 
@@ -387,7 +390,7 @@ Operation:
 	}
 	return res
 
-Example:
+Example (float):
 
 	   +-----+-----+-----+-----+
 	a: |  2  |  2  |  2  |  2  |
@@ -399,8 +402,51 @@ Example:
 	   +-----+-----+-----+------+
 	   | +∞  | -2  |  1  | -2/3 |
 	   +-----+-----+-----+------+
+
+Example (integer):
+
+	   +-----+-----+-----+-----+
+	a: |  7  | -7  |  7  | -7  |
+	   +-----+-----+-----+-----+
+	   +-----+-----+-----+-----+
+	b: |  2  |  2  | -2  | -2  |
+	   +-----+-----+-----+-----+
+	res:
+	   +-----+-----+-----+-----+
+	   |  3  | -3  | -3  |  3  |
+	   +-----+-----+-----+-----+
 */
 div :: intrinsics.simd_div
+
+/*
+Integer remainder (modulo) of SIMD vectors, per-lane.
+
+Computes the remainder of integer division for each lane. For signed integers,
+the result has the same sign as the dividend (truncated division).
+
+Inputs:
+- `a`: A vector of integers (dividend).
+- `b`: A vector of integers (divisor).
+
+Returns:
+- A vector where each lane is `a[i] % b[i]`.
+
+WARNING: Division by zero is undefined behavior.
+
+Example:
+
+	   +-----+-----+-----+-----+
+	a: |  7  | -7  |  7  | -7  |
+	   +-----+-----+-----+-----+
+	   +-----+-----+-----+-----+
+	b: |  3  |  3  | -3  | -3  |
+	   +-----+-----+-----+-----+
+	res:
+	   +-----+-----+-----+-----+
+	   |  1  | -1  |  1  | -1  |
+	   +-----+-----+-----+-----+
+*/
+rem :: intrinsics.simd_rem
 
 /*
 Shift left lanes of a vector.
@@ -2579,6 +2625,9 @@ Reverse the bit pattern of a SIMD vector.
 */
 reverse_bits :: intrinsics.reverse_bits
 
+// Per-lane byte swap for integer SIMD vectors (element size must be >= 2 bytes).
+byte_swap :: intrinsics.byte_swap
+
 /*
 Perform a FMA (Fused multiply-add) operation on each lane of SIMD vectors.
 
@@ -2633,6 +2682,72 @@ Returns:
 */
 fma :: intrinsics.fused_mul_add
 
+// Exact reciprocal: result = 1/a.
+// Produces bit-exact results across all platforms.
+rcp :: intrinsics.simd_rcp
+
+// Fast approximate reciprocal: result ≈ 1/a.
+// On x86 with f32x4 or f32x8, uses hardware reciprocal instruction (~12-bit precision).
+// On other targets or element types, falls back to exact division.
+// Use when speed matters more than precision; results may vary across platforms.
+rcp_fast :: intrinsics.simd_rcp_fast
+
+// Exact reciprocal square root: result = 1/sqrt(a).
+// Produces bit-exact results across all platforms.
+rsqrt :: intrinsics.simd_rsqrt
+
+// Fast approximate reciprocal square root: result ≈ 1/sqrt(a).
+// On x86 with f32x4 or f32x8, uses hardware rsqrt instruction (~12-bit precision).
+// On other targets or element types, falls back to exact computation.
+// Use when speed matters more than precision; results may vary across platforms.
+rsqrt_fast :: intrinsics.simd_rsqrt_fast
+
+// Integer sign-extension: each lane sign-extends to a wider integer type.
+sext :: intrinsics.simd_sext
+
+// Integer zero-extension: each lane zero-extends to a wider integer type.
+zext :: intrinsics.simd_zext
+
+// Integer narrowing: each lane truncates to a narrower integer type (no clamping).
+narrow :: intrinsics.simd_narrow
+
+// Signed saturating narrow: each lane clamps to signed destination range, then truncates.
+narrow_sat :: intrinsics.simd_narrow_sat
+
+// Unsigned saturating narrow: each lane clamps to unsigned destination range (negatives become 0), then truncates.
+narrow_usat :: intrinsics.simd_narrow_usat
+
+// Float to integer conversion (truncation toward zero, saturating).
+// Out-of-range values clamp to the integer min/max; NaN maps to 0.
+ftoi :: intrinsics.simd_ftoi
+
+// Integer to float conversion.
+itof :: intrinsics.simd_itof
+
+// Float precision extension (e.g. f32 -> f64).
+fpext :: intrinsics.simd_fpext
+
+// Float precision truncation (e.g. f64 -> f32).
+fptrunc :: intrinsics.simd_fptrunc
+
+// Horizontal pairwise add: adds adjacent pairs of elements.
+// Given input [a0, a1, a2, a3, ...], returns [a0+a1, a2+a3, ...].
+// The output vector has half the lane count of the input.
+//
+// NOTE: This differs from x86's haddps which takes two vectors and interleaves
+// their horizontal sums. This intrinsic operates on a single vector and is
+// designed to compose well for iterative reduction.
+//
+// Example: hadd([1, 2, 3, 4]) = [3, 7]  (1+2=3, 3+4=7)
+hadd :: intrinsics.simd_hadd
+
+// Horizontal pairwise subtract: subtracts adjacent pairs of elements.
+// Given input [a0, a1, a2, a3, ...], returns [a0-a1, a2-a3, ...].
+// The output vector has half the lane count of the input.
+//
+// Example: hsub([4, 1, 6, 2]) = [3, 4]  (4-1=3, 6-2=4)
+hsub :: intrinsics.simd_hsub
+
 /*
 Convert pointer to SIMD vector to an array pointer.
 */
@@ -2674,7 +2789,8 @@ from_slice :: proc($T: typeid/#simd[$LANES]$E, slice: []E) -> T {
 Perform binary not operation on a SIMD vector.
 
 This procedure returns a vector where each lane is the result of the binary
-NOT operation of the corresponding lane in the vector `a`.
+NOT operation of the corresponding lane in the vector `a`. Works with integer
+and boolean element types.
 
 Operation:
 
@@ -2683,7 +2799,7 @@ Operation:
 	}
 	return res
 
-Example:
+Example (integer):
 
 	   +------+------+------+------+
 	a: | 0x00 | 0x50 | 0x80 | 0xff |
@@ -2692,22 +2808,21 @@ Example:
 	   +------+------+------+------+
 	   | 0xff | 0xaf | 0x7f | 0x00 |
 	   +------+------+------+------+
-*/
-@(require_results)
-bit_not :: #force_inline proc "contextless" (v: $T/#simd[$LANES]$E) -> T where intrinsics.type_is_integer(E) {
-	return bit_xor(v, T(~E(0)))
-}
 
-/*
-Copy the signs from lanes of one SIMD vector into another SIMD vector.
+Example (boolean):
+
+	   +-------+-------+-------+-------+
+	a: | true  | false | true  | false |
+	   +-------+-------+-------+-------+
+	res:
+	   +-------+-------+-------+-------+
+	   | false | true  | false | true  |
+	   +-------+-------+-------+-------+
 */
-@(require_results)
-copysign :: #force_inline proc "contextless" (v, sign: $T/#simd[$LANES]$E) -> T where intrinsics.type_is_float(E) {
-	neg_zero := to_bits(T(-0.0))
-	sign_bit := to_bits(sign) & neg_zero
-	magnitude := to_bits(v) &~ neg_zero
-	return transmute(T)(sign_bit|magnitude)
-}
+bit_not :: intrinsics.simd_bit_not
+
+// Per-lane copysign (IEEE 754): result has magnitude of first arg, sign of second arg.
+copysign :: intrinsics.simd_copysign
 
 /*
 Return signs of SIMD lanes.
