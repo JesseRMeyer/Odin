@@ -1585,6 +1585,9 @@ gb_internal lbValue lb_emit_array_epi(lbModule *m, lbValue s, isize index) {
 
 gb_internal lbValue lb_emit_ptr_offset(lbProcedure *p, lbValue ptr, lbValue index) {
 	index = lb_emit_conv(p, index, t_int);
+	if (LLVMIsAConstantInt(index.value) && LLVMConstIntGetSExtValue(index.value) == 0) {
+		return ptr;
+	}
 	LLVMValueRef indices[1] = {index.value};
 	lbValue res = {};
 	res.type = ptr.type;

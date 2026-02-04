@@ -1160,11 +1160,15 @@ gb_internal void lb_emit_store(lbProcedure *p, lbValue ptr, lbValue value) {
 			LLVMValueRef dst_ptr = ptr.value;
 			LLVMValueRef src_ptr_original = LLVMGetOperand(value.value, 0);
 			LLVMValueRef src_ptr = LLVMBuildPointerCast(p->builder, src_ptr_original, LLVMTypeOf(dst_ptr), "");
+			LLVMValueRef size = LLVMConstInt(LLVMInt64TypeInContext(p->module->ctx), lb_sizeof(LLVMTypeOf(value.value)), false);
+			unsigned dst_align = lb_try_get_alignment(dst_ptr, 1);
+			unsigned src_align = lb_try_get_alignment(src_ptr_original, 1);
 
-			LLVMBuildMemMove(p->builder,
-			                 dst_ptr, lb_try_get_alignment(dst_ptr, 1),
-			                 src_ptr, lb_try_get_alignment(src_ptr_original, 1),
-			                 LLVMConstInt(LLVMInt64TypeInContext(p->module->ctx), lb_sizeof(LLVMTypeOf(value.value)), false));
+			if (LLVMIsAAllocaInst(src_ptr_original)) {
+				LLVMBuildMemCpy(p->builder, dst_ptr, dst_align, src_ptr, src_align, size);
+			} else {
+				LLVMBuildMemMove(p->builder, dst_ptr, dst_align, src_ptr, src_align, size);
+			}
 			return;
 		} else if (LLVMIsConstant(value.value)) {
 			lbAddr addr = lb_add_global_generated_from_procedure(p, value.type, value);

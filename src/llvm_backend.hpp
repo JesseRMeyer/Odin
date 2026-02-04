@@ -623,7 +623,7 @@ gb_internal LLVMValueRef lb_mem_zero_ptr_internal(lbProcedure *p, LLVMValueRef p
 gb_internal LLVMValueRef lb_mem_zero_ptr_internal(lbProcedure *p, LLVMValueRef ptr, usize len, unsigned alignment, bool is_volatile);
 
 gb_internal gb_inline i64 lb_max_zero_init_size(void) {
-	return cast(i64)(8);
+	return cast(i64)(64);
 }
 
 gb_internal LLVMTypeRef OdinLLVMGetArrayElementType(LLVMTypeRef type);
