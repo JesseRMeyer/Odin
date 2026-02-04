@@ -468,6 +468,8 @@ gb_internal lbValue lb_emit_epi(lbModule *m, lbValue const &value, isize index);
 gb_internal lbValue lb_emit_array_epi(lbModule *m, lbValue s, isize index);
 gb_internal lbValue lb_emit_struct_ep(lbProcedure *p, lbValue s, i32 index);
 gb_internal lbValue lb_emit_struct_ev(lbProcedure *p, lbValue s, i32 index);
+gb_internal lbValue lb_emit_struct_iv(lbProcedure *p, lbValue agg, lbValue field, i32 index);
+gb_internal lbValue lb_build_struct_value(lbProcedure *p, Type *type, lbValue *fields, isize count);
 gb_internal lbValue lb_emit_tuple_ev(lbProcedure *p, lbValue value, i32 index);
 gb_internal lbValue lb_emit_array_epi(lbProcedure *p, lbValue value, isize index);
 gb_internal lbValue lb_emit_array_ep(lbProcedure *p, lbValue s, lbValue index);
@@ -541,6 +543,8 @@ gb_internal lbValue lb_emit_select(lbProcedure *p, lbValue cond, lbValue x, lbVa
 gb_internal lbValue lb_emit_mul_add(lbProcedure *p, lbValue a, lbValue b, lbValue c, Type *t);
 
 gb_internal void lb_fill_slice(lbProcedure *p, lbAddr const &slice, lbValue base_elem, lbValue len);
+gb_internal lbValue lb_make_slice_value(lbProcedure *p, Type *slice_type, lbValue elem, lbValue len);
+gb_internal lbValue lb_make_string_value(lbProcedure *p, Type *string_type, lbValue elem, lbValue len);
 
 gb_internal lbValue lb_type_info(lbProcedure *p, Type *type);
 
