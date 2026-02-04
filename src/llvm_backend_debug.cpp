@@ -40,15 +40,7 @@ gb_internal void lb_add_raddbg_string(lbModule *m, char const *a, char const *b,
 
 gb_internal LLVMMetadataRef lb_get_current_debug_scope(lbProcedure *p) {
 	GB_ASSERT_MSG(p->debug_info != nullptr, "missing debug information for %.*s", LIT(p->name));
-
-	for (isize i = p->scope_stack.count-1; i >= 0; i--) {
-		Scope *s = p->scope_stack[i];
-		LLVMMetadataRef md = lb_get_llvm_metadata(p->module, s);
-		if (md) {
-			return md;
-		}
-	}
-	return p->debug_info;
+	return p->current_debug_scope ? p->current_debug_scope : p->debug_info;
 }
 
 gb_internal LLVMMetadataRef lb_debug_location_from_token_pos(lbProcedure *p, TokenPos pos) {

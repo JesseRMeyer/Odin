@@ -393,6 +393,7 @@ struct lbProcedure {
 	Array<lbContextData> context_stack;
 
 	LLVMMetadataRef debug_info;
+	LLVMMetadataRef current_debug_scope; // cached; updated in lb_open_scope/lb_close_scope
 
 	PtrMap<Ast *, lbValue> selector_values;
 	PtrMap<Ast *, lbAddr>  selector_addr;

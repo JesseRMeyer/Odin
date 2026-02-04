@@ -1242,13 +1242,11 @@ gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> c
 			isize ret_count = original_rt->Tuple.variables.count;
 
 			auto tuple_fix_values = slice_make<lbValue>(permanent_allocator(), ret_count);
-			auto tuple_geps = slice_make<lbValue>(permanent_allocator(), ret_count);
 
 			isize offset = ft->original_arg_count - ignored_args;
 			for (isize j = 0; j < ret_count-1; j++) {
 				lbValue ret_arg_ptr = processed_args[offset + j];
-				lbValue ret_arg = lb_emit_load(p, ret_arg_ptr);
-				tuple_fix_values[j] = ret_arg;
+				tuple_fix_values[j] = ret_arg_ptr;  // store pointer, don't load
 			}
 			tuple_fix_values[ret_count-1] = result;
 

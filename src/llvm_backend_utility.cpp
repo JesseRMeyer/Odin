@@ -1159,8 +1159,13 @@ gb_internal lbValue lb_emit_tuple_ep(lbProcedure *p, lbValue ptr, i32 index) {
 	lbTupleFix *tf = map_get(&p->tuple_fix_map, ptr.value);
 	if (tf) {
 		res = tf->values[index];
-		GB_ASSERT(are_types_identical(res.type, result_type));
-		res = lb_address_from_load_or_generate_local(p, res);
+		if (index < tf->values.count - 1) {
+			// Already a pointer to the element — return directly
+			GB_ASSERT(are_types_identical(type_deref(res.type), result_type));
+		} else {
+			GB_ASSERT(are_types_identical(res.type, result_type));
+			res = lb_address_from_load_or_generate_local(p, res);
+		}
 	} else {
 		res = lb_emit_struct_ep_internal(p, ptr, index, result_type);
 	}
@@ -1278,6 +1283,9 @@ gb_internal lbValue lb_emit_tuple_ev(lbProcedure *p, lbValue value, i32 index) {
 	lbTupleFix *tf = map_get(&p->tuple_fix_map, value.value);
 	if (tf) {
 		res = tf->values[index];
+		if (index < tf->values.count - 1) {
+			res = lb_emit_load(p, res);
+		}
 		GB_ASSERT(are_types_identical(res.type, result_type));
 	} else {
 		if (t->Tuple.variables.count == 1) {
