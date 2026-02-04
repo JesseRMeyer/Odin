@@ -47,6 +47,7 @@ gb_internal char const *comp_impurity_message(CompImpurityTrace const &t) {
 // Forward declarations
 gb_internal bool check_comp_purity_proc(Entity *proc_entity, PtrSet<Entity *> *visited, Array<CompImpurityTrace> *trace);
 gb_internal bool check_comp_type_pure(Type *t, Token site, Entity *proc_entity, Array<CompImpurityTrace> *trace);
+gb_internal bool comp_record_impurity(Array<CompImpurityTrace> *trace, Entity *proc, CompImpurityKind kind, Token site);
 
 // Check whether a type is valid for #comp return values (can be a compile-time constant).
 gb_internal bool is_comp_constant_type(Type *t) {
@@ -92,44 +93,19 @@ gb_internal bool check_comp_type_pure(Type *t, Token site, Entity *proc_entity, 
 	t = base_type(t);
 
 	if (is_type_pointer(t) || (t->kind == Type_Basic && (t->Basic.flags & BasicFlag_Pointer))) {
-		CompImpurityTrace entry = {};
-		entry.proc = proc_entity;
-		entry.kind = CompImpure_PointerType;
-		entry.violation_site = site;
-		array_add(trace, entry);
-		return false;
+		return comp_record_impurity(trace, proc_entity, CompImpure_PointerType, site);
 	}
 	if (is_type_slice(t)) {
-		CompImpurityTrace entry = {};
-		entry.proc = proc_entity;
-		entry.kind = CompImpure_SliceType;
-		entry.violation_site = site;
-		array_add(trace, entry);
-		return false;
+		return comp_record_impurity(trace, proc_entity, CompImpure_SliceType, site);
 	}
 	if (is_type_dynamic_array(t)) {
-		CompImpurityTrace entry = {};
-		entry.proc = proc_entity;
-		entry.kind = CompImpure_DynamicArrayType;
-		entry.violation_site = site;
-		array_add(trace, entry);
-		return false;
+		return comp_record_impurity(trace, proc_entity, CompImpure_DynamicArrayType, site);
 	}
 	if (is_type_map(t)) {
-		CompImpurityTrace entry = {};
-		entry.proc = proc_entity;
-		entry.kind = CompImpure_MapType;
-		entry.violation_site = site;
-		array_add(trace, entry);
-		return false;
+		return comp_record_impurity(trace, proc_entity, CompImpure_MapType, site);
 	}
 	if (is_comp_target_dependent_type(t)) {
-		CompImpurityTrace entry = {};
-		entry.proc = proc_entity;
-		entry.kind = CompImpure_TargetDependent;
-		entry.violation_site = site;
-		array_add(trace, entry);
-		return false;
+		return comp_record_impurity(trace, proc_entity, CompImpure_TargetDependent, site);
 	}
 
 	// Recurse into composite types
@@ -443,6 +419,9 @@ gb_internal bool check_comp_purity_ast(Ast *node, Entity *proc_entity, PtrSet<En
 	case Ast_MapType:
 		return comp_record_impurity(trace, proc_entity, CompImpure_MapType, node->MapType.token);
 
+	case Ast_InlineAsmExpr:
+		return comp_record_impurity(trace, proc_entity, CompImpure_ForeignCall, ast_token(node));
+
 	default:
 		// For any unhandled node kinds, assume pure.
 		// The type checker and the purity of called procedures
@@ -542,13 +521,11 @@ gb_internal void report_comp_purity_error(CheckerContext *ctx, Ast *comp_call_si
 	// trace[0] = violation, trace[1..n] = chain links (callers)
 	for (isize i = 1; i < trace.count; i++) {
 		CompImpurityTrace const &link = trace[i];
-		if (i < trace.count) {
-			CompImpurityTrace const &callee = trace[i-1];
-			error_line("\tnote: '%.*s' calls '%.*s' at %s\n",
-				LIT(link.proc->token.string),
-				LIT(callee.proc->token.string),
-				token_pos_to_string(link.call_site.pos));
-		}
+		CompImpurityTrace const &callee = trace[i-1];
+		error_line("\tnote: '%.*s' calls '%.*s' at %s\n",
+			LIT(link.proc->token.string),
+			LIT(callee.proc->token.string),
+			token_pos_to_string(link.call_site.pos));
 	}
 
 	error_line("\tnote: required by '#comp' at %s\n",
@@ -690,9 +667,22 @@ gb_internal void comp_ensure_callees_checked(Checker *checker, Ast *node, PtrSet
 		comp_ensure_callees_checked(checker, node->IndexExpr.expr,  visited);
 		comp_ensure_callees_checked(checker, node->IndexExpr.index, visited);
 		break;
+	case Ast_SliceExpr: {
+		auto *se = &node->SliceExpr;
+		comp_ensure_callees_checked(checker, se->expr, visited);
+		comp_ensure_callees_checked(checker, se->low,  visited);
+		comp_ensure_callees_checked(checker, se->high, visited);
+		break;
+	}
 	case Ast_SelectorExpr:
 		comp_ensure_callees_checked(checker, node->SelectorExpr.expr, visited);
 		break;
+	case Ast_SelectorCallExpr: {
+		auto *sce = &node->SelectorCallExpr;
+		comp_ensure_callees_checked(checker, sce->expr, visited);
+		comp_ensure_callees_checked(checker, sce->call, visited);
+		break;
+	}
 	case Ast_CompoundLit:
 		comp_ensure_callees_checked_list(checker, node->CompoundLit.elems, visited);
 		break;
@@ -710,6 +700,13 @@ gb_internal void comp_ensure_callees_checked(Checker *checker, Ast *node, PtrSet
 	case Ast_FieldValue:
 		comp_ensure_callees_checked(checker, node->FieldValue.value, visited);
 		break;
+	case Ast_WhenStmt: {
+		auto *ws = &node->WhenStmt;
+		comp_ensure_callees_checked(checker, ws->cond, visited);
+		comp_ensure_callees_checked(checker, ws->body, visited);
+		comp_ensure_callees_checked(checker, ws->else_stmt, visited);
+		break;
+	}
 	default:
 		break;
 	}

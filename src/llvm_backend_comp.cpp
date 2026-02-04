@@ -47,56 +47,8 @@ gb_global thread_local CompJITTrapState comp_trap_state;
 
 extern "C" {
 
-static void comp_stub_bounds_check_error(
-	void *file_ptr, i32 file_len,
-	i32 line, i32 column,
-	i64 index, i64 count
-) {
-	(void)file_ptr; (void)file_len; (void)line; (void)column;
-	gb_snprintf(comp_trap_state.panic_msg, sizeof(comp_trap_state.panic_msg),
-		"index out of bounds — index %lld, length %lld",
-		(long long)index, (long long)count);
-	comp_trap_state.panicked = true;
-	longjmp(comp_trap_state.recovery, 1);
-}
-
-static void comp_stub_slice_expr_error_hi(
-	void *file_ptr, i32 file_len,
-	i32 line, i32 column,
-	i64 hi, i64 len
-) {
-	(void)file_ptr; (void)file_len; (void)line; (void)column;
-	gb_snprintf(comp_trap_state.panic_msg, sizeof(comp_trap_state.panic_msg),
-		"slice high bound out of range — hi %lld, length %lld",
-		(long long)hi, (long long)len);
-	comp_trap_state.panicked = true;
-	longjmp(comp_trap_state.recovery, 1);
-}
-
-static void comp_stub_slice_expr_error_lo_hi(
-	void *file_ptr, i32 file_len,
-	i32 line, i32 column,
-	i64 lo, i64 hi
-) {
-	(void)file_ptr; (void)file_len; (void)line; (void)column;
-	gb_snprintf(comp_trap_state.panic_msg, sizeof(comp_trap_state.panic_msg),
-		"slice low > high — lo %lld, hi %lld",
-		(long long)lo, (long long)hi);
-	comp_trap_state.panicked = true;
-	longjmp(comp_trap_state.recovery, 1);
-}
-
-static void comp_stub_panic(void *msg_ptr, i64 msg_len) {
-	i64 copy_len = gb_min(msg_len, (i64)sizeof(comp_trap_state.panic_msg) - 1);
-	if (copy_len > 0 && msg_ptr != nullptr) {
-		gb_memmove(comp_trap_state.panic_msg, msg_ptr, cast(isize)copy_len);
-	}
-	comp_trap_state.panic_msg[copy_len] = 0;
-	comp_trap_state.panicked = true;
-	longjmp(comp_trap_state.recovery, 1);
-}
-
-// Generic trap for any unresolved runtime symbol
+// Generic trap for any unresolved runtime symbol.
+// On x86_64, extra arguments from the call site are safely ignored in registers.
 static void comp_stub_generic_trap() {
 	gb_snprintf(comp_trap_state.panic_msg, sizeof(comp_trap_state.panic_msg),
 		"runtime error during #comp evaluation");
@@ -148,7 +100,9 @@ gb_internal void comp_init_jit_module(lbModule *m, Checker *checker) {
 		LLVMCodeModelJITDefault
 	);
 
-	LLVMSetModuleDataLayout(m->mod, LLVMCreateTargetDataLayout(m->target_machine));
+	LLVMTargetDataRef data_layout = LLVMCreateTargetDataLayout(m->target_machine);
+	LLVMSetModuleDataLayout(m->mod, data_layout);
+	LLVMDisposeTargetData(data_layout);
 	LLVMDisposeMessage(host_triple);
 
 	// Initialize all maps and data structures
@@ -198,6 +152,33 @@ gb_internal void comp_destroy_jit_module(lbModule *m) {
 	}
 	// Note: mod and ctx ownership is transferred to LLJIT
 	// If LLJIT creation fails, caller must dispose them
+
+	// Destroy maps and arrays initialized in comp_init_jit_module
+	map_destroy(&m->types);
+	map_destroy(&m->func_raw_types);
+	map_destroy(&m->struct_field_remapping);
+	map_destroy(&m->values);
+	map_destroy(&m->soa_values);
+	string_map_destroy(&m->members);
+	string_map_destroy(&m->procedures);
+	string_map_destroy(&m->const_strings);
+	string16_map_destroy(&m->const_string16s);
+	map_destroy(&m->function_type_map);
+	string_map_destroy(&m->gen_procs);
+	map_destroy(&m->procedure_values);
+	array_free(&m->generated_procedures);
+	array_free(&m->global_procedures_to_create);
+	array_free(&m->global_types_to_create);
+	map_destroy(&m->debug_values);
+	string_map_destroy(&m->objc_classes);
+	string_map_destroy(&m->objc_selectors);
+	string_map_destroy(&m->objc_ivars);
+	map_destroy(&m->map_info_map);
+	map_destroy(&m->map_cell_info_map);
+	map_destroy(&m->exact_value_compound_literal_addr_map);
+	array_free(&m->pad_types);
+	string_map_destroy(&m->tbaa_type_nodes);
+	map_destroy(&m->tbaa_access_tags);
 }
 
 // ---------------------------------------------------------------------------
@@ -366,19 +347,8 @@ gb_internal void comp_collect_callees_from_ast(Ast *node, PtrSet<Entity *> *call
 }
 
 // ---------------------------------------------------------------------------
-// JIT Symbol Resolver — maps runtime procedure names to stubs
+// JIT Symbol Resolver
 // ---------------------------------------------------------------------------
-
-struct CompSymbolEntry {
-	char const   *name;
-	void         *addr;
-};
-
-gb_global CompSymbolEntry comp_symbol_stubs[] = {
-	// These names must match what the Odin codegen emits
-	// We'll add a catch-all via the definition generator
-	{nullptr, nullptr}, // sentinel
-};
 
 // Custom definition generator callback for LLJIT
 // This resolves any unresolved symbol to the generic trap stub
@@ -472,34 +442,40 @@ gb_internal CompEvalResult comp_evaluate(
 	// Generate procedure bodies.
 	// Disable bounds checking since runtime error procedures aren't available
 	// in the JIT module. Our longjmp trap stubs catch actual errors at execution.
-	bool saved_no_bounds_check = build_context.no_bounds_check;
-	build_context.no_bounds_check = true;
+	// Serialize access to build_context.no_bounds_check to prevent races with
+	// concurrent procedure body checking in the thread pool.
+	{
+		static std::mutex comp_codegen_mutex;
+		std::lock_guard<std::mutex> lock(comp_codegen_mutex);
 
-	FOR_PTR_SET(e, callees) {
-		if (e->kind != Entity_Procedure) continue;
-		if (e->Procedure.is_foreign) continue; // Skip foreign procs — will be resolved by stubs
+		bool saved_no_bounds_check = build_context.no_bounds_check;
+		build_context.no_bounds_check = true;
 
-		lbProcedure *p = nullptr;
-		String name = lb_get_entity_name(&comp_module, e);
-		lbProcedure **found = string_map_get(&comp_module.procedures, name);
-		if (found != nullptr) {
-			p = *found;
+		FOR_PTR_SET(e, callees) {
+			if (e->kind != Entity_Procedure) continue;
+			if (e->Procedure.is_foreign) continue; // Skip foreign procs — will be resolved by stubs
+
+			lbProcedure *p = nullptr;
+			String name = lb_get_entity_name(&comp_module, e);
+			lbProcedure **found = string_map_get(&comp_module.procedures, name);
+			if (found != nullptr) {
+				p = *found;
+			}
+			if (p != nullptr) {
+				lb_generate_procedure(&comp_module, p);
+			}
 		}
-		if (p != nullptr) {
-			lb_generate_procedure(&comp_module, p);
-		}
+
+		build_context.no_bounds_check = saved_no_bounds_check;
 	}
-
-	build_context.no_bounds_check = saved_no_bounds_check;
 	// Create a wrapper function that calls the target and stores the result
 	// to a buffer, avoiding ABI issues with struct/float returns.
 	// Wrapper signature: void __comp_wrapper(i8* result_buf)
 	char const *wrapper_name = "__comp_eval_wrapper";
 	{
 		LLVMTypeRef target_fn_type = LLVMGlobalGetValueType(entry_proc->value);
-		LLVMTypeRef target_ret_type = LLVMGetReturnType(target_fn_type);
-		unsigned target_param_count = LLVMCountParamTypes(target_fn_type);
-		bool uses_sret = (LLVMGetTypeKind(target_ret_type) == LLVMVoidTypeKind && target_param_count > 0);
+		bool uses_sret = (entry_proc->abi_function_type != nullptr &&
+		                   entry_proc->abi_function_type->ret.kind == lbArg_Indirect);
 
 		LLVMTypeRef ptr_type = LLVMPointerTypeInContext(comp_module.ctx, 0);
 		LLVMTypeRef void_type = LLVMVoidTypeInContext(comp_module.ctx);
@@ -682,43 +658,46 @@ gb_internal CompEvalResult comp_evaluate(
 // Timeout Wrapper
 // ---------------------------------------------------------------------------
 
+struct CompEvalSharedState {
+	CompEvalResult          result;
+	std::mutex              mtx;
+	std::condition_variable cv;
+	bool                    finished;
+};
+
 gb_internal CompEvalResult comp_evaluate_with_timeout(
 	CheckerContext *ctx,
 	Entity         *proc_entity,
 	Type           *result_type,
 	f64             timeout_seconds
 ) {
-	CompEvalResult result = {};
-	result.ok = false;
+	auto shared = new CompEvalSharedState{};
+	shared->finished = false;
 
-	bool finished = false;
-	std::mutex mtx;
-	std::condition_variable cv;
-
-	std::thread worker([&]() {
-		result = comp_evaluate(ctx, proc_entity, result_type);
+	std::thread worker([shared, ctx, proc_entity, result_type]() {
+		CompEvalResult r = comp_evaluate(ctx, proc_entity, result_type);
 		{
-			std::lock_guard<std::mutex> lock(mtx);
-			finished = true;
+			std::lock_guard<std::mutex> lock(shared->mtx);
+			shared->result = r;
+			shared->finished = true;
 		}
-		cv.notify_one();
+		shared->cv.notify_one();
 	});
 
+	CompEvalResult result = {};
 	{
-		std::unique_lock<std::mutex> lock(mtx);
-		if (!cv.wait_for(lock, std::chrono::duration<f64>(timeout_seconds), [&]{ return finished; })) {
-			// Timeout
+		std::unique_lock<std::mutex> lock(shared->mtx);
+		if (shared->cv.wait_for(lock, std::chrono::duration<f64>(timeout_seconds), [shared]{ return shared->finished; })) {
+			result = shared->result;
+		} else {
 			result.ok = false;
 			result.panic_msg = str_lit("timed out");
-			// Detach the worker thread — it will be cleaned up at process exit
 			worker.detach();
+			// shared intentionally leaked — detached thread still owns it
 			return result;
 		}
 	}
-
-	if (worker.joinable()) {
-		worker.join();
-	}
-
+	worker.join();
+	delete shared;
 	return result;
 }

@@ -180,6 +180,14 @@ bad :: proc(f: proc() -> i32) -> i32 { return 0 }
 x := #comp bad(nil)
 ' ""
 
+# --- Procedure with arguments ---
+
+expect_error "comp_with_args" '
+package test
+double :: proc(x: i32) -> i32 { return x * 2 }
+main :: proc() { x := #comp double(21); _ = x }
+' "no parameters"
+
 # --- Raw union struct ---
 
 expect_error "raw_union_return" '

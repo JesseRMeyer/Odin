@@ -8405,7 +8405,9 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 	pt = base_type(pt);
 
 	if (pt->kind == Type_Proc && pt->Proc.calling_convention == ProcCC_Odin) {
-		if ((c->scope->flags & ScopeFlag_ContextDefined) == 0) {
+		// #comp calls are JIT-evaluated and don't need context at the call site.
+		// The purity checker already verifies no context access occurs in the callee.
+		if (!call->CallExpr.comp_eval && (c->scope->flags & ScopeFlag_ContextDefined) == 0) {
 			ERROR_BLOCK();
 			if (c->scope->flags & ScopeFlag_File) {
 				error(call, "Procedures requiring a 'context' cannot be called at the global scope");
@@ -8559,7 +8561,17 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 			return Expr_Expr;
 		}
 
-		// 2. Validate return type can be a compile-time constant
+		// 2. Validate: must be a zero-argument procedure
+		{
+			Type *sig = proc_entity->type;
+			if (sig != nullptr && sig->kind == Type_Proc && sig->Proc.param_count > 0) {
+				error(call, "#comp requires a procedure with no parameters");
+				operand->mode = Addressing_Invalid;
+				return Expr_Expr;
+			}
+		}
+
+		// 3. Validate return type can be a compile-time constant
 		Type *comp_result_type = operand->type;
 		if (comp_result_type == nullptr || !is_comp_constant_type(comp_result_type)) {
 			ERROR_BLOCK();
@@ -8577,11 +8589,11 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 			return Expr_Expr;
 		}
 
-		// 3. Ensure the callee's body has been type-checked.
+		// 4. Ensure the callee's body has been type-checked.
 		//    #comp may run during entity checking, before normal body checking order.
 		comp_ensure_body_checked(c, proc_entity);
 
-		// 4. Purity check
+		// 5. Purity check
 		auto trace = array_make<CompImpurityTrace>(temporary_allocator());
 		if (!check_comp_purity(c, proc_entity, call, &trace)) {
 			report_comp_purity_error(c, call, trace);
@@ -8589,7 +8601,7 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 			return Expr_Expr;
 		}
 
-		// 5. JIT evaluate
+		// 6. JIT evaluate
 		CompEvalResult comp_result = comp_evaluate_with_timeout(
 			c, proc_entity, comp_result_type,
 			build_context.comp_timeout_seconds
@@ -8606,7 +8618,7 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 			return Expr_Expr;
 		}
 
-		// 6. Success — transform into a constant
+		// 7. Success — transform into a constant
 		operand->mode = Addressing_Constant;
 		operand->value = comp_result.value;
 		return Expr_Expr;
