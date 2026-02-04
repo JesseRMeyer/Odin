@@ -3932,6 +3932,7 @@ gb_internal lbValue lb_build_unary_and(lbProcedure *p, Ast *expr) {
 }
 
 gb_internal lbValue lb_build_expr_internal(lbProcedure *p, Ast *expr);
+gb_internal lbValue lb_build_slice_expr_value(lbProcedure *p, Ast *expr);
 gb_internal lbValue lb_build_expr(lbProcedure *p, Ast *expr) {
 	u16 prev_state_flags = p->state_flags;
 	defer (p->state_flags = prev_state_flags);
@@ -4283,6 +4284,16 @@ gb_internal lbValue lb_build_expr_internal(lbProcedure *p, Ast *expr) {
 			if (se->high == nullptr &&
 			    (se->low == nullptr || lb_is_expr_constant_zero(se->low))) {
 				return lb_build_expr(p, se->expr);
+			}
+		}
+		{
+			Type *result_type = type_of_expr(expr);
+			Type *source_type = base_type(type_of_expr(se->expr));
+			if (is_type_pointer(source_type)) {
+				source_type = base_type(type_deref(source_type));
+			}
+			if (is_type_slice(source_type) || is_type_dynamic_array(source_type) || is_type_string(source_type)) {
+				return lb_build_slice_expr_value(p, expr);
 			}
 		}
 		return lb_addr_load(p, lb_build_addr(p, expr));
@@ -4826,6 +4837,105 @@ gb_internal lbAddr lb_build_addr_index_expr(lbProcedure *p, Ast *expr) {
 	return {};
 }
 
+
+gb_internal lbValue lb_build_slice_expr_value(lbProcedure *p, Ast *expr) {
+	ast_node(se, SliceExpr, expr);
+
+	lbValue base = lb_build_expr(p, se->expr);
+	Type *type = base_type(base.type);
+
+	if (is_type_pointer(type)) {
+		type = base_type(type_deref(type));
+		base = lb_emit_load(p, base);
+	}
+
+	lbValue low  = lb_const_int(p->module, t_int, 0);
+	lbValue high = {};
+
+	if (se->low  != nullptr) {
+		low = lb_correct_endianness(p, lb_build_expr(p, se->low));
+	}
+	if (se->high != nullptr) {
+		high = lb_correct_endianness(p, lb_build_expr(p, se->high));
+	}
+
+	bool no_indices = se->low == nullptr && se->high == nullptr;
+
+	switch (type->kind) {
+	case Type_Slice: {
+		Type *slice_type = type;
+		lbValue len = lb_slice_len(p, base);
+		if (high.value == nullptr) high = len;
+
+		if (!no_indices) {
+			lb_emit_slice_bounds_check(p, se->open, low, high, len, se->low != nullptr);
+		}
+
+		lbValue elem = lb_emit_ptr_offset(p, lb_slice_elem(p, base), low);
+		lbValue new_len = (se->low == nullptr)
+			? high
+			: lb_emit_arith(p, Token_Sub, high, low, t_int);
+
+		return lb_make_slice_value(p, slice_type, elem, new_len);
+	}
+
+	case Type_DynamicArray: {
+		Type *elem_type = type->DynamicArray.elem;
+		Type *slice_type = alloc_type_slice(elem_type);
+
+		lbValue len = lb_dynamic_array_len(p, base);
+		if (high.value == nullptr) high = len;
+
+		if (!no_indices) {
+			lb_emit_slice_bounds_check(p, se->open, low, high, len, se->low != nullptr);
+		}
+
+		lbValue elem = lb_emit_ptr_offset(p, lb_dynamic_array_elem(p, base), low);
+		lbValue new_len = (se->low == nullptr)
+			? high
+			: lb_emit_arith(p, Token_Sub, high, low, t_int);
+
+		return lb_make_slice_value(p, slice_type, elem, new_len);
+	}
+
+	case Type_Basic: {
+		if (is_type_string16(type)) {
+			GB_ASSERT_MSG(are_types_identical(type, t_string16), "got %s", type_to_string(type));
+			lbValue len = lb_string_len(p, base);
+			if (high.value == nullptr) high = len;
+
+			if (!no_indices) {
+				lb_emit_slice_bounds_check(p, se->open, low, high, len, se->low != nullptr);
+			}
+
+			lbValue elem = lb_emit_ptr_offset(p, lb_string_elem(p, base), low);
+			lbValue new_len = (se->low == nullptr)
+				? high
+				: lb_emit_arith(p, Token_Sub, high, low, t_int);
+
+			return lb_make_string_value(p, t_string16, elem, new_len);
+		}
+		GB_ASSERT_MSG(are_types_identical(type, t_string), "got %s", type_to_string(type));
+		lbValue len = lb_string_len(p, base);
+		if (high.value == nullptr) high = len;
+
+		if (!no_indices) {
+			lb_emit_slice_bounds_check(p, se->open, low, high, len, se->low != nullptr);
+		}
+
+		lbValue elem = lb_emit_ptr_offset(p, lb_string_elem(p, base), low);
+		lbValue new_len = (se->low == nullptr)
+			? high
+			: lb_emit_arith(p, Token_Sub, high, low, t_int);
+
+		return lb_make_string_value(p, t_string, elem, new_len);
+	}
+
+	default:
+		GB_PANIC("lb_build_slice_expr_value: unexpected type %s", type_to_string(base.type));
+		return {};
+	}
+}
 
 gb_internal lbAddr lb_build_addr_slice_expr(lbProcedure *p, Ast *expr) {
 	ast_node(se, SliceExpr, expr);
