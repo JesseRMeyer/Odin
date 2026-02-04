@@ -2519,6 +2519,15 @@ gb_internal Ast *parse_operand(AstFile *f, bool lhs) {
 			Ast *type = parse_type(f);
 			syntax_error(tag, "#relative types have now been removed in favour of \"core:relative\"");
 			return ast_relative_type(f, tag, type);
+		} else if (name.string == "comp") {
+			Ast *expr = parse_unary_expr(f, false);
+			Ast *e = strip_or_return_expr(expr);
+			if (e == nullptr || e->kind != Ast_CallExpr) {
+				syntax_error(token, "#comp must be followed by a procedure call");
+				return ast_bad_expr(f, token, f->curr_token);
+			}
+			e->CallExpr.comp_eval = true;
+			return expr;
 		} else if (name.string == "force_inline" ||
 		           name.string == "force_no_inline" ||
 		           name.string == "must_tail") {

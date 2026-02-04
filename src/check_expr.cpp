@@ -8550,6 +8550,68 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 		check_objc_call_expr(c, operand, call, proc_entity, pt);
 	}
 
+	// #comp compile-time evaluation
+	if (call->CallExpr.comp_eval) {
+		// 1. Validate: must be a named procedure
+		if (proc_entity == nullptr || proc_entity->kind != Entity_Procedure) {
+			error(call, "#comp requires a named procedure, not an expression");
+			operand->mode = Addressing_Invalid;
+			return Expr_Expr;
+		}
+
+		// 2. Validate return type can be a compile-time constant
+		Type *comp_result_type = operand->type;
+		if (comp_result_type == nullptr || !is_comp_constant_type(comp_result_type)) {
+			ERROR_BLOCK();
+			error(call, "result of '#comp %.*s()' cannot be a compile-time constant",
+				LIT(proc_entity->token.string));
+			if (comp_result_type != nullptr) {
+				gbString type_str = type_to_string(comp_result_type);
+				error_line("\treturn type '%s' is not allowed\n", type_str);
+				gb_string_free(type_str);
+			}
+			if (comp_result_type != nullptr && is_type_slice(comp_result_type)) {
+				error_line("\tnote: use a fixed-size array instead of a slice\n");
+			}
+			operand->mode = Addressing_Invalid;
+			return Expr_Expr;
+		}
+
+		// 3. Ensure the callee's body has been type-checked.
+		//    #comp may run during entity checking, before normal body checking order.
+		comp_ensure_body_checked(c, proc_entity);
+
+		// 4. Purity check
+		auto trace = array_make<CompImpurityTrace>(temporary_allocator());
+		if (!check_comp_purity(c, proc_entity, call, &trace)) {
+			report_comp_purity_error(c, call, trace);
+			operand->mode = Addressing_Invalid;
+			return Expr_Expr;
+		}
+
+		// 5. JIT evaluate
+		CompEvalResult comp_result = comp_evaluate_with_timeout(
+			c, proc_entity, comp_result_type,
+			build_context.comp_timeout_seconds
+		);
+
+		if (!comp_result.ok) {
+			ERROR_BLOCK();
+			error(call, "compile-time evaluation of '#comp %.*s()' failed",
+				LIT(proc_entity->token.string));
+			if (comp_result.panic_msg.len > 0) {
+				error_line("\truntime panic: %.*s\n", LIT(comp_result.panic_msg));
+			}
+			operand->mode = Addressing_Invalid;
+			return Expr_Expr;
+		}
+
+		// 6. Success — transform into a constant
+		operand->mode = Addressing_Constant;
+		operand->value = comp_result.value;
+		return Expr_Expr;
+	}
+
 	return Expr_Expr;
 }
 

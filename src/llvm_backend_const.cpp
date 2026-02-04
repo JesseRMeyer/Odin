@@ -678,6 +678,84 @@ LLVMValueRef llvm_const_pad_to_size(lbModule *m, LLVMValueRef val, LLVMTypeRef d
 }
 #endif
 
+// Reconstruct LLVM constant values from a raw byte buffer (produced by #comp JIT evaluation).
+gb_internal lbValue lb_const_from_raw_bytes(lbModule *m, Type *type, u8 const *data) {
+	type = default_type(type);
+	Type *original_type = type;
+	Type *bt = base_type(type);
+	lbValue res = {};
+	res.type = original_type;
+
+	if (is_type_integer(bt) || is_type_enum(bt)) {
+		Type *inner = bt;
+		if (is_type_enum(bt)) {
+			inner = base_type(bt->Enum.base_type);
+		}
+		i64 size = type_size_of(inner);
+		if (size > 8) {
+			// 128-bit integers: construct from two 64-bit words
+			u64 words[2] = {};
+			gb_memmove(words, data, cast(isize)gb_min(size, (i64)16));
+			res.value = LLVMConstIntOfArbitraryPrecision(lb_type(m, original_type), 2, words);
+		} else {
+			u64 val = 0;
+			gb_memmove(&val, data, cast(isize)size);
+			res.value = LLVMConstInt(lb_type(m, original_type), val, !is_type_unsigned(inner));
+		}
+		return res;
+	}
+	if (is_type_float(bt)) {
+		i64 size = type_size_of(bt);
+		if (size == 2) {
+			u16 bits;
+			gb_memmove(&bits, data, 2);
+			// Use LLVMConstRealOfBitWidth for f16
+			res.value = LLVMConstBitCast(
+				LLVMConstInt(LLVMInt16TypeInContext(m->ctx), bits, false),
+				lb_type(m, original_type));
+		} else if (size == 4) {
+			f32 val;
+			gb_memmove(&val, data, 4);
+			res.value = LLVMConstReal(lb_type(m, original_type), (f64)val);
+		} else if (size == 8) {
+			f64 val;
+			gb_memmove(&val, data, 8);
+			res.value = LLVMConstReal(lb_type(m, original_type), val);
+		} else {
+			GB_PANIC("Unsupported float size %lld in lb_const_from_raw_bytes", size);
+		}
+		return res;
+	}
+	if (is_type_boolean(bt)) {
+		res.value = LLVMConstInt(lb_type(m, original_type), *data != 0 ? 1 : 0, false);
+		return res;
+	}
+	if (bt->kind == Type_Array) {
+		i64 elem_size = type_size_of(bt->Array.elem);
+		i64 count = bt->Array.count;
+		auto values = gb_alloc_array(temporary_allocator(), LLVMValueRef, count);
+		for (i64 i = 0; i < count; i++) {
+			values[i] = lb_const_from_raw_bytes(m, bt->Array.elem, data + i * elem_size).value;
+		}
+		res.value = lb_build_constant_array_values(m, original_type, bt->Array.elem, cast(isize)count, values, {});
+		return res;
+	}
+	if (bt->kind == Type_Struct && !bt->Struct.is_raw_union) {
+		isize field_count = bt->Struct.fields.count;
+		auto values = gb_alloc_array(temporary_allocator(), LLVMValueRef, field_count);
+		for (isize i = 0; i < field_count; i++) {
+			Entity *f = bt->Struct.fields[i];
+			i64 offset = bt->Struct.offsets[i];
+			values[i] = lb_const_from_raw_bytes(m, f->type, data + offset).value;
+		}
+		res.value = llvm_const_named_struct(m, original_type, values, field_count);
+		return res;
+	}
+
+	GB_PANIC("Unsupported type in lb_const_from_raw_bytes: %s", type_to_string(type));
+	return res;
+}
+
 gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, lbConstContext cc, Type *value_type) {
 	if (cc.allow_local) {
 		cc.is_rodata = false;
@@ -691,6 +769,13 @@ gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, lb
 	lbValue res = {};
 	res.type = original_type;
 	type = core_type(type);
+
+	// Handle #comp raw bytes results before convert_exact_value_for_type
+	// which doesn't know about ExactValue_RawBytes
+	if (value.kind == ExactValue_RawBytes) {
+		return lb_const_from_raw_bytes(m, original_type, value.value_raw_bytes.data);
+	}
+
 	value = convert_exact_value_for_type(value, type);
 
 	bool is_local = cc.allow_local && m->curr_procedure != nullptr;

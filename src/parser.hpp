@@ -500,6 +500,7 @@ AST_KIND(_ExprBegin,  "",  bool) \
 		Token        ellipsis; \
 		ProcInlining inlining; \
 		ProcTailing  tailing; \
+		bool         comp_eval; \
 		bool         optional_ok_one; \
 		bool         was_selector; \
 		AstSplitArgs *split_args; \
