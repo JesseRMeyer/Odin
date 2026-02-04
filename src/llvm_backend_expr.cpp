@@ -4108,48 +4108,75 @@ gb_internal lbValue lb_build_expr_internal(lbProcedure *p, Ast *expr) {
 	case_end;
 
 	case_ast_node(te, TernaryIfExpr, expr);
-		LLVMValueRef incoming_values[2] = {};
-		LLVMBasicBlockRef incoming_blocks[2] = {};
-
 		GB_ASSERT(te->y != nullptr);
-		lbBlock *then  = lb_create_block(p, "if.then");
-		lbBlock *done  = lb_create_block(p, "if.done"); // NOTE(bill): Append later
-		lbBlock *else_ = lb_create_block(p, "if.else");
-
-		lb_build_cond(p, te->cond, then, else_);
-		lb_start_block(p, then);
-
 		Type *type = default_type(type_of_expr(expr));
-		LLVMTypeRef llvm_type = lb_type(p->module, type);
 
-		incoming_values[0] = lb_emit_conv(p, lb_build_expr(p, te->x), type).value;
-		if (is_type_internally_pointer_like(type)) {
-			incoming_values[0] = LLVMBuildBitCast(p->builder, incoming_values[0], llvm_type, "");
+		// Use select for scalar types with trivial (side-effect-free) arms
+		{
+			Type *bt = base_type(type);
+			bool is_scalar = is_type_integer(bt) || is_type_float(bt) || is_type_boolean(bt) ||
+			                 is_type_pointer(bt) || is_type_enum(bt) || is_type_rune(bt) ||
+			                 is_type_typeid(bt);
+			if (is_scalar) {
+				auto is_trivial = [](Ast *e) -> bool {
+					e = unparen_expr(e);
+					TypeAndValue tav = type_and_value_of_expr(e);
+					if (tav.mode == Addressing_Constant) return true;
+					if (e->kind == Ast_Ident) return true;
+					return false;
+				};
+				if (is_trivial(te->x) && is_trivial(te->y)) {
+					lbValue cond = lb_build_expr(p, te->cond);
+					lbValue x = lb_emit_conv(p, lb_build_expr(p, te->x), type);
+					lbValue y = lb_emit_conv(p, lb_build_expr(p, te->y), type);
+					return lb_emit_select(p, cond, x, y);
+				}
+			}
 		}
 
-		lb_emit_jump(p, done);
-		lb_start_block(p, else_);
+		// General path: branch + phi
+		{
+			LLVMValueRef incoming_values[2] = {};
+			LLVMBasicBlockRef incoming_blocks[2] = {};
 
-		incoming_values[1] = lb_emit_conv(p, lb_build_expr(p, te->y), type).value;
+			lbBlock *then  = lb_create_block(p, "if.then");
+			lbBlock *done  = lb_create_block(p, "if.done");
+			lbBlock *else_ = lb_create_block(p, "if.else");
 
-		if (is_type_internally_pointer_like(type)) {
-			incoming_values[1] = LLVMBuildBitCast(p->builder, incoming_values[1], llvm_type, "");
+			lb_build_cond(p, te->cond, then, else_);
+			lb_start_block(p, then);
+
+			LLVMTypeRef llvm_type = lb_type(p->module, type);
+
+			incoming_values[0] = lb_emit_conv(p, lb_build_expr(p, te->x), type).value;
+			if (is_type_internally_pointer_like(type)) {
+				incoming_values[0] = LLVMBuildBitCast(p->builder, incoming_values[0], llvm_type, "");
+			}
+
+			lb_emit_jump(p, done);
+			lb_start_block(p, else_);
+
+			incoming_values[1] = lb_emit_conv(p, lb_build_expr(p, te->y), type).value;
+
+			if (is_type_internally_pointer_like(type)) {
+				incoming_values[1] = LLVMBuildBitCast(p->builder, incoming_values[1], llvm_type, "");
+			}
+
+			lb_emit_jump(p, done);
+			lb_start_block(p, done);
+
+			lbValue res = {};
+			res.value = LLVMBuildPhi(p->builder, llvm_type, "");
+			res.type = type;
+
+			GB_ASSERT(p->curr_block->preds.count >= 2);
+			incoming_blocks[0] = p->curr_block->preds[0]->block;
+			incoming_blocks[1] = p->curr_block->preds[1]->block;
+
+			LLVMAddIncoming(res.value, incoming_values, incoming_blocks, 2);
+
+			return res;
 		}
-
-		lb_emit_jump(p, done);
-		lb_start_block(p, done);
-
-		lbValue res = {};
-		res.value = LLVMBuildPhi(p->builder, llvm_type, "");
-		res.type = type;
-
-		GB_ASSERT(p->curr_block->preds.count >= 2);
-		incoming_blocks[0] = p->curr_block->preds[0]->block;
-		incoming_blocks[1] = p->curr_block->preds[1]->block;
-
-		LLVMAddIncoming(res.value, incoming_values, incoming_blocks, 2);
-
-		return res;
 	case_end;
 
 	case_ast_node(te, TernaryWhenExpr, expr);
