@@ -255,8 +255,10 @@ gb_internal void lb_equal_proc_generate_body(lbModule *m, lbProcedure *p) {
 	lb_begin_procedure_body(p);
 
 	LLVMSetLinkage(p->value, LLVMInternalLinkage);
-	// lb_add_attribute_to_proc(m, p->value, "readonly");
+	lb_add_attribute_to_proc_with_string(m, p->value, str_lit("memory"), str_lit("read"));
 	lb_add_attribute_to_proc(m, p->value, "nounwind");
+	lb_add_attribute_to_proc(m, p->value, "willreturn");
+	lb_add_attribute_to_proc(m, p->value, "mustprogress");
 
 	LLVMValueRef x = LLVMGetParam(p->value, 0);
 	LLVMValueRef y = LLVMGetParam(p->value, 1);
@@ -439,8 +441,10 @@ gb_internal lbValue lb_hasher_proc_for_type(lbModule *m, Type *type) {
 	defer (lb_end_procedure_body(p));
 
 	LLVMSetLinkage(p->value, LLVMInternalLinkage);
-	// lb_add_attribute_to_proc(m, p->value, "readonly");
+	lb_add_attribute_to_proc_with_string(m, p->value, str_lit("memory"), str_lit("read"));
 	lb_add_attribute_to_proc(m, p->value, "nounwind");
+	lb_add_attribute_to_proc(m, p->value, "willreturn");
+	lb_add_attribute_to_proc(m, p->value, "mustprogress");
 
 	LLVMValueRef x = LLVMGetParam(p->value, 0);
 	LLVMValueRef y = LLVMGetParam(p->value, 1);
@@ -448,7 +452,7 @@ gb_internal lbValue lb_hasher_proc_for_type(lbModule *m, Type *type) {
 	lbValue seed = {y, t_uintptr};
 
 	lb_add_proc_attribute_at_index(p, 1+0, "nonnull");
-	// lb_add_proc_attribute_at_index(p, 1+0, "readonly");
+	lb_add_proc_attribute_at_index(p, 1+0, "readonly");
 
 	if (is_type_simple_compare(type)) {
 		lbValue res = lb_simple_compare_hash(p, type, data, seed);
@@ -653,6 +657,7 @@ gb_internal lbValue lb_map_get_proc_for_type(lbModule *m, Type *type) {
 
 	LLVMSetLinkage(p->value, LLVMInternalLinkage);
 	lb_add_attribute_to_proc(m, p->value, "nounwind");
+	lb_add_attribute_to_proc(m, p->value, "mustprogress");
 	if (build_context.ODIN_DEBUG) {
 		lb_add_attribute_to_proc(m, p->value, "noinline");
 	}
@@ -828,6 +833,7 @@ gb_internal lbValue lb_map_set_proc_for_type(lbModule *m, Type *type) {
 
 	LLVMSetLinkage(p->value, LLVMInternalLinkage);
 	lb_add_attribute_to_proc(m, p->value, "nounwind");
+	lb_add_attribute_to_proc(m, p->value, "mustprogress");
 	if (build_context.ODIN_DEBUG) {
 		lb_add_attribute_to_proc(m, p->value, "noinline");
 	}
@@ -3393,43 +3399,41 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 
 		lbValue g = {};
 		g.type = alloc_type_pointer(e->type);
-		g.value = LLVMAddGlobal(m->mod, lb_type(m, e->type), alloc_cstring(permanent_allocator(), name));
+
+		// Determine type and initializer BEFORE creating the global
+		LLVMTypeRef global_type = lb_type(m, e->type);
+		LLVMValueRef initializer = nullptr;
+		bool is_const_global = false;
 
 		if (decl->init_expr != nullptr) {
 			TypeAndValue tav = type_and_value_of_expr(decl->init_expr);
-			if (!is_type_any(e->type)) {
-				if (tav.mode != Addressing_Invalid) {
-					if (tav.value.kind != ExactValue_Invalid) {
-						auto cc = LB_CONST_CONTEXT_DEFAULT;
-						cc.is_rodata = e->kind == Entity_Variable && e->Variable.is_rodata;
-						cc.allow_local = false;
-						cc.link_section = e->Variable.link_section;
-
-						ExactValue v = tav.value;
-						lbValue init = lb_const_value(m, tav.type, v, cc);
-
-						LLVMDeleteGlobal(g.value);
-						g.value = nullptr;
-						g.value = LLVMAddGlobal(m->mod, LLVMTypeOf(init.value), alloc_cstring(permanent_allocator(), name));
-
-						LLVMSetInitializer(g.value, init.value);
-						var.is_initialized = true;
-						if (cc.is_rodata) {
-							LLVMSetGlobalConstant(g.value, true);
-						}
-					}
-				}
+			if (!is_type_any(e->type) && tav.mode != Addressing_Invalid
+			    && tav.value.kind != ExactValue_Invalid) {
+				auto cc = LB_CONST_CONTEXT_DEFAULT;
+				cc.is_rodata = e->kind == Entity_Variable && e->Variable.is_rodata;
+				cc.allow_local = false;
+				cc.link_section = e->Variable.link_section;
+				lbValue init = lb_const_value(m, tav.type, tav.value, cc);
+				global_type = LLVMTypeOf(init.value);
+				initializer = init.value;
+				var.is_initialized = true;
+				is_const_global = cc.is_rodata;
 			}
 			if (!var.is_initialized && is_type_untyped_nil(tav.type)) {
 				var.is_initialized = true;
-				if (e->kind == Entity_Variable && e->Variable.is_rodata) {
-					LLVMSetGlobalConstant(g.value, true);
-				}
+				is_const_global = (e->kind == Entity_Variable && e->Variable.is_rodata);
 			}
 		} else if (e->kind == Entity_Variable && e->Variable.is_rodata) {
-			LLVMSetGlobalConstant(g.value, true);
+			is_const_global = true;
 		}
 
+		g.value = LLVMAddGlobal(m->mod, global_type, alloc_cstring(permanent_allocator(), name));
+		if (initializer) {
+			LLVMSetInitializer(g.value, initializer);
+		}
+		if (is_const_global) {
+			LLVMSetGlobalConstant(g.value, true);
+		}
 
 		lb_apply_thread_local_model(g.value, e->Variable.thread_local_model);
 

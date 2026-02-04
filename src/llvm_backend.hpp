@@ -186,8 +186,14 @@ struct lbModule {
 	LLVMMetadataRef debug_compile_unit;
 
 	RecursiveMutex debug_values_mutex;
-	PtrMap<void *, LLVMMetadataRef> debug_values; 
+	PtrMap<void *, LLVMMetadataRef> debug_values;
 
+	// TBAA metadata
+	LLVMMetadataRef tbaa_root;
+	unsigned        tbaa_kind_id;
+	RecursiveMutex  tbaa_mutex;
+	StringMap<LLVMMetadataRef>      tbaa_type_nodes;
+	PtrMap<Type *, LLVMMetadataRef> tbaa_access_tags;
 
 	StringMap<lbAddr> objc_classes;
 	StringMap<lbAddr> objc_selectors;
@@ -387,6 +393,7 @@ struct lbProcedure {
 	Array<lbContextData> context_stack;
 
 	LLVMMetadataRef debug_info;
+	LLVMMetadataRef current_debug_scope; // cached; updated in lb_open_scope/lb_close_scope
 
 	PtrMap<Ast *, lbValue> selector_values;
 	PtrMap<Ast *, lbAddr>  selector_addr;

@@ -168,8 +168,8 @@ gb_internal void lb_pop_target_list(lbProcedure *p) {
 gb_internal void lb_open_scope(lbProcedure *p, Scope *s) {
 	lbModule *m = p->module;
 	if (m->debug_builder) {
-		LLVMMetadataRef curr_metadata = lb_get_llvm_metadata(m, s);
-		if (s != nullptr && s->node != nullptr && curr_metadata == nullptr) {
+		LLVMMetadataRef scope_md = lb_get_llvm_metadata(m, s);
+		if (s != nullptr && s->node != nullptr && scope_md == nullptr) {
 			Token token = ast_token(s->node);
 			unsigned line = cast(unsigned)token.pos.line;
 			unsigned column = cast(unsigned)token.pos.column;
@@ -187,13 +187,11 @@ gb_internal void lb_open_scope(lbProcedure *p, Scope *s) {
 				scope = lb_get_llvm_metadata(m, p);
 			}
 			GB_ASSERT_MSG(scope != nullptr, "%.*s", LIT(p->name));
-
-			if (m->debug_builder) {
-				LLVMMetadataRef res = LLVMDIBuilderCreateLexicalBlock(m->debug_builder, scope,
-					file, line, column
-				);
-				lb_set_llvm_metadata(m, s, res);
-			}
+			scope_md = LLVMDIBuilderCreateLexicalBlock(m->debug_builder, scope, file, line, column);
+			lb_set_llvm_metadata(m, s, scope_md);
+		}
+		if (scope_md) {
+			p->current_debug_scope = scope_md;
 		}
 	}
 
@@ -201,7 +199,6 @@ gb_internal void lb_open_scope(lbProcedure *p, Scope *s) {
 	p->curr_scope = s;
 	p->scope_index += 1;
 	array_add(&p->scope_stack, s);
-
 }
 
 gb_internal void lb_close_scope(lbProcedure *p, lbDeferExitKind kind, lbBlock *block, Ast *node, bool pop_stack=true) {
@@ -225,6 +222,16 @@ gb_internal void lb_close_scope(lbProcedure *p, lbDeferExitKind kind, lbBlock *b
 
 	p->scope_index -= 1;
 	array_pop(&p->scope_stack);
+	if (p->module->debug_builder) {
+		p->current_debug_scope = nullptr;
+		for (isize i = p->scope_stack.count-1; i >= 0; i--) {
+			LLVMMetadataRef md = lb_get_llvm_metadata(p->module, p->scope_stack[i]);
+			if (md) {
+				p->current_debug_scope = md;
+				break;
+			}
+		}
+	}
 }
 
 gb_internal void lb_build_when_stmt(lbProcedure *p, AstWhenStmt *ws) {
@@ -2257,7 +2264,11 @@ gb_internal isize lb_append_tuple_values(lbProcedure *p, Array<lbValue> *dst_val
 	if (t->kind == Type_Tuple) {
 		lbTupleFix *tf = map_get(&p->tuple_fix_map, src_value.value);
 		if (tf) {
-			for (lbValue const &value : tf->values) {
+			for (isize i = 0; i < tf->values.count; i++) {
+				lbValue value = tf->values[i];
+				if (i < tf->values.count - 1) {
+					value = lb_emit_load(p, value);
+				}
 				array_add(dst_values, value);
 			}
 		} else {
