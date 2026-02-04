@@ -2788,6 +2788,33 @@ gb_internal LLVMValueRef OdinLLVMBuildTransmute(lbProcedure *p, LLVMValueRef val
 		}
 	}
 
+	// struct-to-struct: per-field transmute when field counts and sizes match
+	if (src_kind == LLVMStructTypeKind && dst_kind == LLVMStructTypeKind) {
+		unsigned src_count = LLVMCountStructElementTypes(src_type);
+		unsigned dst_count = LLVMCountStructElementTypes(dst_type);
+		if (src_count == dst_count && src_count > 0 && src_size == dst_size) {
+			bool compatible = true;
+			for (unsigned i = 0; i < src_count; i++) {
+				LLVMTypeRef sf = LLVMStructGetTypeAtIndex(src_type, i);
+				LLVMTypeRef df = LLVMStructGetTypeAtIndex(dst_type, i);
+				if (lb_sizeof(sf) != lb_sizeof(df)) {
+					compatible = false;
+					break;
+				}
+			}
+			if (compatible) {
+				LLVMValueRef result = LLVMGetPoison(dst_type);
+				for (unsigned i = 0; i < src_count; i++) {
+					LLVMTypeRef df = LLVMStructGetTypeAtIndex(dst_type, i);
+					LLVMValueRef field = LLVMBuildExtractValue(p->builder, val, i, "");
+					field = OdinLLVMBuildTransmute(p, field, df);
+					result = LLVMBuildInsertValue(p->builder, result, field, i, "");
+				}
+				return result;
+			}
+		}
+	}
+
 general_end:;
 	// make the alignment big if necessary
 	if (LLVMIsALoadInst(val) && src_align < dst_align) {
