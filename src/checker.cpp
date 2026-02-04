@@ -661,7 +661,7 @@ gb_internal bool check_vet_shadowing(Checker *c, Entity *e, VettedEntity *ve) {
 		return false;
 	}
 
-	Entity *shadowed = scope_lookup(parent, name);
+	Entity *shadowed = scope_lookup(parent, name, string_hash(name));
 	if (shadowed == nullptr) {
 		return false;
 	}
@@ -944,7 +944,7 @@ gb_internal AstPackage *try_get_core_package(CheckerInfo *info, String name) {
 gb_internal void add_package_dependency(CheckerContext *c, char const *package_name, char const *name, bool required=false) {
 	String n = make_string_c(name);
 	AstPackage *p = get_core_package(&c->checker->info, make_string_c(package_name));
-	Entity *e = scope_lookup(p->scope, n);
+	Entity *e = scope_lookup(p->scope, n, string_hash(n));
 	GB_ASSERT_MSG(e != nullptr, "%s", name);
 	GB_ASSERT(c->decl != nullptr);
 	e->flags |= EntityFlag_Used;
@@ -957,7 +957,7 @@ gb_internal void add_package_dependency(CheckerContext *c, char const *package_n
 gb_internal void try_to_add_package_dependency(CheckerContext *c, char const *package_name, char const *name) {
 	String n = make_string_c(name);
 	AstPackage *p = get_core_package(&c->checker->info, make_string_c(package_name));
-	Entity *e = scope_lookup(p->scope, n);
+	Entity *e = scope_lookup(p->scope, n, string_hash(n));
 	if (e == nullptr) {
 		return;
 	}
@@ -2715,7 +2715,7 @@ gb_internal void add_dependency_to_set_threaded(Checker *c, Entity *entity) {
 
 
 gb_internal void force_add_dependency_entity(Checker *c, Scope *scope, String const &name) {
-	Entity *e = scope_lookup(scope, name);
+	Entity *e = scope_lookup(scope, name, string_hash(name));
 	if (e == nullptr) {
 		return;
 	}

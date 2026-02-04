@@ -1496,7 +1496,7 @@ gb_internal bool check_type_specialization_to(CheckerContext *ctx, Type *special
 
 				// NOTE(bill, 2018-12-14): This is needed to override polymorphic named constants in types
 				if (st->kind == Type_Generic && t_e->kind == Entity_Constant) {
-					Entity *e = scope_lookup(st->Generic.scope, st->Generic.name);
+					Entity *e = scope_lookup(st->Generic.scope, st->Generic.name, st->Generic.name_hash);
 					GB_ASSERT(e != nullptr);
 					if (modify_type) {
 						e->kind = Entity_Constant;
@@ -1549,7 +1549,7 @@ gb_internal bool check_type_specialization_to(CheckerContext *ctx, Type *special
 
 				// NOTE(bill, 2018-12-14): This is needed to override polymorphic named constants in types
 				if (st->kind == Type_Generic && t_e->kind == Entity_Constant) {
-					Entity *e = scope_lookup(st->Generic.scope, st->Generic.name);
+					Entity *e = scope_lookup(st->Generic.scope, st->Generic.name, st->Generic.name_hash);
 					GB_ASSERT(e != nullptr);
 					if (modify_type) {
 						e->kind = Entity_Constant;

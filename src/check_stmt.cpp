@@ -1184,6 +1184,8 @@ gb_internal void check_switch_stmt(CheckerContext *ctx, Ast *node, u32 mod_flags
 
 	SeenMap seen = {}; // NOTE(bill): Multimap, Key: ExactValue
 	defer (map_destroy(&seen));
+	RangeCache switch_rc = range_cache_make(heap_allocator());
+	defer (range_cache_destroy(&switch_rc));
 
 	for (Ast *stmt : bs->stmts) {
 		if (stmt->kind != Ast_CaseClause) {
@@ -1243,7 +1245,7 @@ gb_internal void check_switch_stmt(CheckerContext *ctx, Ast *node, u32 mod_flags
 				Operand b1 = rhs;
 				check_comparison(ctx, expr, &a1, &b1, Token_LtEq);
 
-				add_to_seen_map(ctx, &seen, upper_op, x, lhs, rhs);
+				add_to_seen_map(ctx, &seen, &switch_rc, upper_op, x, lhs, rhs);
 
 				if (is_type_string16(x.type)) {
 					// NOTE(bill): Force dependency for strings here
@@ -1292,7 +1294,7 @@ gb_internal void check_switch_stmt(CheckerContext *ctx, Ast *node, u32 mod_flags
 						continue;
 					}
 					update_untyped_expr_type(ctx, z.expr, x.type, !is_type_untyped(x.type));
-					add_to_seen_map(ctx, &seen, y);
+					add_to_seen_map(ctx, &seen, &switch_rc, y);
 				}
 			}
 		}
@@ -1318,7 +1320,11 @@ gb_internal void check_switch_stmt(CheckerContext *ctx, Ast *node, u32 mod_flags
 			ExactValue v = f->Constant.value;
 			auto found = map_get(&seen, hash_exact_value(v));
 			if (!found) {
-				array_add(&unhandled, f);
+				// Also check RangeCache for values covered by ranges
+				i64 vi = exact_value_to_i64(v);
+				if (!range_cache_index_exists(&switch_rc, vi)) {
+					array_add(&unhandled, f);
+				}
 			}
 		}
 

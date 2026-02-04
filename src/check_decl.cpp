@@ -158,7 +158,7 @@ gb_internal void override_entity_in_scope(Entity *original_entity, Entity *new_e
 	String original_name = original_entity->token.string;
 	Scope *found_scope = nullptr;
 	Entity *found_entity = nullptr;
-	scope_lookup_parent(original_entity->scope, original_name, &found_scope, &found_entity);
+	scope_lookup_parent(original_entity->scope, original_name, &found_scope, &found_entity, string_hash(original_name));
 	if (found_scope == nullptr) {
 		return;
 	}

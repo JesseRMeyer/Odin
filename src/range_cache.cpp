@@ -33,6 +33,11 @@ gb_internal bool range_cache_add_index(RangeCache *c, i64 index) {
 }
 
 
+// NOTE: On overlap, merges into the first overlapping entry and returns false.
+// Does NOT coalesce with further entries — after an overlap error, the ranges
+// array may contain internally-overlapping entries. This is benign: it only
+// occurs in error-recovery paths, and range_cache_index_exists still returns
+// correct results because the merged entry covers at least the new input.
 gb_internal bool range_cache_add_range(RangeCache *c, i64 lo, i64 hi) {
 	GB_ASSERT(lo <= hi);
 	for_array(i, c->ranges) {
@@ -59,12 +64,12 @@ gb_internal bool range_cache_add_range(RangeCache *c, i64 lo, i64 hi) {
 }
 
 
-// gb_internal bool range_cache_index_exists(RangeCache *c, i64 index) {
-// 	for_array(i, c->ranges) {
-// 		RangeValue v = c->ranges[i];
-// 		if (v.lo <= index && index <= v.hi) {
-// 			return true;
-// 		}
-// 	}
-// 	return false;
-// }
+gb_internal bool range_cache_index_exists(RangeCache *c, i64 index) {
+	for_array(i, c->ranges) {
+		RangeValue v = c->ranges[i];
+		if (v.lo <= index && index <= v.hi) {
+			return true;
+		}
+	}
+	return false;
+}

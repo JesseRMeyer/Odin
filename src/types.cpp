@@ -226,6 +226,7 @@ struct TypeNamed {
 	TYPE_KIND(Generic, struct {                               \
 		i64     id;                                       \
 		String  name;                                     \
+		u32     name_hash;                                \
 		Type *  specialized;                              \
 		Scope * scope;                                    \
 		Entity *entity;                                   \
@@ -984,6 +985,7 @@ gb_internal Type *alloc_type_generic(Scope *scope, i64 id, String name, Type *sp
 	Type *t = alloc_type(Type_Generic);
 	t->Generic.id = id;
 	t->Generic.name = name;
+	t->Generic.name_hash = string_hash(name);
 	t->Generic.specialized = specialized;
 	t->Generic.scope = scope;
 	return t;
@@ -2964,6 +2966,12 @@ gb_internal bool are_types_identical(Type *x, Type *y) {
 		return false;
 	}
 
+	// NOTE: No hash-gated early-out here. The canonical_hash includes parameter
+	// names, but are_types_identical (check_tuple_names=false) ignores them.
+	// Using the hash would produce false negatives for proc types that differ
+	// only in parameter names (e.g. "seed: i64" vs "_: i64").
+	// The early-out is safe in are_types_identical_unique_tuples which checks names.
+
 	// MUTEX_GUARD(&g_type_mutex);
 	return are_types_identical_internal(x, y, false);
 }
@@ -2990,6 +2998,16 @@ gb_internal bool are_types_identical_unique_tuples(Type *x, Type *y) {
 	}
 	if (x->kind != y->kind) {
 		return false;
+	}
+
+	// Hash-gated early-out: safe here because check_tuple_names=true matches
+	// the canonical_hash which includes parameter names.
+	{
+		u64 hx = x->canonical_hash.load(std::memory_order_relaxed);
+		u64 hy = y->canonical_hash.load(std::memory_order_relaxed);
+		if (hx != 0 && hy != 0 && hx != hy) {
+			return false;
+		}
 	}
 
 	// MUTEX_GUARD(&g_type_mutex);

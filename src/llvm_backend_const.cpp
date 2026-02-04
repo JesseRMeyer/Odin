@@ -1234,7 +1234,52 @@ gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, lb
 		res.value = LLVMConstIntToPtr(LLVMConstInt(lb_type(m, t_uintptr), value.value_pointer, false), lb_type(m, original_type));
 		return res;
 
-	case ExactValue_Compound:
+	case ExactValue_Compound: {
+		// Helper: build field_index_map on the CompoundLit if not already built.
+		// Maps position i (0-based, relative to base_index) to index j in cl->elems, or -1 for unset.
+		//
+		// NOTE: Lazily cached on the AST node. If two backend threads process the
+		// same compound literal concurrently, both compute an identical map from
+		// immutable AST data and write the same pointer-sized value. Benign on
+		// x86-64/AArch64 where aligned pointer stores are atomic.
+		//
+		// Each compound literal has a single type from the checker, so the
+		// base_index/total_count pair is always the same for a given AST node.
+		//
+		// For range elements, lb_const_value is called per-index rather than once
+		// per range. This is safe because LLVM constants are uniqued (interned) —
+		// identical inputs yield the same LLVMValueRef.
+		auto lb_ensure_field_index_map = [](AstCompoundLit *cl, i64 base_index, i64 total_count) -> i32 * {
+			if (cl->field_index_map) {
+				return cl->field_index_map;
+			}
+			i32 *map = gb_alloc_array(permanent_allocator(), i32, cast(isize)total_count);
+			for (i64 i = 0; i < total_count; i++) {
+				map[i] = -1;
+			}
+			for (isize j = 0; j < cl->elems.count; j++) {
+				Ast *elem = cl->elems[j];
+				GB_ASSERT(elem->kind == Ast_FieldValue);
+				AstFieldValue *fv = &elem->FieldValue;
+				if (is_ast_range(fv->field)) {
+					AstBinaryExpr *ie = &fv->field->BinaryExpr;
+					i64 lo = exact_value_to_i64(ie->left->tav.value);
+					i64 hi = exact_value_to_i64(ie->right->tav.value);
+					if (ie->op.kind != Token_RangeHalf) {
+						hi += 1;
+					}
+					for (i64 k = lo; k < hi; k++) {
+						map[k - base_index] = cast(i32)j;
+					}
+				} else {
+					i64 idx = exact_value_to_i64(fv->field->tav.value);
+					map[idx - base_index] = cast(i32)j;
+				}
+			}
+			cl->field_index_map = map;
+			return map;
+		};
+
 		if (is_type_slice(type)) {
 			return lb_const_value(m, type, value, cc);
 		} else if (is_type_soa_struct(type)) {
@@ -1249,62 +1294,22 @@ gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, lb
 			if (cl->elems[0]->kind == Ast_FieldValue) {
 				TEMPORARY_ALLOCATOR_GUARD();
 
-				// TODO(bill): This is O(N*M) and will be quite slow; it should probably be sorted before hand
-
 				isize elem_count = cast(isize)type->Struct.soa_count;
 
 				LLVMValueRef *aos_values = gb_alloc_array(temporary_allocator(), LLVMValueRef, elem_count);
 
-				isize value_index = 0;
+				i32 *index_map = lb_ensure_field_index_map(cl, 0, elem_count);
 				for (i64 i = 0; i < elem_count; i++) {
-					bool found = false;
-
-					for (isize j = 0; j < elem_count; j++) {
+					i32 j = index_map[i];
+					if (j >= 0) {
 						Ast *elem = cl->elems[j];
 						ast_node(fv, FieldValue, elem);
-						if (is_ast_range(fv->field)) {
-							ast_node(ie, BinaryExpr, fv->field);
-							TypeAndValue lo_tav = ie->left->tav;
-							TypeAndValue hi_tav = ie->right->tav;
-							GB_ASSERT(lo_tav.mode == Addressing_Constant);
-							GB_ASSERT(hi_tav.mode == Addressing_Constant);
-
-							TokenKind op = ie->op.kind;
-							i64 lo = exact_value_to_i64(lo_tav.value);
-							i64 hi = exact_value_to_i64(hi_tav.value);
-							if (op != Token_RangeHalf) {
-								hi += 1;
-							}
-							if (lo == i) {
-								TypeAndValue tav = fv->value->tav;
-								LLVMValueRef val = lb_const_value(m, elem_type, tav.value, cc, tav.type).value;
-								for (i64 k = lo; k < hi; k++) {
-									aos_values[value_index++] = val;
-								}
-
-								found = true;
-								i += (hi-lo-1);
-								break;
-							}
-						} else {
-							TypeAndValue index_tav = fv->field->tav;
-							GB_ASSERT(index_tav.mode == Addressing_Constant);
-							i64 index = exact_value_to_i64(index_tav.value);
-							if (index == i) {
-								TypeAndValue tav = fv->value->tav;
-								LLVMValueRef val = lb_const_value(m, elem_type, tav.value, cc, tav.type).value;
-								aos_values[value_index++] = val;
-								found = true;
-								break;
-							}
-						}
-					}
-
-					if (!found) {
-						aos_values[value_index++] = nullptr;
+						TypeAndValue tav = fv->value->tav;
+						aos_values[i] = lb_const_value(m, elem_type, tav.value, cc, tav.type).value;
+					} else {
+						aos_values[i] = nullptr;
 					}
 				}
-
 
 				isize field_count = type->Struct.fields.count;
 				LLVMValueRef *soa_values = gb_alloc_array(temporary_allocator(), LLVMValueRef, field_count);
@@ -1387,56 +1392,19 @@ gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, lb
 				return lb_const_nil(m, original_type);
 			}
 			if (cl->elems[0]->kind == Ast_FieldValue) {
-				// TODO(bill): This is O(N*M) and will be quite slow; it should probably be sorted before hand
 				LLVMValueRef *values = gb_alloc_array(temporary_allocator(), LLVMValueRef, cast(isize)type->Array.count);
+				LLVMValueRef null_val = LLVMConstNull(lb_type(m, elem_type));
 
-				isize value_index = 0;
+				i32 *index_map = lb_ensure_field_index_map(cl, 0, type->Array.count);
 				for (i64 i = 0; i < type->Array.count; i++) {
-					bool found = false;
-
-					for (isize j = 0; j < elem_count; j++) {
+					i32 j = index_map[i];
+					if (j >= 0) {
 						Ast *elem = cl->elems[j];
 						ast_node(fv, FieldValue, elem);
-						if (is_ast_range(fv->field)) {
-							ast_node(ie, BinaryExpr, fv->field);
-							TypeAndValue lo_tav = ie->left->tav;
-							TypeAndValue hi_tav = ie->right->tav;
-							GB_ASSERT(lo_tav.mode == Addressing_Constant);
-							GB_ASSERT(hi_tav.mode == Addressing_Constant);
-
-							TokenKind op = ie->op.kind;
-							i64 lo = exact_value_to_i64(lo_tav.value);
-							i64 hi = exact_value_to_i64(hi_tav.value);
-							if (op != Token_RangeHalf) {
-								hi += 1;
-							}
-							if (lo == i) {
-								TypeAndValue tav = fv->value->tav;
-								LLVMValueRef val = lb_const_value(m, elem_type, tav.value, cc, tav.type).value;
-								for (i64 k = lo; k < hi; k++) {
-									values[value_index++] = val;
-								}
-
-								found = true;
-								i += (hi-lo-1);
-								break;
-							}
-						} else {
-							TypeAndValue index_tav = fv->field->tav;
-							GB_ASSERT(index_tav.mode == Addressing_Constant);
-							i64 index = exact_value_to_i64(index_tav.value);
-							if (index == i) {
-								TypeAndValue tav = fv->value->tav;
-								LLVMValueRef val = lb_const_value(m, elem_type, tav.value, cc, tav.type).value;
-								values[value_index++] = val;
-								found = true;
-								break;
-							}
-						}
-					}
-
-					if (!found) {
-						values[value_index++] = LLVMConstNull(lb_type(m, elem_type));
+						TypeAndValue tav = fv->value->tav;
+						values[i] = lb_const_value(m, elem_type, tav.value, cc, tav.type).value;
+					} else {
+						values[i] = null_val;
 					}
 				}
 
@@ -1478,60 +1446,23 @@ gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, lb
 				return lb_const_nil(m, original_type);
 			}
 			if (cl->elems[0]->kind == Ast_FieldValue) {
-				// TODO(bill): This is O(N*M) and will be quite slow; it should probably be sorted before hand
 				LLVMValueRef *values = gb_alloc_array(temporary_allocator(), LLVMValueRef, cast(isize)type->EnumeratedArray.count);
-
-				isize value_index = 0;
+				LLVMValueRef null_val = LLVMConstNull(lb_type(m, elem_type));
 
 				i64 total_lo = exact_value_to_i64(*type->EnumeratedArray.min_value);
 				i64 total_hi = exact_value_to_i64(*type->EnumeratedArray.max_value);
+				i64 total_count = total_hi - total_lo + 1;
 
-				for (i64 i = total_lo; i <= total_hi; i++) {
-					bool found = false;
-
-					for (isize j = 0; j < elem_count; j++) {
+				i32 *index_map = lb_ensure_field_index_map(cl, total_lo, total_count);
+				for (i64 i = 0; i < total_count; i++) {
+					i32 j = index_map[i];
+					if (j >= 0) {
 						Ast *elem = cl->elems[j];
 						ast_node(fv, FieldValue, elem);
-						if (is_ast_range(fv->field)) {
-							ast_node(ie, BinaryExpr, fv->field);
-							TypeAndValue lo_tav = ie->left->tav;
-							TypeAndValue hi_tav = ie->right->tav;
-							GB_ASSERT(lo_tav.mode == Addressing_Constant);
-							GB_ASSERT(hi_tav.mode == Addressing_Constant);
-
-							TokenKind op = ie->op.kind;
-							i64 lo = exact_value_to_i64(lo_tav.value);
-							i64 hi = exact_value_to_i64(hi_tav.value);
-							if (op != Token_RangeHalf) {
-								hi += 1;
-							}
-							if (lo == i) {
-								TypeAndValue tav = fv->value->tav;
-								LLVMValueRef val = lb_const_value(m, elem_type, tav.value, cc, tav.type).value;
-								for (i64 k = lo; k < hi; k++) {
-									values[value_index++] = val;
-								}
-
-								found = true;
-								i += (hi-lo-1);
-								break;
-							}
-						} else {
-							TypeAndValue index_tav = fv->field->tav;
-							GB_ASSERT(index_tav.mode == Addressing_Constant);
-							i64 index = exact_value_to_i64(index_tav.value);
-							if (index == i) {
-								TypeAndValue tav = fv->value->tav;
-								LLVMValueRef val = lb_const_value(m, elem_type, tav.value, cc, tav.type).value;
-								values[value_index++] = val;
-								found = true;
-								break;
-							}
-						}
-					}
-
-					if (!found) {
-						values[value_index++] = LLVMConstNull(lb_type(m, elem_type));
+						TypeAndValue tav = fv->value->tav;
+						values[i] = lb_const_value(m, elem_type, tav.value, cc, tav.type).value;
+					} else {
+						values[i] = null_val;
 					}
 				}
 
@@ -1567,54 +1498,17 @@ gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, lb
 			LLVMValueRef *values = gb_alloc_array(temporary_allocator(), LLVMValueRef, total_elem_count);
 
 			if (cl->elems[0]->kind == Ast_FieldValue) {
-				// TODO(bill): This is O(N*M) and will be quite slow; it should probably be sorted before hand
-				isize value_index = 0;
+				LLVMValueRef null_val = LLVMConstNull(lb_type(m, elem_type));
+				i32 *index_map = lb_ensure_field_index_map(cl, 0, total_elem_count);
 				for (i64 i = 0; i < total_elem_count; i++) {
-					bool found = false;
-
-					for (isize j = 0; j < elem_count; j++) {
+					i32 j = index_map[i];
+					if (j >= 0) {
 						Ast *elem = cl->elems[j];
 						ast_node(fv, FieldValue, elem);
-						if (is_ast_range(fv->field)) {
-							ast_node(ie, BinaryExpr, fv->field);
-							TypeAndValue lo_tav = ie->left->tav;
-							TypeAndValue hi_tav = ie->right->tav;
-							GB_ASSERT(lo_tav.mode == Addressing_Constant);
-							GB_ASSERT(hi_tav.mode == Addressing_Constant);
-
-							TokenKind op = ie->op.kind;
-							i64 lo = exact_value_to_i64(lo_tav.value);
-							i64 hi = exact_value_to_i64(hi_tav.value);
-							if (op != Token_RangeHalf) {
-								hi += 1;
-							}
-							if (lo == i) {
-								TypeAndValue tav = fv->value->tav;
-								LLVMValueRef val = lb_const_value(m, elem_type, tav.value, cc, tav.type).value;
-								for (i64 k = lo; k < hi; k++) {
-									values[value_index++] = val;
-								}
-
-								found = true;
-								i += (hi-lo-1);
-								break;
-							}
-						} else {
-							TypeAndValue index_tav = fv->field->tav;
-							GB_ASSERT(index_tav.mode == Addressing_Constant);
-							i64 index = exact_value_to_i64(index_tav.value);
-							if (index == i) {
-								TypeAndValue tav = fv->value->tav;
-								LLVMValueRef val = lb_const_value(m, elem_type, tav.value, cc, tav.type).value;
-								values[value_index++] = val;
-								found = true;
-								break;
-							}
-						}
-					}
-
-					if (!found) {
-						values[value_index++] = LLVMConstNull(lb_type(m, elem_type));
+						TypeAndValue tav = fv->value->tav;
+						values[i] = lb_const_value(m, elem_type, tav.value, cc, tav.type).value;
+					} else {
+						values[i] = null_val;
 					}
 				}
 
@@ -1998,7 +1892,7 @@ gb_internal lbValue lb_const_value(lbModule *m, Type *type, ExactValue value, lb
 		} else {
 			return lb_const_nil(m, original_type);
 		}
-		break;
+		} break;
 	case ExactValue_Procedure:
 		GB_PANIC("handled earlier");
 		break;

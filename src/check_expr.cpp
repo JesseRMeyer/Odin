@@ -479,6 +479,9 @@ gb_internal bool find_or_generate_polymorphic_procedure(CheckerContext *old_c, E
 
 		mutex_unlock(&base_entity->Procedure.gen_procs_mutex); // @entity-mutex
 
+		// NOTE: Do NOT call type_hash_canonical_type here - final_proc_type is not
+		// fully resolved yet. Prematurely caching the hash would poison the
+		// hash-gated early-out in are_types_identical (Optimization 1).
 		for (Entity *other : gen_procs->procs) {
 			Type *pt = base_type(other->type);
 			if (are_types_identical(pt, final_proc_type)) {
@@ -519,7 +522,10 @@ gb_internal bool find_or_generate_polymorphic_procedure(CheckerContext *old_c, E
 		}
 
 		rw_mutex_shared_lock(&gen_procs->mutex); // @local-mutex
-		for (Entity *other : gen_procs->procs) {
+
+		// NOTE: This lambda unlocks the shared mutex on match and returns true.
+		// Callers MUST return immediately when it returns true.
+		auto handle_found_other = [&](Entity *other) -> bool {
 			Type *pt = base_type(other->type);
 			if (are_types_identical(pt, final_proc_type)) {
 				rw_mutex_shared_unlock(&gen_procs->mutex); // @local-mutex
@@ -545,7 +551,31 @@ gb_internal bool find_or_generate_polymorphic_procedure(CheckerContext *old_c, E
 
 				return true;
 			}
+			return false;
+		};
+
+		// Fast path: hash-indexed lookup (safe here since type is fully resolved).
+		// NOTE: type_hash_canonical_type returns 0 only for nullptr types (the
+		// hasher maps 0->1), so in practice all valid entries are in procs_by_hash.
+		u64 lookup_hash2 = type_hash_canonical_type(final_proc_type);
+		if (lookup_hash2 != 0 && gen_procs->procs_by_hash.count > 0) {
+			auto *entry = multi_map_find_first(&gen_procs->procs_by_hash, lookup_hash2);
+			while (entry != nullptr) {
+				if (handle_found_other(entry->value)) {
+					return true;
+				}
+				entry = multi_map_find_next(&gen_procs->procs_by_hash, entry);
+			}
 		}
+		// Slow path: linear scan as a defensive fallback.
+		// Redundant for entries already checked via hash, but ensures correctness
+		// if any entry was inserted with hash=0 (e.g. nullptr type edge case).
+		for (Entity *other : gen_procs->procs) {
+			if (handle_found_other(other)) {
+				return true;
+			}
+		}
+
 		rw_mutex_shared_unlock(&gen_procs->mutex); // @local-mutex
 	}
 
@@ -622,6 +652,12 @@ gb_internal bool find_or_generate_polymorphic_procedure(CheckerContext *old_c, E
 
 	rw_mutex_lock(&gen_procs->mutex); // @local-mutex
 		array_add(&gen_procs->procs, entity);
+		{
+			u64 h = type_hash_canonical_type(final_proc_type);
+			if (h != 0) {
+				multi_map_insert(&gen_procs->procs_by_hash, h, entity);
+			}
+		}
 	rw_mutex_unlock(&gen_procs->mutex); // @local-mutex
 
 	ProcInfo *proc_info = gb_alloc_item(permanent_allocator(), ProcInfo);
@@ -1323,7 +1359,7 @@ gb_internal bool polymorphic_assign_index(Type **gt_, i64 *dst_count, i64 source
 	Type *gt = *gt_;
 	
 	GB_ASSERT(gt->kind == Type_Generic);
-	Entity *e = scope_lookup(gt->Generic.scope, gt->Generic.name);
+	Entity *e = scope_lookup(gt->Generic.scope, gt->Generic.name, gt->Generic.name_hash);
 	GB_ASSERT(e != nullptr);
 	if (e->kind == Entity_TypeName) {
 		*gt_ = nullptr;
@@ -1424,7 +1460,7 @@ gb_internal bool is_polymorphic_type_assignable(CheckerContext *c, Type *poly, T
 			if (poly->Array.generic_count != nullptr) {
 				Type *gt = poly->Array.generic_count;
 				GB_ASSERT(gt->kind == Type_Generic);
-				Entity *e = scope_lookup(gt->Generic.scope, gt->Generic.name);
+				Entity *e = scope_lookup(gt->Generic.scope, gt->Generic.name, gt->Generic.name_hash);
 				GB_ASSERT(e != nullptr);
 				if (e->kind == Entity_TypeName) {
 					Type *index = source->EnumeratedArray.index;
@@ -9066,10 +9102,27 @@ gb_internal void add_constant_switch_case(CheckerContext *ctx, SeenMap *seen, Op
 }
 
 
-gb_internal void add_to_seen_map(CheckerContext *ctx, SeenMap *seen, TokenKind upper_op, Operand const &x, Operand const &lhs, Operand const &rhs) {
-	if (is_type_enum(x.type)) {
-		// TODO(bill): Fix this logic so it's fast!!!
-
+gb_internal void add_to_seen_map(CheckerContext *ctx, SeenMap *seen, RangeCache *rc, TokenKind upper_op, Operand const &x, Operand const &lhs, Operand const &rhs) {
+	if (is_type_enum(x.type) && rc) {
+		// Fast path: use RangeCache for overlap detection
+		i64 v0 = exact_value_to_i64(lhs.value);
+		i64 v1 = exact_value_to_i64(rhs.value);
+		if (upper_op != Token_LtEq) {
+			v1 -= 1;
+		}
+		if (!range_cache_add_range(rc, v0, v1)) {
+			gbString expr_str = expr_to_string(x.expr);
+			error(x.expr, "Overlapping switch case range '%s'", expr_str);
+			gb_string_free(expr_str);
+			return;
+		}
+		// Add endpoints to SeenMap for exhaustiveness checking
+		add_constant_switch_case(ctx, seen, lhs);
+		if (upper_op == Token_LtEq) {
+			add_constant_switch_case(ctx, seen, rhs);
+		}
+	} else if (is_type_enum(x.type)) {
+		// Fallback: per-value expansion when no RangeCache (e.g. compound literal context)
 		i64 v0 = exact_value_to_i64(lhs.value);
 		i64 v1 = exact_value_to_i64(rhs.value);
 		Operand v = {};
@@ -9077,13 +9130,10 @@ gb_internal void add_to_seen_map(CheckerContext *ctx, SeenMap *seen, TokenKind u
 		v.type = x.type;
 		v.expr = x.expr;
 
-		Type *bt = base_type(x.type);
-		GB_ASSERT(bt->kind == Type_Enum);
 		for (i64 vi = v0; vi <= v1; vi++) {
 			if (upper_op != Token_LtEq && vi == v1) {
 				break;
 			}
-
 			v.value = exact_value_i64(vi);
 			add_constant_switch_case(ctx, seen, v);
 		}
@@ -9094,7 +9144,16 @@ gb_internal void add_to_seen_map(CheckerContext *ctx, SeenMap *seen, TokenKind u
 		}
 	}
 }
-gb_internal void add_to_seen_map(CheckerContext *ctx, SeenMap *seen, Operand const &x) {
+gb_internal void add_to_seen_map(CheckerContext *ctx, SeenMap *seen, RangeCache *rc, Operand const &x) {
+	if (is_type_enum(x.type) && rc) {
+		i64 v = exact_value_to_i64(x.value);
+		if (!range_cache_add_index(rc, v)) {
+			gbString expr_str = expr_to_string(x.expr);
+			error(x.expr, "Duplicate case '%s' (overlaps with a previous range)", expr_str);
+			gb_string_free(expr_str);
+			return;
+		}
+	}
 	add_constant_switch_case(ctx, seen, x);
 }
 
@@ -10533,7 +10592,7 @@ gb_internal ExprKind check_compound_literal(CheckerContext *c, Operand *o, Ast *
 					if (op.kind == Token_RangeHalf) {
 						upper_op = Token_Lt;
 					}
-					add_to_seen_map(c, &seen, upper_op, x, x, y);
+					add_to_seen_map(c, &seen, nullptr, upper_op, x, x, y);
 				} else {
 					Operand op_index = {};
 					check_expr_with_type_hint(c, &op_index, fv->field, index_type);
@@ -10572,7 +10631,7 @@ gb_internal ExprKind check_compound_literal(CheckerContext *c, Operand *o, Ast *
 						is_constant = check_is_operand_compound_lit_constant(c, &operand, elem_type);
 					}
 
-					add_to_seen_map(c, &seen, op_index);
+					add_to_seen_map(c, &seen, nullptr, op_index);
 				}
 			}
 

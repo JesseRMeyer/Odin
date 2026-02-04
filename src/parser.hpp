@@ -463,6 +463,7 @@ struct AstSplitArgs {
 		Token open, close; \
 		i64 max_count; \
 		Ast *tag; \
+		i32 *field_index_map; \
 	}) \
 AST_KIND(_ExprBegin,  "",  bool) \
 	AST_KIND(BadExpr,      "bad expression",         struct { Token begin, end; }) \

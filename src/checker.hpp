@@ -414,8 +414,9 @@ struct LoadDirectoryCache {
 
 
 struct GenProcsData {
-	Array<Entity *> procs;
-	RwMutex         mutex;
+	Array<Entity *>       procs;
+	PtrMap<u64, Entity *> procs_by_hash;
+	RwMutex               mutex;
 };
 
 struct GenTypesData {
