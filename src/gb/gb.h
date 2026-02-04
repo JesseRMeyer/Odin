@@ -523,7 +523,11 @@ typedef i32 b32; // NOTE(bill): Prefer this!!!
 #endif
 
 #ifndef gb_offset_of
+#if defined(__GNUC__) || defined(__clang__)
+#define gb_offset_of(Type, element) ((isize)__builtin_offsetof(Type, element))
+#else
 #define gb_offset_of(Type, element) ((isize)&(((Type *)0)->element))
+#endif
 #endif
 
 #if defined(__cplusplus)
@@ -3440,6 +3444,7 @@ GB_COMPARE_PROC_PTR(gb_str_cmp(isize offset)) {
 
 
 void gb_sort(void *base_, isize count, isize size, gbCompareProc cmp) {
+	if (count <= 1) return;
 	u8 *i, *j;
 	u8 *base = cast(u8 *)base_;
 	u8 *limit = base + count*size;
