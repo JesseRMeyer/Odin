@@ -136,7 +136,6 @@ gb_internal void comp_init_jit_module(lbModule *m, Checker *checker) {
 	LLVMMetadataRef root_str = LLVMMDStringInContext2(m->ctx, "Odin TBAA", 9);
 	m->tbaa_root = LLVMMDNodeInContext2(m->ctx, &root_str, 1);
 	m->tbaa_kind_id = LLVMGetMDKindIDInContext(m->ctx, "tbaa", 4);
-	string_map_init(&m->tbaa_type_nodes);
 	map_init(&m->tbaa_access_tags);
 
 	m->const_dummy_builder = LLVMCreateBuilderInContext(m->ctx);
@@ -177,7 +176,6 @@ gb_internal void comp_destroy_jit_module(lbModule *m) {
 	map_destroy(&m->map_cell_info_map);
 	map_destroy(&m->exact_value_compound_literal_addr_map);
 	array_free(&m->pad_types);
-	string_map_destroy(&m->tbaa_type_nodes);
 	map_destroy(&m->tbaa_access_tags);
 }
 
