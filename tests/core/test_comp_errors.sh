@@ -180,13 +180,28 @@ bad :: proc(f: proc() -> i32) -> i32 { return 0 }
 x := #comp bad(nil)
 ' ""
 
-# --- Procedure with arguments ---
+# --- Non-constant argument ---
 
-expect_error "comp_with_args" '
+expect_error "comp_runtime_arg" '
 package test
 double :: proc(x: i32) -> i32 { return x * 2 }
-main :: proc() { x := #comp double(21); _ = x }
-' "no parameters"
+get_val :: proc() -> i32 { return 21 }
+main :: proc() { x := #comp double(get_val()); _ = x }
+' "not a compile-time constant"
+
+# --- Argument type not comp-compatible ---
+
+expect_error "comp_slice_arg" '
+package test
+sum_slice :: proc(s: []i32) -> i32 { return 0 }
+x := #comp sum_slice(nil)
+' "not allowed"
+
+expect_error "comp_pointer_arg" '
+package test
+deref :: proc(p: ^i32) -> i32 { return 0 }
+x := #comp deref(nil)
+' "not allowed"
 
 # --- Raw union struct ---
 
@@ -196,6 +211,70 @@ RU :: struct #raw_union { a: i32, b: f32 }
 bad :: proc() -> RU { return RU{} }
 x := #comp bad()
 ' "not allowed"
+
+# --- Additional type restrictions ---
+
+expect_error "uintptr_return" '
+package test
+bad :: proc() -> uintptr { return 0 }
+x := #comp bad()
+' "not allowed"
+
+expect_error "cstring_return" '
+package test
+bad :: proc() -> cstring { return nil }
+x := #comp bad()
+' "not allowed"
+
+expect_error "union_return" '
+package test
+U :: union { i32, f32 }
+bad :: proc() -> U { return U(i32(42)) }
+x := #comp bad()
+' "not allowed"
+
+expect_error "enum_int_backing" '
+package test
+E :: enum int { A, B, C }
+bad :: proc() -> E { return .A }
+x := #comp bad()
+' "not allowed"
+
+expect_error "multiple_returns" '
+package test
+bad :: proc() -> (i32, bool) { return 42, true }
+x := #comp bad()
+' ""
+
+# --- Struct field type restrictions (recursive) ---
+
+expect_error "struct_with_pointer_field" '
+package test
+S :: struct { p: ^i32, v: i32 }
+bad :: proc() -> S { return S{} }
+x := #comp bad()
+' "not allowed"
+
+expect_error "struct_with_string_field" '
+package test
+S :: struct { name: string, id: i32 }
+bad :: proc() -> S { return S{} }
+x := #comp bad()
+' "not allowed"
+
+# --- Additional parameter type restrictions ---
+
+expect_error "comp_string_param" '
+package test
+bad :: proc(s: string) -> i32 { return 0 }
+x := #comp bad("hello")
+' ""
+
+expect_error "comp_int_param" '
+package test
+bad :: proc(x: int) -> i32 { return i32(x) }
+x := #comp bad(42)
+' ""
 
 echo ""
 echo "Results: $passed passed, $failed failed"

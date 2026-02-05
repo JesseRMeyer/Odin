@@ -4257,6 +4257,10 @@ gb_internal DECL_ATTRIBUTE_PROC(type_decl_attribute) {
 
 // Forward declarations for JIT evaluator (defined in llvm_backend_comp.cpp,
 // which is part of the same translation unit but included later).
+struct CompEvalArg {
+	Type       *type;
+	ExactValue  value;
+};
 struct CompEvalResult {
 	bool         ok;
 	ExactValue   value;
@@ -4266,6 +4270,7 @@ gb_internal CompEvalResult comp_evaluate_with_timeout(
 	CheckerContext *ctx,
 	Entity         *proc_entity,
 	Type           *result_type,
+	Slice<CompEvalArg> args,
 	f64             timeout_seconds
 );
 

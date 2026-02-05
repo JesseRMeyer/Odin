@@ -137,6 +137,8 @@ struct lbModule {
 
 	struct lbGenerator *gen;
 	LLVMTargetMachineRef target_machine;
+	bool no_context_parameter; // JIT modules: procedures are contextless
+	bool no_bounds_check;      // JIT modules: runtime not available for bounds checks
 
 	lbModule *polymorphic_module;
 

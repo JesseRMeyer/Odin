@@ -529,6 +529,141 @@ compute_f32_array :: proc() -> [4]f32 {
 }
 
 // ===========================================================================
+// Procedure parameters — passing compile-time constants to #comp
+// ===========================================================================
+
+// Basic integer parameter
+double :: proc(x: i32) -> i32 {
+	return x * 2
+}
+
+// Multiple parameters
+add3 :: proc(a, b, c: i32) -> i32 {
+	return a + b + c
+}
+
+// Float parameter
+scale_f32 :: proc(x: f32, factor: f32) -> f32 {
+	return x * factor
+}
+
+// Boolean parameter
+choose :: proc(cond: bool, a, b: i32) -> i32 {
+	if cond { return a }
+	return b
+}
+
+// Struct parameter
+vec2_add :: proc(a, b: Vec2) -> Vec2 {
+	return Vec2{a.x + b.x, a.y + b.y}
+}
+
+// Array parameter
+sum_array :: proc(arr: [4]i32) -> i32 {
+	total: i32 = 0
+	for i: i32 = 0; i < 4; i += 1 {
+		total += arr[i]
+	}
+	return total
+}
+
+// Enum parameter
+is_green :: proc(c: Color) -> bool {
+	return c == .Green
+}
+
+// Mixed parameters
+weighted_sum :: proc(weights: [3]f32, values: [3]i32) -> f32 {
+	sum: f32 = 0.0
+	for i: i32 = 0; i < 3; i += 1 {
+		sum += weights[i] * f32(values[i])
+	}
+	return sum
+}
+
+// Recursive with parameter
+factorial :: proc(n: i32) -> i32 {
+	if n <= 1 { return 1 }
+	return n * factorial(n - 1)
+}
+
+// Struct with computed fields parameter
+transform_vec :: proc(v: Vec2, scale: f32, offset: f32) -> Vec2 {
+	return Vec2{v.x * scale + offset, v.y * scale + offset}
+}
+
+// Nested struct parameter
+mat_scale :: proc(m: Mat3, s: f32) -> Mat3 {
+	result: Mat3
+	for i: i32 = 0; i < 3; i += 1 {
+		for j: i32 = 0; j < 3; j += 1 {
+			result.e[i][j] = m.e[i][j] * s
+		}
+	}
+	return result
+}
+
+// Enum with backing type parameter
+flag_value :: proc(f: Flags) -> u8 {
+	return u8(f)
+}
+
+// Chained #comp — one #comp feeds another
+compute_base :: proc() -> i32 {
+	return 5
+}
+
+multiply :: proc(x: i32, factor: i32) -> i32 {
+	return x * factor
+}
+
+// ===========================================================================
+// Constant binding and package scope
+// ===========================================================================
+
+// #comp at package scope — result is Addressing_Constant, usable in :: decl
+PKG_CONST :: #comp compute_i32()
+PKG_DOUBLED :: #comp double(21)
+
+// ===========================================================================
+// Distinct types
+// ===========================================================================
+
+Meters :: distinct f32
+
+compute_meters :: proc() -> Meters {
+	return Meters(42.5)
+}
+
+add_meters :: proc(a, b: Meters) -> Meters {
+	return Meters(f32(a) + f32(b))
+}
+
+// ===========================================================================
+// Wider parameter types (exercise different ABI paths)
+// ===========================================================================
+
+double_i8  :: proc(x: i8) -> i8   { return x * 2 }
+double_i64 :: proc(x: i64) -> i64 { return x * 2 }
+double_u64 :: proc(x: u64) -> u64 { return x * 2 }
+scale_f64  :: proc(x: f64, s: f64) -> f64 { return x * s }
+add_i128   :: proc(a, b: i128) -> i128 { return a + b }
+
+// ===========================================================================
+// Mutual recursion
+// ===========================================================================
+
+is_even_comp :: proc(n: i32) -> bool {
+	if n == 0 { return true }
+	return is_odd_comp(n - 1)
+}
+
+is_odd_comp :: proc(n: i32) -> bool {
+	if n == 0 { return false }
+	return is_even_comp(n - 1)
+}
+
+// ===========================================================================
 // Main — run all tests
 // ===========================================================================
 
@@ -878,6 +1013,136 @@ main :: proc() {
 		expect("f32_array", f32_near(fa[0], 1.0) && f32_near(fa[1], 2.0) &&
 		                    f32_near(fa[2], 3.0) && f32_near(fa[3], 4.0)); passed += 1
 		fmt.println("  f32 array: OK")
+	}
+
+	// --- Procedure parameters ---
+	{
+		total += 14
+
+		// Basic integer parameter
+		d := #comp double(21)
+		expect("param_double", d == 42); passed += 1
+
+		// Multiple parameters
+		s := #comp add3(10, 20, 30)
+		expect("param_add3", s == 60); passed += 1
+
+		// Float parameters
+		sf := #comp scale_f32(2.5, 4.0)
+		expect("param_scale_f32", f32_near(sf, 10.0)); passed += 1
+
+		// Boolean parameter
+		c1 := #comp choose(true, 100, 200)
+		c2 := #comp choose(false, 100, 200)
+		expect("param_choose", c1 == 100 && c2 == 200); passed += 1
+
+		// Struct parameter
+		V1 :: Vec2{1.0, 2.0}
+		V2 :: Vec2{3.0, 4.0}
+		vs := #comp vec2_add(V1, V2)
+		expect("param_vec2_add", f32_near(vs.x, 4.0) && f32_near(vs.y, 6.0)); passed += 1
+
+		// Array parameter
+		ARR :: [4]i32{1, 2, 3, 4}
+		arr_sum := #comp sum_array(ARR)
+		expect("param_sum_array", arr_sum == 10); passed += 1
+
+		// Enum parameter
+		g := #comp is_green(.Green)
+		ng := #comp is_green(.Red)
+		expect("param_enum", g == true && ng == false); passed += 1
+
+		// Mixed array parameters
+		WEIGHTS :: [3]f32{1.0, 2.0, 3.0}
+		VALUES  :: [3]i32{10, 20, 30}
+		ws := #comp weighted_sum(WEIGHTS, VALUES)
+		// 1*10 + 2*20 + 3*30 = 10 + 40 + 90 = 140
+		expect("param_mixed", f32_near(ws, 140.0)); passed += 1
+
+		// Recursive with parameter
+		f5 := #comp factorial(5)
+		expect("param_factorial", f5 == 120); passed += 1
+
+		// Struct with multiple params
+		V3 :: Vec2{2.0, 3.0}
+		tv := #comp transform_vec(V3, 2.0, 1.0)
+		expect("param_transform", f32_near(tv.x, 5.0) && f32_near(tv.y, 7.0)); passed += 1
+
+		// Nested struct parameter
+		M :: Mat3{e = {{1.0, 2.0, 3.0}, {4.0, 5.0, 6.0}, {7.0, 8.0, 9.0}}}
+		ms := #comp mat_scale(M, 2.0)
+		expect("param_mat_scale", f32_near(ms.e[0][0], 2.0) && f32_near(ms.e[1][1], 10.0) && f32_near(ms.e[2][2], 18.0)); passed += 1
+
+		// Enum with backing type
+		fv := #comp flag_value(.C)
+		expect("param_flag", fv == 4); passed += 1
+
+		// Chained #comp
+		chained := #comp multiply(#comp compute_base(), 10)
+		expect("param_chained", chained == 50); passed += 1
+
+		// Constant expression as argument
+		N :: 7
+		expr_arg := #comp double(N + 3)
+		expect("param_const_expr", expr_arg == 20); passed += 1
+
+		fmt.println("  procedure parameters: OK")
+	}
+
+	// --- Constant binding and package scope ---
+	{
+		total += 3
+		expect("pkg_const", PKG_CONST == -100_000); passed += 1
+		expect("pkg_doubled", PKG_DOUBLED == 42); passed += 1
+
+		// Multiple #comp in a single expression
+		multi := #comp double(10) + #comp double(20)
+		expect("multi_comp", multi == 60); passed += 1
+		fmt.println("  constant binding: OK")
+	}
+
+	// --- Distinct types ---
+	{
+		total += 2
+		m := #comp compute_meters()
+		expect("distinct_return", f32_near(f32(m), 42.5)); passed += 1
+
+		M1 :: Meters(10.0)
+		M2 :: Meters(20.0)
+		ms := #comp add_meters(M1, M2)
+		expect("distinct_param", f32_near(f32(ms), 30.0)); passed += 1
+		fmt.println("  distinct types: OK")
+	}
+
+	// --- Wider parameter types ---
+	{
+		total += 5
+		vi8 := #comp double_i8(21)
+		expect("param_i8", vi8 == 42); passed += 1
+
+		vi64 := #comp double_i64(1_000_000_000)
+		expect("param_i64", vi64 == 2_000_000_000); passed += 1
+
+		vu64 := #comp double_u64(9_000_000_000)
+		expect("param_u64", vu64 == 18_000_000_000); passed += 1
+
+		vf64 := #comp scale_f64(2.5, 4.0)
+		expect("param_f64", f64_near(vf64, 10.0)); passed += 1
+
+		v128 := #comp add_i128(i128(1_000_000_000_000), i128(2_000_000_000_000))
+		expect("param_i128", v128 == i128(3_000_000_000_000)); passed += 1
+		fmt.println("  wider params: OK")
+	}
+
+	// --- Mutual recursion ---
+	{
+		total += 2
+		ve := #comp is_even_comp(10)
+		expect("mutual_even", ve == true); passed += 1
+
+		vo := #comp is_odd_comp(7)
+		expect("mutual_odd", vo == true); passed += 1
+		fmt.println("  mutual recursion: OK")
 	}
 
 	// --- Summary ---

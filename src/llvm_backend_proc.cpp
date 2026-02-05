@@ -588,7 +588,7 @@ gb_internal void lb_begin_procedure_body(lbProcedure *p) {
 	GB_ASSERT(p->type != nullptr);
 
 	lb_ensure_abi_function_type(p->module, p);
-	if (p->type->Proc.calling_convention == ProcCC_Odin) {
+	if (p->abi_function_type->calling_convention == ProcCC_Odin) {
 		lb_push_context_onto_stack_from_implicit_parameter(p);
 	}
 	{
@@ -1105,8 +1105,10 @@ gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> c
 	GB_ASSERT(pt->kind == Type_Proc);
 	Type *results = pt->Proc.results;
 
+	lbFunctionType *ft = lb_get_function_type(m, pt);
+
 	lbAddr context_ptr = {};
-	if (pt->Proc.calling_convention == ProcCC_Odin) {
+	if (ft->calling_convention == ProcCC_Odin) {
 		context_ptr = lb_find_or_generate_context_ptr(p);
 	}
 
@@ -1132,7 +1134,6 @@ gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> c
 
 		bool is_odin_cc = is_calling_convention_odin(pt->Proc.calling_convention);
 
-		lbFunctionType *ft = lb_get_function_type(m, pt);
 		bool return_by_pointer = ft->ret.kind == lbArg_Indirect;
 		bool split_returns = ft->multiple_return_original_type != nullptr;
 

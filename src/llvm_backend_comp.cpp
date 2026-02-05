@@ -385,7 +385,8 @@ static LLVMErrorRef comp_definition_generator(
 gb_internal CompEvalResult comp_evaluate(
 	CheckerContext *ctx,
 	Entity         *proc_entity,
-	Type           *result_type
+	Type           *result_type,
+	Slice<CompEvalArg> args
 ) {
 	CompEvalResult result = {};
 	result.ok = false;
@@ -403,6 +404,8 @@ gb_internal CompEvalResult comp_evaluate(
 	lbModule &comp_module = comp_gen.default_module;
 	comp_init_jit_module(&comp_module, ctx->checker);
 	comp_module.gen = &comp_gen;
+	comp_module.no_context_parameter = true;
+	comp_module.no_bounds_check = true;
 
 	// Collect all procedures in the call graph
 	auto callees = PtrSet<Entity *>{};
@@ -438,42 +441,51 @@ gb_internal CompEvalResult comp_evaluate(
 	}
 
 	// Generate procedure bodies.
-	// Disable bounds checking since runtime error procedures aren't available
-	// in the JIT module. Our longjmp trap stubs catch actual errors at execution.
-	// Serialize access to build_context.no_bounds_check to prevent races with
-	// concurrent procedure body checking in the thread pool.
-	{
-		static std::mutex comp_codegen_mutex;
-		std::lock_guard<std::mutex> lock(comp_codegen_mutex);
+	// Bounds checks are left enabled — if a bounds check fires at runtime,
+	// the unresolved runtime function resolves to comp_stub_generic_trap
+	// via the catch-all symbol resolver, which longjmps back with an error.
+	// This is safer than silently disabling bounds checks and allows
+	// concurrent JIT compilations without mutex contention.
+	FOR_PTR_SET(e, callees) {
+		if (e->kind != Entity_Procedure) continue;
+		if (e->Procedure.is_foreign) continue; // Skip foreign procs — will be resolved by stubs
 
-		bool saved_no_bounds_check = build_context.no_bounds_check;
-		build_context.no_bounds_check = true;
-
-		FOR_PTR_SET(e, callees) {
-			if (e->kind != Entity_Procedure) continue;
-			if (e->Procedure.is_foreign) continue; // Skip foreign procs — will be resolved by stubs
-
-			lbProcedure *p = nullptr;
-			String name = lb_get_entity_name(&comp_module, e);
-			lbProcedure **found = string_map_get(&comp_module.procedures, name);
-			if (found != nullptr) {
-				p = *found;
-			}
-			if (p != nullptr) {
-				lb_generate_procedure(&comp_module, p);
-			}
+		lbProcedure *p = nullptr;
+		String name = lb_get_entity_name(&comp_module, e);
+		lbProcedure **found = string_map_get(&comp_module.procedures, name);
+		if (found != nullptr) {
+			p = *found;
 		}
-
-		build_context.no_bounds_check = saved_no_bounds_check;
+		if (p != nullptr) {
+			lb_generate_procedure(&comp_module, p);
+		}
 	}
+	// Create global constants for each argument.
+	// We store arguments as module-level constants and load them in the wrapper.
+	auto arg_globals = gb_alloc_array(temporary_allocator(), LLVMValueRef, args.count);
+	auto arg_llvm_types = gb_alloc_array(temporary_allocator(), LLVMTypeRef, args.count);
+	for (isize i = 0; i < args.count; i++) {
+		lbValue const_val = lb_const_value(&comp_module, args[i].type, args[i].value);
+		arg_llvm_types[i] = LLVMTypeOf(const_val.value);
+
+		// Create a global constant for this argument
+		char name_buf[64];
+		gb_snprintf(name_buf, sizeof(name_buf), "__comp_arg_%lld", cast(long long)i);
+		LLVMValueRef global = LLVMAddGlobal(comp_module.mod, arg_llvm_types[i], name_buf);
+		LLVMSetInitializer(global, const_val.value);
+		LLVMSetGlobalConstant(global, true);
+		LLVMSetLinkage(global, LLVMPrivateLinkage);
+		arg_globals[i] = global;
+	}
+
 	// Create a wrapper function that calls the target and stores the result
 	// to a buffer, avoiding ABI issues with struct/float returns.
 	// Wrapper signature: void __comp_wrapper(i8* result_buf)
 	char const *wrapper_name = "__comp_eval_wrapper";
 	{
 		LLVMTypeRef target_fn_type = LLVMGlobalGetValueType(entry_proc->value);
-		bool uses_sret = (entry_proc->abi_function_type != nullptr &&
-		                   entry_proc->abi_function_type->ret.kind == lbArg_Indirect);
+		lbFunctionType *abi_ft = entry_proc->abi_function_type;
+		bool uses_sret = (abi_ft != nullptr && abi_ft->ret.kind == lbArg_Indirect);
 
 		LLVMTypeRef ptr_type = LLVMPointerTypeInContext(comp_module.ctx, 0);
 		LLVMTypeRef void_type = LLVMVoidTypeInContext(comp_module.ctx);
@@ -488,14 +500,53 @@ gb_internal CompEvalResult comp_evaluate(
 
 		LLVMValueRef buf_ptr = LLVMGetParam(wrapper_fn, 0);
 
+		// Build call arguments with ABI transformations (+1 for potential sret)
+		auto call_args = gb_alloc_array(temporary_allocator(), LLVMValueRef, args.count + 1);
+		isize call_arg_count = 0;
+
 		if (uses_sret) {
-			// The target function takes an sret pointer as first arg and returns void.
-			// Pass our buffer pointer as the sret argument.
-			LLVMValueRef args[] = { buf_ptr };
-			LLVMBuildCall2(builder, target_fn_type, entry_proc->value, args, 1, "");
+			call_args[call_arg_count++] = buf_ptr;
+		}
+
+		for (isize i = 0; i < args.count; i++) {
+			lbArgType *arg_abi = nullptr;
+			if (abi_ft != nullptr && i < abi_ft->args.count) {
+				arg_abi = &abi_ft->args[i];
+			}
+
+			if (arg_abi != nullptr && arg_abi->kind == lbArg_Ignore) {
+				continue;
+			}
+
+			char load_name[64];
+			gb_snprintf(load_name, sizeof(load_name), "arg%lld", cast(long long)i);
+
+			if (arg_abi != nullptr && arg_abi->kind == lbArg_Indirect) {
+				call_args[call_arg_count++] = arg_globals[i];
+			} else if (arg_abi != nullptr && arg_abi->kind == lbArg_Direct) {
+				LLVMValueRef loaded = LLVMBuildLoad2(builder, arg_llvm_types[i], arg_globals[i], load_name);
+
+				LLVMTypeRef abi_type = arg_abi->cast_type ? arg_abi->cast_type : arg_abi->type;
+				if (abi_type != nullptr && abi_type != arg_llvm_types[i]) {
+					// Transmute to the ABI type via alloca+store+load
+					LLVMValueRef tmp = LLVMBuildAlloca(builder, arg_llvm_types[i], "tmp");
+					LLVMBuildStore(builder, loaded, tmp);
+					loaded = LLVMBuildLoad2(builder, abi_type, tmp, load_name);
+				}
+				call_args[call_arg_count++] = loaded;
+			} else {
+				LLVMValueRef loaded = LLVMBuildLoad2(builder, arg_llvm_types[i], arg_globals[i], load_name);
+				call_args[call_arg_count++] = loaded;
+			}
+		}
+
+		if (uses_sret) {
+			// Call with sret — result written directly to buffer
+			LLVMBuildCall2(builder, target_fn_type, entry_proc->value, call_args, cast(unsigned)call_arg_count, "");
 		} else {
-			// Direct return — call and store the result.
-			LLVMValueRef call_result = LLVMBuildCall2(builder, target_fn_type, entry_proc->value, nullptr, 0, "");
+			// Direct return — call and store the result
+			LLVMValueRef call_result = LLVMBuildCall2(builder, target_fn_type, entry_proc->value,
+				call_args, cast(unsigned)call_arg_count, "call");
 			LLVMBuildStore(builder, call_result, buf_ptr);
 		}
 
@@ -667,13 +718,20 @@ gb_internal CompEvalResult comp_evaluate_with_timeout(
 	CheckerContext *ctx,
 	Entity         *proc_entity,
 	Type           *result_type,
+	Slice<CompEvalArg> args,
 	f64             timeout_seconds
 ) {
+	// Copy args to permanent storage so the worker thread isn't holding
+	// a temporary_allocator pointer that could dangle on timeout+detach.
+	auto perm_args = gb_alloc_array(permanent_allocator(), CompEvalArg, args.count);
+	gb_memmove(perm_args, args.data, args.count * gb_size_of(CompEvalArg));
+	Slice<CompEvalArg> stable_args = {perm_args, args.count};
+
 	auto shared = new CompEvalSharedState{};
 	shared->finished = false;
 
-	std::thread worker([shared, ctx, proc_entity, result_type]() {
-		CompEvalResult r = comp_evaluate(ctx, proc_entity, result_type);
+	std::thread worker([shared, ctx, proc_entity, result_type, stable_args]() {
+		CompEvalResult r = comp_evaluate(ctx, proc_entity, result_type, stable_args);
 		{
 			std::lock_guard<std::mutex> lock(shared->mtx);
 			shared->result = r;
