@@ -4075,6 +4075,16 @@ gb_internal lbValue lb_build_expr_internal(lbProcedure *p, Ast *expr) {
 					TypeAndValue tav = type_and_value_of_expr(e);
 					if (tav.mode == Addressing_Constant) return true;
 					if (e->kind == Ast_Ident) return true;
+					if (e->kind == Ast_SelectorExpr) {
+						Ast *operand = unparen_expr(e->SelectorExpr.expr);
+						if (operand && operand->kind == Ast_Ident) return true;
+					}
+					if (e->kind == Ast_UnaryExpr && e->UnaryExpr.op.kind != Token_And) {
+						Ast *operand = unparen_expr(e->UnaryExpr.expr);
+						TypeAndValue otav = type_and_value_of_expr(operand);
+						if (otav.mode == Addressing_Constant) return true;
+						if (operand->kind == Ast_Ident) return true;
+					}
 					return false;
 				};
 				if (is_trivial(te->x) && is_trivial(te->y)) {

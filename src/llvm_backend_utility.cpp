@@ -485,6 +485,25 @@ gb_internal lbValue lb_emit_or_else(lbProcedure *p, Ast *arg, Ast *else_expr, Ty
 		lb_start_block(p, then);
 		return lb_emit_conv(p, lhs, type);
 	} else {
+		// Select fast path for scalar types with trivial else expressions
+		Type *bt = base_type(type);
+		bool is_scalar = is_type_integer(bt) || is_type_float(bt) || is_type_boolean(bt) ||
+		                 is_type_pointer(bt) || is_type_enum(bt) || is_type_rune(bt) ||
+		                 is_type_typeid(bt);
+		if (is_scalar) {
+			Ast *else_unparen = unparen_expr(else_expr);
+			TypeAndValue else_tav = type_and_value_of_expr(else_unparen);
+			bool else_trivial = (else_tav.mode == Addressing_Constant) ||
+			                    (else_unparen->kind == Ast_Ident);
+			if (else_trivial) {
+				lbValue has_value = lb_emit_try_has_value(p, rhs);
+				lbValue then_val = lb_emit_conv(p, lhs, type);
+				lbValue else_val = lb_emit_conv(p, lb_build_expr(p, else_expr), type);
+				return lb_emit_select(p, has_value, then_val, else_val);
+			}
+		}
+
+		// General path: branch + phi
 		LLVMValueRef incoming_values[2] = {};
 		LLVMBasicBlockRef incoming_blocks[2] = {};
 
