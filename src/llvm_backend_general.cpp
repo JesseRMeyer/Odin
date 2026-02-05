@@ -722,12 +722,24 @@ gb_internal void lb_emit_bounds_check(lbProcedure *p, Token token, lbValue index
 	index = lb_emit_conv(p, index, t_int);
 	len = lb_emit_conv(p, len, t_int);
 
+	// Inline the bounds comparison so the happy path (in-bounds) avoids
+	// a function call. Only the cold error path calls the runtime.
+	lbBlock *in_bounds = lb_create_block(p, "bounds.ok");
+	lbBlock *out_of_bounds = lb_create_block(p, "bounds.fail");
+
+	LLVMValueRef cmp = LLVMBuildICmp(p->builder, LLVMIntULT,
+	                                  index.value, len.value, "");
+	lb_emit_if(p, {cmp, t_llvm_bool}, in_bounds, out_of_bounds);
+
+	lb_start_block(p, out_of_bounds);
 	auto args = array_make<lbValue>(temporary_allocator(), 5);
 	lb_set_file_line_col(p, args, token.pos);
 	args[3] = index;
 	args[4] = len;
-
 	lb_emit_runtime_call(p, "bounds_check_error", args);
+	LLVMBuildUnreachable(p->builder);
+
+	lb_start_block(p, in_bounds);
 }
 
 gb_internal void lb_emit_matrix_bounds_check(lbProcedure *p, Token token, lbValue row_index, lbValue column_index, lbValue row_count, lbValue column_count) {
@@ -1288,11 +1300,15 @@ gb_internal void lb_emit_store(lbProcedure *p, lbValue ptr, lbValue value) {
 			LLVMValueRef dst_ptr = ptr.value;
 			LLVMValueRef src_ptr_original = LLVMGetOperand(value.value, 0);
 			LLVMValueRef src_ptr = LLVMBuildPointerCast(p->builder, src_ptr_original, LLVMTypeOf(dst_ptr), "");
+			LLVMValueRef size = LLVMConstInt(LLVMInt64TypeInContext(p->module->ctx), lb_sizeof(LLVMTypeOf(value.value)), false);
+			unsigned dst_align = lb_try_get_alignment(dst_ptr, 1);
+			unsigned src_align = lb_try_get_alignment(src_ptr_original, 1);
 
-			LLVMBuildMemMove(p->builder,
-			                 dst_ptr, lb_try_get_alignment(dst_ptr, 1),
-			                 src_ptr, lb_try_get_alignment(src_ptr_original, 1),
-			                 LLVMConstInt(LLVMInt64TypeInContext(p->module->ctx), lb_sizeof(LLVMTypeOf(value.value)), false));
+			if (LLVMIsAAllocaInst(src_ptr_original)) {
+				LLVMBuildMemCpy(p->builder, dst_ptr, dst_align, src_ptr, src_align, size);
+			} else {
+				LLVMBuildMemMove(p->builder, dst_ptr, dst_align, src_ptr, src_align, size);
+			}
 			return;
 		} else if (LLVMIsConstant(value.value)) {
 			lbAddr addr = lb_add_global_generated_from_procedure(p, value.type, value);
@@ -2855,7 +2871,9 @@ gb_internal void lb_emit_if(lbProcedure *p, lbValue cond, lbBlock *true_block, l
 	lb_add_edge(b, false_block);
 
 	LLVMValueRef cv = cond.value;
-	cv = LLVMBuildTruncOrBitCast(p->builder, cv, lb_type(p->module, t_llvm_bool), "");
+	if (LLVMTypeOf(cv) != lb_type(p->module, t_llvm_bool)) {
+		cv = LLVMBuildTruncOrBitCast(p->builder, cv, lb_type(p->module, t_llvm_bool), "");
+	}
 	LLVMBuildCondBr(p->builder, cv, true_block->block, false_block->block);
 }
 
@@ -2922,6 +2940,33 @@ gb_internal LLVMValueRef OdinLLVMBuildTransmute(lbProcedure *p, LLVMValueRef val
 			return LLVMBuildPtrToInt(p->builder, val, dst_type, "");
 		} else if (src_kind == LLVMIntegerTypeKind && dst_kind == LLVMPointerTypeKind) {
 			return LLVMBuildIntToPtr(p->builder, val, dst_type, "");
+		}
+	}
+
+	// struct-to-struct: per-field transmute when field counts and sizes match
+	if (src_kind == LLVMStructTypeKind && dst_kind == LLVMStructTypeKind) {
+		unsigned src_count = LLVMCountStructElementTypes(src_type);
+		unsigned dst_count = LLVMCountStructElementTypes(dst_type);
+		if (src_count == dst_count && src_count > 0 && src_size == dst_size) {
+			bool compatible = true;
+			for (unsigned i = 0; i < src_count; i++) {
+				LLVMTypeRef sf = LLVMStructGetTypeAtIndex(src_type, i);
+				LLVMTypeRef df = LLVMStructGetTypeAtIndex(dst_type, i);
+				if (lb_sizeof(sf) != lb_sizeof(df)) {
+					compatible = false;
+					break;
+				}
+			}
+			if (compatible) {
+				LLVMValueRef result = LLVMGetPoison(dst_type);
+				for (unsigned i = 0; i < src_count; i++) {
+					LLVMTypeRef df = LLVMStructGetTypeAtIndex(dst_type, i);
+					LLVMValueRef field = LLVMBuildExtractValue(p->builder, val, i, "");
+					field = OdinLLVMBuildTransmute(p, field, df);
+					result = LLVMBuildInsertValue(p->builder, result, field, i, "");
+				}
+				return result;
+			}
 		}
 	}
 

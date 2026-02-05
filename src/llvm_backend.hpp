@@ -475,6 +475,8 @@ gb_internal lbValue lb_emit_epi(lbModule *m, lbValue const &value, isize index);
 gb_internal lbValue lb_emit_array_epi(lbModule *m, lbValue s, isize index);
 gb_internal lbValue lb_emit_struct_ep(lbProcedure *p, lbValue s, i32 index);
 gb_internal lbValue lb_emit_struct_ev(lbProcedure *p, lbValue s, i32 index);
+gb_internal lbValue lb_emit_struct_iv(lbProcedure *p, lbValue agg, lbValue field, i32 index);
+gb_internal lbValue lb_build_struct_value(lbProcedure *p, Type *type, lbValue *fields, isize count);
 gb_internal lbValue lb_emit_tuple_ev(lbProcedure *p, lbValue value, i32 index);
 gb_internal lbValue lb_emit_array_epi(lbProcedure *p, lbValue value, isize index);
 gb_internal lbValue lb_emit_array_ep(lbProcedure *p, lbValue s, lbValue index);
@@ -492,7 +494,7 @@ gb_internal void lb_emit_defer_stmts(lbProcedure *p, lbDeferExitKind kind, lbBlo
 gb_internal void lb_emit_defer_stmts(lbProcedure *p, lbDeferExitKind kind, lbBlock *block, Ast *node);
 gb_internal lbValue lb_emit_transmute(lbProcedure *p, lbValue value, Type *t);
 gb_internal lbValue lb_emit_comp(lbProcedure *p, TokenKind op_kind, lbValue left, lbValue right);
-gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> const &args, ProcInlining inlining = ProcInlining_none, ProcTailing tailing = ProcTailing_none);
+gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> const &args, ProcInlining inlining = ProcInlining_none, ProcTailing tailing = ProcTailing_none, lbValue *sret_dest = nullptr);
 gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t);
 gb_internal lbValue lb_emit_comp_against_nil(lbProcedure *p, TokenKind op_kind, lbValue x);
 
@@ -500,11 +502,11 @@ gb_internal void lb_emit_jump(lbProcedure *p, lbBlock *target_block);
 gb_internal void lb_emit_if(lbProcedure *p, lbValue cond, lbBlock *true_block, lbBlock *false_block);
 gb_internal void lb_start_block(lbProcedure *p, lbBlock *b);
 
-gb_internal lbValue lb_build_call_expr(lbProcedure *p, Ast *expr);
+gb_internal lbValue lb_build_call_expr(lbProcedure *p, Ast *expr, lbValue *sret_dest = nullptr);
 gb_internal lbProcedure *lb_create_dummy_procedure(lbModule *m, String link_name, Type *type);
 gb_internal void lb_begin_procedure_body(lbProcedure *p);
 gb_internal void lb_end_procedure_body(lbProcedure *p);
-gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> const &args, ProcInlining inlining);
+gb_internal lbValue lb_emit_call(lbProcedure *p, lbValue value, Array<lbValue> const &args, ProcInlining inlining, ProcTailing tailing, lbValue *sret_dest);
 
 gb_internal lbAddr lb_find_or_generate_context_ptr(lbProcedure *p);
 gb_internal lbContextData *lb_push_context_onto_stack(lbProcedure *p, lbAddr ctx);
@@ -548,6 +550,8 @@ gb_internal lbValue lb_emit_select(lbProcedure *p, lbValue cond, lbValue x, lbVa
 gb_internal lbValue lb_emit_mul_add(lbProcedure *p, lbValue a, lbValue b, lbValue c, Type *t);
 
 gb_internal void lb_fill_slice(lbProcedure *p, lbAddr const &slice, lbValue base_elem, lbValue len);
+gb_internal lbValue lb_make_slice_value(lbProcedure *p, Type *slice_type, lbValue elem, lbValue len);
+gb_internal lbValue lb_make_string_value(lbProcedure *p, Type *string_type, lbValue elem, lbValue len);
 
 gb_internal lbValue lb_type_info(lbProcedure *p, Type *type);
 
@@ -626,7 +630,7 @@ gb_internal LLVMValueRef lb_mem_zero_ptr_internal(lbProcedure *p, LLVMValueRef p
 gb_internal LLVMValueRef lb_mem_zero_ptr_internal(lbProcedure *p, LLVMValueRef ptr, usize len, unsigned alignment, bool is_volatile);
 
 gb_internal gb_inline i64 lb_max_zero_init_size(void) {
-	return cast(i64)(8);
+	return cast(i64)(64);
 }
 
 gb_internal LLVMTypeRef OdinLLVMGetArrayElementType(LLVMTypeRef type);
