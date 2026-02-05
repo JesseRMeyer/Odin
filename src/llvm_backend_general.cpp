@@ -713,12 +713,24 @@ gb_internal void lb_emit_bounds_check(lbProcedure *p, Token token, lbValue index
 	index = lb_emit_conv(p, index, t_int);
 	len = lb_emit_conv(p, len, t_int);
 
+	// Inline the bounds comparison so the happy path (in-bounds) avoids
+	// a function call. Only the cold error path calls the runtime.
+	lbBlock *in_bounds = lb_create_block(p, "bounds.ok");
+	lbBlock *out_of_bounds = lb_create_block(p, "bounds.fail");
+
+	LLVMValueRef cmp = LLVMBuildICmp(p->builder, LLVMIntULT,
+	                                  index.value, len.value, "");
+	lb_emit_if(p, {cmp, t_llvm_bool}, in_bounds, out_of_bounds);
+
+	lb_start_block(p, out_of_bounds);
 	auto args = array_make<lbValue>(temporary_allocator(), 5);
 	lb_set_file_line_col(p, args, token.pos);
 	args[3] = index;
 	args[4] = len;
-
 	lb_emit_runtime_call(p, "bounds_check_error", args);
+	LLVMBuildUnreachable(p->builder);
+
+	lb_start_block(p, in_bounds);
 }
 
 gb_internal void lb_emit_matrix_bounds_check(lbProcedure *p, Token token, lbValue row_index, lbValue column_index, lbValue row_count, lbValue column_count) {
@@ -2704,7 +2716,9 @@ gb_internal void lb_emit_if(lbProcedure *p, lbValue cond, lbBlock *true_block, l
 	lb_add_edge(b, false_block);
 
 	LLVMValueRef cv = cond.value;
-	cv = LLVMBuildTruncOrBitCast(p->builder, cv, lb_type(p->module, t_llvm_bool), "");
+	if (LLVMTypeOf(cv) != lb_type(p->module, t_llvm_bool)) {
+		cv = LLVMBuildTruncOrBitCast(p->builder, cv, lb_type(p->module, t_llvm_bool), "");
+	}
 	LLVMBuildCondBr(p->builder, cv, true_block->block, false_block->block);
 }
 

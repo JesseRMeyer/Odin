@@ -2035,6 +2035,17 @@ gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t) {
 
 	// bool <-> llvm bool
 	if (is_type_boolean(src) && dst == t_llvm_bool) {
+		// Check if value is a zext from i1 — if so, use the original i1
+		// This avoids the i1→i8→i1 round-trip that occurs on every branch
+		if (LLVMIsAZExtInst(value.value)) {
+			LLVMValueRef operand = LLVMGetOperand(value.value, 0);
+			if (LLVMTypeOf(operand) == LLVMInt1TypeInContext(m->ctx)) {
+				lbValue res = {};
+				res.value = operand;
+				res.type = t;
+				return res;
+			}
+		}
 		lbValue res = {};
 		res.value = LLVMBuildICmp(p->builder, LLVMIntNE, value.value, LLVMConstNull(lb_type(m, src)), "");
 		res.type = t;

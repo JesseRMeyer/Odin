@@ -787,14 +787,12 @@ gb_internal void lb_build_range_interval(lbProcedure *p, AstBinaryExpr *node,
 	}
 	lb_addr_store(p, value, lower);
 
-	lbAddr index;
+	lbAddr index = {};
 	if (val1_type != nullptr) {
 		Entity *e = entity_of_node(val1);
 		index = lb_add_local(p, val1_type, e, false);
-	} else {
-		index = lb_add_local_generated(p, t_int, false);
+		lb_addr_store(p, index, lb_const_int(m, t_int, 0));
 	}
-	lb_addr_store(p, index, lb_const_int(m, t_int, 0));
 
 	lbBlock *loop = lb_create_block(p, "for.interval.loop");
 	lbBlock *body = lb_create_block(p, "for.interval.body");
@@ -822,9 +820,11 @@ gb_internal void lb_build_range_interval(lbProcedure *p, AstBinaryExpr *node,
 	lb_start_block(p, body);
 
 	lbValue val = lb_addr_load(p, value);
-	lbValue idx = lb_addr_load(p, index);
 	if (val0_type) lb_store_range_stmt_val(p, val0, val);
-	if (val1_type) lb_store_range_stmt_val(p, val1, idx);
+	if (val1_type) {
+		lbValue idx = lb_addr_load(p, index);
+		lb_store_range_stmt_val(p, val1, idx);
+	}
 
 	{
 		// NOTE: this check block will most likely be optimized out, and is here
@@ -859,7 +859,9 @@ gb_internal void lb_build_range_interval(lbProcedure *p, AstBinaryExpr *node,
 
 		lb_start_block(p, post);
 		lb_emit_increment(p, value.addr);
-		lb_emit_increment(p, index.addr);
+		if (val1_type) {
+			lb_emit_increment(p, index.addr);
+		}
 		lb_emit_jump(p, loop);
 	}
 
