@@ -2856,7 +2856,6 @@ gb_internal void lb_build_assign_stmt_array(lbProcedure *p, TokenKind op, lbAddr
 gb_internal void lb_build_assign_stmt(lbProcedure *p, AstAssignStmt *as) {
 	if (as->op.kind == Token_Eq) {
 		// RVO: for single assignments of `x = call()`, forward x's address as sret
-		// RVO: for single assignments of `x = call()`, forward x's address as sret
 		if (as->lhs.count == 1 && as->rhs.count == 1 && !is_blank_ident(as->lhs[0])) {
 			Ast *rhs_expr = unparen_expr(as->rhs[0]);
 			if (rhs_expr->kind == Ast_CallExpr) {

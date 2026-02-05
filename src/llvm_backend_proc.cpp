@@ -1444,14 +1444,15 @@ gb_internal lbValue lb_build_builtin_simd_proc(lbProcedure *p, Ast *expr, TypeAn
 		return res;
 	case BuiltinProc_simd_abs:
 		if (is_float) {
-			LLVMValueRef pos = arg0.value;
-			LLVMValueRef neg = LLVMBuildFNeg(p->builder, pos, "");
-			LLVMValueRef cond = LLVMBuildFCmp(p->builder, LLVMRealOGT, pos, neg, "");
-			res.value = LLVMBuildSelect(p->builder, cond, pos, neg, "");
+			LLVMValueRef args[1] = {arg0.value};
+			LLVMTypeRef types[1] = {lb_type(p->module, res.type)};
+			res.value = lb_call_intrinsic(p, "llvm.fabs", args, gb_count_of(args), types, gb_count_of(types));
+		} else if (!is_signed) {
+			res.value = arg0.value;
 		} else {
 			LLVMValueRef pos = arg0.value;
 			LLVMValueRef neg = LLVMBuildNeg(p->builder, pos, "");
-			LLVMValueRef cond = LLVMBuildICmp(p->builder, is_signed ? LLVMIntSGT : LLVMIntUGT, pos, neg, "");
+			LLVMValueRef cond = LLVMBuildICmp(p->builder, LLVMIntSGT, pos, neg, "");
 			res.value = LLVMBuildSelect(p->builder, cond, pos, neg, "");
 		}
 		return res;

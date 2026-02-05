@@ -4937,7 +4937,7 @@ gb_internal lbValue lb_build_slice_expr_value(lbProcedure *p, Ast *expr) {
 
 			lbValue elem = lb_emit_ptr_offset(p, lb_string_elem(p, base), low);
 			lbValue new_len = (se->low == nullptr)
-				? high
+				? lb_emit_conv(p, high, t_int)
 				: lb_emit_arith(p, Token_Sub, high, low, t_int);
 
 			return lb_make_string_value(p, t_string16, elem, new_len);
@@ -5092,7 +5092,7 @@ gb_internal lbAddr lb_build_addr_slice_expr(lbProcedure *p, Ast *expr) {
 
 			lbValue elem    = lb_emit_ptr_offset(p, lb_string_elem(p, base), low);
 			lbValue new_len = (se->low == nullptr)
-				? high
+				? lb_emit_conv(p, high, t_int)
 				: lb_emit_arith(p, Token_Sub, high, low, t_int);
 
 			lbAddr str = lb_add_local_generated(p, t_string16, false);
