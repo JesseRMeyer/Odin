@@ -504,8 +504,9 @@ gb_internal String cg_set_nested_type_name_ir_mangled_name(Entity *e, cgProcedur
 
 	if (p == nullptr) {
 		Entity *proc = nullptr;
-		if (e->parent_proc_decl != nullptr) {
-			proc = e->parent_proc_decl->entity;
+		DeclInfo *ppd = e->parent_proc_decl.load(std::memory_order_relaxed);
+		if (ppd != nullptr) {
+			proc = ppd->entity;
 		} else {
 			Scope *scope = e->scope;
 			while (scope != nullptr && (scope->flags & ScopeFlag_Proc) == 0) {
@@ -516,8 +517,9 @@ gb_internal String cg_set_nested_type_name_ir_mangled_name(Entity *e, cgProcedur
 			proc = scope->procedure_entity;
 		}
 		GB_ASSERT(proc->kind == Entity_Procedure);
-		if (proc->cg_procedure != nullptr) {
-			p = proc->cg_procedure;
+		cgProcedure *cg_proc = cast(cgProcedure *)proc->code_gen_procedure.load(std::memory_order_relaxed);
+		if (cg_proc != nullptr) {
+			p = cg_proc;
 		}
 	}
 

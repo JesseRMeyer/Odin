@@ -170,7 +170,7 @@ struct Entity {
 	Type *      type;
 	std::atomic<Ast *> identifier; // Can be nullptr
 	DeclInfo *  decl_info;
-	DeclInfo *  parent_proc_decl; // nullptr if in file/global scope
+	std::atomic<DeclInfo *> parent_proc_decl; // nullptr if in file/global scope
 	AstFile *   file;
 	AstPackage *pkg;
 
@@ -180,14 +180,10 @@ struct Entity {
 
 	Entity *    aliased_of;
 
-	union {
-		struct lbModule *code_gen_module;
-		struct cgModule *cg_module;
-	};
-	union {
-		struct lbProcedure *code_gen_procedure;
-		struct cgProcedure *cg_procedure;
-	};
+	// Backend codegen pointers (mutually exclusive - only one backend active).
+	// Using void* with std::atomic since both backends share the same slots.
+	std::atomic<void *> code_gen_module;
+	std::atomic<void *> code_gen_procedure;
 
 	u64         order_in_src;
 	String      deprecated_message;
@@ -370,7 +366,7 @@ gb_internal Entity *alloc_entity_using_variable(Entity *parent, Token token, Typ
 	token.pos = parent->token.pos;
 	Entity *entity = alloc_entity(Entity_Variable, parent->scope, token, type);
 	entity->using_parent = parent;
-	entity->parent_proc_decl = parent->parent_proc_decl;
+	entity->parent_proc_decl.store(parent->parent_proc_decl.load(std::memory_order_relaxed), std::memory_order_relaxed);
 	entity->using_expr = using_expr;
 	entity->flags |= EntityFlag_Using;
 	entity->flags |= EntityFlag_Used;

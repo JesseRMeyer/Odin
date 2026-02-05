@@ -102,8 +102,8 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 	lbProcedure *p = gb_alloc_item(permanent_allocator(), lbProcedure);
 
 	p->module = m;
-	entity->code_gen_module = m;
-	entity->code_gen_procedure = p;
+	entity->code_gen_module.store(m, std::memory_order_relaxed);
+	entity->code_gen_procedure.store(p, std::memory_order_relaxed);
 	p->entity = entity;
 	p->name = link_name;
 
@@ -714,7 +714,7 @@ gb_internal void lb_begin_procedure_body(lbProcedure *p) {
 
 					lbAddr res = {};
 					if (p->entity && p->entity->decl_info &&
-					    p->entity->decl_info->defer_use_checked &&
+					    p->entity->decl_info->defer_use_checked.load(std::memory_order_relaxed) &&
 					    p->entity->decl_info->defer_used == 0) {
 
 						// NOTE(bill): this is a bodge to get around the issue of the problem BELOW
@@ -869,7 +869,7 @@ gb_internal void lb_build_nested_proc(lbProcedure *p, AstProcLit *pd, Entity *e)
 		// This is an unspecialized polymorphic procedure, skip codegen
 		return;
 	}
-	e->code_gen_procedure = nested_proc;
+	e->code_gen_procedure.store(nested_proc, std::memory_order_relaxed);
 
 	lbValue value = {};
 	value.value = nested_proc->value;
@@ -2513,8 +2513,9 @@ gb_internal lbValue lb_build_builtin_proc(lbProcedure *p, Ast *expr, TypeAndValu
 				Entity *e = entity_of_node(ident);
 				GB_ASSERT(e != nullptr);
 
-				if (e->parent_proc_decl != nullptr && e->parent_proc_decl->entity != nullptr) {
-					procedure = e->parent_proc_decl->entity.load()->token.string;
+				DeclInfo *ppd = e->parent_proc_decl.load(std::memory_order_relaxed);
+				if (ppd != nullptr && ppd->entity != nullptr) {
+					procedure = ppd->entity.load()->token.string;
 				} else {
 					procedure = str_lit("");
 				}

@@ -509,8 +509,8 @@ gb_internal lbModule *lb_module_of_entity_internal(lbGenerator *gen, Entity *e, 
 
 	if (e->kind == Entity_Procedure &&
 	    e->decl_info &&
-	    e->decl_info->code_gen_module) {
-		return e->decl_info->code_gen_module;
+	    e->decl_info->code_gen_module.load(std::memory_order_relaxed)) {
+		return e->decl_info->code_gen_module.load(std::memory_order_relaxed);
 	}
 	if (e->file) {
 		found = map_get(&gen->modules, cast(void *)e->file);
@@ -1724,7 +1724,7 @@ gb_internal void lb_emit_store_union_variant(lbProcedure *p, lbValue parent, lbV
 	} else {
 		if (type_size_of(variant_type) == 0) {
 			unsigned alignment = 1;
-			lb_mem_zero_ptr_internal(p, parent.value, pt->Union.variant_block_size, alignment, false);
+			lb_mem_zero_ptr_internal(p, parent.value, pt->Union.variant_block_size.load(std::memory_order_relaxed), alignment, false);
 		} else {
 			lbValue underlying = lb_emit_conv(p, parent, alloc_type_pointer(variant_type));
 			lb_emit_store(p, underlying, variant);
@@ -1911,7 +1911,7 @@ gb_internal LLVMTypeRef lb_type_internal_union_block_type(lbModule *m, Type *typ
 
 	i64 align = type_align_of(type);
 
-	unsigned block_size = cast(unsigned)type->Union.variant_block_size;
+	unsigned block_size = cast(unsigned)type->Union.variant_block_size.load(std::memory_order_relaxed);
 	if (block_size == 0) {
 		return lb_type_padding_filler(m, block_size, align);
 	}
@@ -3389,7 +3389,7 @@ gb_internal lbValue lb_generate_anonymous_proc_lit(lbModule *m, String const &pr
 	GB_ASSERT(target_module != nullptr);
 
 	// NOTE(bill): this is to prevent a race condition since these procedure literals can be created anywhere at any time
-	pl->decl->code_gen_module = target_module;
+	pl->decl->code_gen_module.store(target_module, std::memory_order_relaxed);
 	e->decl_info = pl->decl;
 	e->parent_proc_decl = pl->decl->parent;
 	e->Procedure.is_anonymous = true;
@@ -3523,8 +3523,9 @@ gb_internal lbValue lb_find_value_from_entity(lbModule *m, Entity *e) {
 
 		bool is_external = other_module != m;
 		if (!is_external) {
-			if (e->code_gen_module != nullptr) {
-				other_module = e->code_gen_module;
+			lbModule *entity_module = cast(lbModule *)e->code_gen_module.load(std::memory_order_relaxed);
+			if (entity_module != nullptr) {
+				other_module = entity_module;
 			} else {
 				other_module = &m->gen->default_module;
 			}
