@@ -77,6 +77,14 @@ gb_internal LLVMMetadataRef lb_debug_procedure_parameters(lbModule *m, Type *typ
 }
 
 gb_internal LLVMMetadataRef lb_debug_type_internal_proc(lbModule *m, Type *type) {
+	if (build_context.debug_mode == DebugMode_Minimal) {
+		// Return a single cached empty subroutine type per module in minimal mode
+		if (m->debug_empty_subroutine_type == nullptr) {
+			m->debug_empty_subroutine_type = LLVMDIBuilderCreateSubroutineType(
+				m->debug_builder, nullptr, nullptr, 0, LLVMDIFlagZero);
+		}
+		return m->debug_empty_subroutine_type;
+	}
 	i64 size = type_size_of(type); // Check size
 	gb_unused(size);
 
@@ -645,12 +653,7 @@ gb_internal LLVMMetadataRef lb_debug_enum(lbModule *m, Type *type, String name, 
 
 gb_internal LLVMMetadataRef lb_debug_type_basic_type(lbModule *m, String const &name, u64 size_in_bits, LLVMDWARFTypeEncoding encoding, LLVMDIFlags flags = LLVMDIFlagZero) {
 	LLVMMetadataRef basic_type = LLVMDIBuilderCreateBasicType(m->debug_builder, cast(char const *)name.text, name.len, size_in_bits, encoding, flags);
-#if 1
-	LLVMMetadataRef final_decl = LLVMDIBuilderCreateTypedef(m->debug_builder, basic_type, cast(char const *)name.text, name.len, nullptr, 0, nullptr, cast(u32)size_in_bits);
-	return final_decl;
-#else
 	return basic_type;
-#endif
 }
 
 gb_internal LLVMMetadataRef lb_debug_type_internal(lbModule *m, Type *type) {
@@ -1052,6 +1055,9 @@ gb_internal LLVMMetadataRef lb_get_base_scope_metadata(lbModule *m, Scope *scope
 }
 
 gb_internal LLVMMetadataRef lb_debug_type(lbModule *m, Type *type) {
+	if (build_context.debug_mode == DebugMode_Minimal) {
+		return nullptr;
+	}
 	GB_ASSERT(type != nullptr);
 	LLVMMetadataRef found = lb_get_llvm_metadata(m, type);
 	if (found != nullptr) {
@@ -1115,6 +1121,9 @@ gb_internal LLVMMetadataRef lb_debug_type(lbModule *m, Type *type) {
 }
 
 gb_internal void lb_add_debug_local_variable(lbProcedure *p, LLVMValueRef ptr, Type *type, Token const &token) {
+	if (build_context.debug_mode == DebugMode_Minimal) {
+		return;
+	}
 	if (p->debug_info == nullptr) {
 		return;
 	}
@@ -1181,6 +1190,9 @@ gb_internal void lb_add_debug_local_variable(lbProcedure *p, LLVMValueRef ptr, T
 }
 
 gb_internal void lb_add_debug_param_variable(lbProcedure *p, LLVMValueRef ptr, Type *type, Token const &token, unsigned arg_number, lbBlock *block) {
+	if (build_context.debug_mode == DebugMode_Minimal) {
+		return;
+	}
 	if (p->debug_info == nullptr) {
 		return;
 	}
@@ -1313,6 +1325,9 @@ gb_internal void lb_add_debug_info_for_global_constant_internal_i64(lbModule *m,
 }
 
 gb_internal void lb_add_debug_info_for_global_constant_from_entity(lbGenerator *gen, Entity *e) {
+	if (build_context.debug_mode == DebugMode_Minimal) {
+		return;
+	}
 	if (e == nullptr || e->kind != Entity_Constant) {
 		return;
 	}

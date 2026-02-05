@@ -457,6 +457,11 @@ enum IntegerDivisionByZeroKind : u8 {
 	IntegerDivisionByZero_AllBits,
 };
 
+enum DebugMode : i32 {
+	DebugMode_Full    = 0,
+	DebugMode_Minimal = 1,
+};
+
 // This stores the information for the specify architecture of this build
 struct BuildContext {
 	// Constants
@@ -555,6 +560,10 @@ struct BuildContext {
 	bool   has_ansi_terminal_colours;
 
 	bool   fast_isel;
+
+	DebugMode debug_mode;
+	bool   compress_debug_sections;
+	bool   split_dwarf;
 	bool   ignore_lazy;
 	bool   ignore_llvm_build;
 	bool   ignore_panic;
