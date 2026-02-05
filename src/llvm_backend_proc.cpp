@@ -155,6 +155,14 @@ gb_internal lbProcedure *lb_create_procedure(lbModule *m, Entity *entity, bool i
 
 	if (build_context.disable_unwind) {
 		lb_add_attribute_to_proc(m, p->value, "nounwind");
+	} else {
+		// Odin-CC functions cannot unwind — Odin has no exception mechanism.
+		// All panics terminate via llvm.trap. Only applies to Odin-implemented
+		// functions (ProcCC_Odin, ProcCC_Contextless), never to foreign declarations.
+		ProcCallingConvention cc = pt->Proc.calling_convention;
+		if (cc == ProcCC_Odin || cc == ProcCC_Contextless) {
+			lb_add_attribute_to_proc(m, p->value, "nounwind");
+		}
 	}
 
 	if (pt->Proc.diverging) {
@@ -1053,15 +1061,13 @@ gb_internal lbValue lb_emit_conjugate(lbProcedure *p, lbValue val, Type *type) {
 	lbValue res = {};
 	Type *t = val.type;
 	if (is_type_complex(t)) {
-		res = lb_addr_get_ptr(p, lb_add_local_generated(p, type, false));
 		lbValue real = lb_emit_struct_ev(p, val, 0);
 		lbValue imag = lb_emit_struct_ev(p, val, 1);
 		imag = lb_emit_unary_arith(p, Token_Sub, imag, imag.type);
-		lb_emit_store(p, lb_emit_struct_ep(p, res, 0), real);
-		lb_emit_store(p, lb_emit_struct_ep(p, res, 1), imag);
+		lbValue fields[2] = {real, imag};
+		return lb_build_struct_value(p, type, fields, 2);
 	} else if (is_type_quaternion(t)) {
-		// @QuaternionLayout
-		res = lb_addr_get_ptr(p, lb_add_local_generated(p, type, false));
+		// @QuaternionLayout — index order: 0=i, 1=j, 2=k, 3=w
 		lbValue real = lb_emit_struct_ev(p, val, 3);
 		lbValue imag = lb_emit_struct_ev(p, val, 0);
 		lbValue jmag = lb_emit_struct_ev(p, val, 1);
@@ -1069,10 +1075,8 @@ gb_internal lbValue lb_emit_conjugate(lbProcedure *p, lbValue val, Type *type) {
 		imag = lb_emit_unary_arith(p, Token_Sub, imag, imag.type);
 		jmag = lb_emit_unary_arith(p, Token_Sub, jmag, jmag.type);
 		kmag = lb_emit_unary_arith(p, Token_Sub, kmag, kmag.type);
-		lb_emit_store(p, lb_emit_struct_ep(p, res, 3), real);
-		lb_emit_store(p, lb_emit_struct_ep(p, res, 0), imag);
-		lb_emit_store(p, lb_emit_struct_ep(p, res, 1), jmag);
-		lb_emit_store(p, lb_emit_struct_ep(p, res, 2), kmag);
+		lbValue fields[4] = {imag, jmag, kmag, real};
+		return lb_build_struct_value(p, type, fields, 4);
 	} else if (is_type_array_like(t)) {
 		res = lb_addr_get_ptr(p, lb_add_local_generated(p, type, true));
 		Type *elem_type = base_array_type(t);

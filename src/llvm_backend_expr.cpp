@@ -1485,7 +1485,6 @@ gb_internal lbValue lb_emit_arith(lbProcedure *p, TokenKind op, lbValue lhs, lbV
 			}
 		}
 
-		lbAddr res = lb_add_local_generated(p, type, false); // NOTE: initialized in full later
 		lbValue a = lb_emit_struct_ev(p, lhs, 0);
 		lbValue b = lb_emit_struct_ev(p, lhs, 1);
 		lbValue c = lb_emit_struct_ev(p, rhs, 0);
@@ -1523,10 +1522,8 @@ gb_internal lbValue lb_emit_arith(lbProcedure *p, TokenKind op, lbValue lhs, lbV
 		}
 		}
 
-		lb_emit_store(p, lb_emit_struct_ep(p, res.addr, 0), real);
-		lb_emit_store(p, lb_emit_struct_ep(p, res.addr, 1), imag);
-
-		return lb_addr_load(p, res);
+		lbValue fields[2] = {real, imag};
+		return lb_build_struct_value(p, type, fields, 2);
 	} else if (is_type_quaternion(type)) {
 		lhs = lb_emit_conv(p, lhs, type);
 		rhs = lb_emit_conv(p, rhs, type);
@@ -1539,7 +1536,6 @@ gb_internal lbValue lb_emit_arith(lbProcedure *p, TokenKind op, lbValue lhs, lbV
 				immediate_type = t_f32;
 			}
 
-			lbAddr res = lb_add_local_generated(p, type, false); // NOTE: initialized in full later
 			lbValue x0 = lb_emit_struct_ev(p, lhs, 0);
 			lbValue x1 = lb_emit_struct_ev(p, lhs, 1);
 			lbValue x2 = lb_emit_struct_ev(p, lhs, 2);
@@ -1567,11 +1563,6 @@ gb_internal lbValue lb_emit_arith(lbProcedure *p, TokenKind op, lbValue lhs, lbV
 			lbValue z2 = lb_emit_arith(p, op, x2, y2, immediate_type);
 			lbValue z3 = lb_emit_arith(p, op, x3, y3, immediate_type);
 
-			lbValue d0 = lb_emit_struct_ep(p, res.addr, 0);
-			lbValue d1 = lb_emit_struct_ep(p, res.addr, 1);
-			lbValue d2 = lb_emit_struct_ep(p, res.addr, 2);
-			lbValue d3 = lb_emit_struct_ep(p, res.addr, 3);
-
 			if (immediate_type != ft) {
 				z0 = lb_emit_conv(p, z0, ft);
 				z1 = lb_emit_conv(p, z1, ft);
@@ -1579,12 +1570,8 @@ gb_internal lbValue lb_emit_arith(lbProcedure *p, TokenKind op, lbValue lhs, lbV
 				z3 = lb_emit_conv(p, z3, ft);
 			}
 
-			lb_emit_store(p, d0, z0);
-			lb_emit_store(p, d1, z1);
-			lb_emit_store(p, d2, z2);
-			lb_emit_store(p, d3, z3);
-
-			return lb_addr_load(p, res);
+			lbValue fields[4] = {z0, z1, z2, z3};
+			return lb_build_struct_value(p, type, fields, 4);
 		} else if (op == Token_Mul) {
 			TEMPORARY_ALLOCATOR_GUARD();
 
@@ -2233,77 +2220,46 @@ gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t) {
 
 	if (is_type_complex(src) && is_type_complex(dst)) {
 		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, false);
-		lbValue gp = lb_addr_get_ptr(p, gen);
 		lbValue real = lb_emit_conv(p, lb_emit_struct_ev(p, value, 0), ft);
 		lbValue imag = lb_emit_conv(p, lb_emit_struct_ev(p, value, 1), ft);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 0), real);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 1), imag);
-		return lb_addr_load(p, gen);
+		lbValue fields[2] = {real, imag};
+		return lb_build_struct_value(p, t, fields, 2);
 	}
 
 	if (is_type_quaternion(src) && is_type_quaternion(dst)) {
 		// @QuaternionLayout
 		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, false);
-		lbValue gp = lb_addr_get_ptr(p, gen);
 		lbValue q0 = lb_emit_conv(p, lb_emit_struct_ev(p, value, 0), ft);
 		lbValue q1 = lb_emit_conv(p, lb_emit_struct_ev(p, value, 1), ft);
 		lbValue q2 = lb_emit_conv(p, lb_emit_struct_ev(p, value, 2), ft);
 		lbValue q3 = lb_emit_conv(p, lb_emit_struct_ev(p, value, 3), ft);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 0), q0);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 1), q1);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 2), q2);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 3), q3);
-		return lb_addr_load(p, gen);
+		lbValue fields[4] = {q0, q1, q2, q3};
+		return lb_build_struct_value(p, t, fields, 4);
 	}
 
-	if (is_type_integer(src) && is_type_complex(dst)) {
+	if ((is_type_integer(src) || is_type_float(src)) && is_type_complex(dst)) {
 		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, true);
-		lbValue gp = lb_addr_get_ptr(p, gen);
 		lbValue real = lb_emit_conv(p, value, ft);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 0), real);
-		return lb_addr_load(p, gen);
-	}
-	if (is_type_float(src) && is_type_complex(dst)) {
-		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, true);
-		lbValue gp = lb_addr_get_ptr(p, gen);
-		lbValue real = lb_emit_conv(p, value, ft);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 0), real);
-		return lb_addr_load(p, gen);
+		lbValue zero = {LLVMConstNull(lb_type(m, t)), t};
+		return lb_emit_struct_iv(p, zero, real, 0);
 	}
 
 
-	if (is_type_integer(src) && is_type_quaternion(dst)) {
+	if ((is_type_integer(src) || is_type_float(src)) && is_type_quaternion(dst)) {
 		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, true);
-		lbValue gp = lb_addr_get_ptr(p, gen);
 		lbValue real = lb_emit_conv(p, value, ft);
-		// @QuaternionLayout
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 3), real);
-		return lb_addr_load(p, gen);
-	}
-	if (is_type_float(src) && is_type_quaternion(dst)) {
-		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, true);
-		lbValue gp = lb_addr_get_ptr(p, gen);
-		lbValue real = lb_emit_conv(p, value, ft);
-		// @QuaternionLayout
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 3), real);
-		return lb_addr_load(p, gen);
+		// @QuaternionLayout — real (w) component is at index 3
+		lbValue zero = {LLVMConstNull(lb_type(m, t)), t};
+		return lb_emit_struct_iv(p, zero, real, 3);
 	}
 	if (is_type_complex(src) && is_type_quaternion(dst)) {
 		Type *ft = base_complex_elem_type(dst);
-		lbAddr gen = lb_add_local_generated(p, t, true);
-		lbValue gp = lb_addr_get_ptr(p, gen);
 		lbValue real = lb_emit_conv(p, lb_emit_struct_ev(p, value, 0), ft);
 		lbValue imag = lb_emit_conv(p, lb_emit_struct_ev(p, value, 1), ft);
-		// @QuaternionLayout
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 3), real);
-		lb_emit_store(p, lb_emit_struct_ep(p, gp, 0), imag);
-		return lb_addr_load(p, gen);
+		// @QuaternionLayout — real (w) at index 3, imag (i) at index 0
+		lbValue zero = {LLVMConstNull(lb_type(m, t)), t};
+		lbValue tmp = lb_emit_struct_iv(p, zero, real, 3);
+		return lb_emit_struct_iv(p, tmp, imag, 0);
 	}
 
 	// float <-> integer
@@ -2845,8 +2801,6 @@ gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t) {
 			return lb_const_nil(p->module, t);
 		}
 
-		lbAddr result = lb_add_local_generated(p, t, true);
-
 		Type *st = default_type(src_type);
 
 		lbValue data = lb_address_from_load_or_generate_local(p, value);
@@ -2855,13 +2809,9 @@ gb_internal lbValue lb_emit_conv(lbProcedure *p, lbValue value, Type *t) {
 		data = lb_emit_conv(p, data, t_rawptr);
 
 		lbValue id = lb_typeid(p->module, st);
-		lbValue any_data = lb_emit_struct_ep(p, result.addr, 0);
-		lbValue any_id   = lb_emit_struct_ep(p, result.addr, 1);
 
-		lb_emit_store(p, any_data, data);
-		lb_emit_store(p, any_id,   id);
-
-		return lb_addr_load(p, result);
+		lbValue fields[2] = {data, id};
+		return lb_build_struct_value(p, t, fields, 2);
 	}
 
 
