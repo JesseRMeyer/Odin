@@ -425,6 +425,8 @@ enum BuildFlagKind {
 	BuildFlag_Subsystem,
 #endif
 
+	BuildFlag_CompTimeout,
+
 	BuildFlag_AndroidKeystore,
 	BuildFlag_AndroidKeystoreAlias,
 	BuildFlag_AndroidKeystorePassword,
@@ -630,6 +632,8 @@ gb_internal bool parse_build_flags(Array<String> args) {
 	add_flag(&build_flags, BuildFlag_IntegerDivisionByZero,   str_lit("integer-division-by-zero"),  BuildFlagParam_String, Command__does_check);
 
 	add_flag(&build_flags, BuildFlag_BuildDiagnostics,        str_lit("build-diagnostics"),         BuildFlagParam_None,    Command__does_build);
+
+	add_flag(&build_flags, BuildFlag_CompTimeout,            str_lit("comp-timeout"),              BuildFlagParam_Integer, Command__does_check);
 
 	add_flag(&build_flags, BuildFlag_InternalFastISel,        str_lit("internal-fast-isel"),        BuildFlagParam_None,    Command_all);
 	add_flag(&build_flags, BuildFlag_InternalIgnoreLazy,      str_lit("internal-ignore-lazy"),      BuildFlagParam_None,    Command_all);
@@ -1546,6 +1550,18 @@ gb_internal bool parse_build_flags(Array<String> args) {
 								bad_flags = true;
 							} else {
 								build_context.max_error_count = cast(isize)count;
+							}
+							break;
+						}
+
+						case BuildFlag_CompTimeout: {
+							GB_ASSERT(value.kind == ExactValue_Integer);
+							i64 timeout = big_int_to_i64(&value.value_integer);
+							if (timeout <= 0) {
+								gb_printf_err("-comp-timeout must be greater than 0\n");
+								bad_flags = true;
+							} else {
+								build_context.comp_timeout_seconds = cast(f64)timeout;
 							}
 							break;
 						}

@@ -607,6 +607,7 @@ struct BuildContext {
 	bool   disable_red_zone;
 	bool   disable_unwind;
 
+	f64   comp_timeout_seconds;
 	isize max_error_count;
 
 	bool tilde_backend;
@@ -1751,6 +1752,10 @@ gb_internal void init_build_context(TargetMetrics *cross_target, Subtarget subta
 
 	if (bc->max_error_count <= 0) {
 		bc->max_error_count = DEFAULT_MAX_ERROR_COLLECTOR_COUNT;
+	}
+
+	if (bc->comp_timeout_seconds <= 0) {
+		bc->comp_timeout_seconds = 10.0;
 	}
 
 	{

@@ -725,6 +725,9 @@ gb_internal void lb_emit_bounds_check(lbProcedure *p, Token token, lbValue index
 	if (build_context.no_bounds_check) {
 		return;
 	}
+	if (p->module->no_bounds_check) {
+		return;
+	}
 	if ((p->state_flags & StateFlag_no_bounds_check) != 0) {
 		return;
 	}
@@ -758,6 +761,9 @@ gb_internal void lb_emit_matrix_bounds_check(lbProcedure *p, Token token, lbValu
 	if (build_context.no_bounds_check) {
 		return;
 	}
+	if (p->module->no_bounds_check) {
+		return;
+	}
 	if ((p->state_flags & StateFlag_no_bounds_check) != 0) {
 		return;
 	}
@@ -784,6 +790,9 @@ gb_internal void lb_emit_multi_pointer_slice_bounds_check(lbProcedure *p, Token 
 	if (build_context.no_bounds_check) {
 		return;
 	}
+	if (p->module->no_bounds_check) {
+		return;
+	}
 	if ((p->state_flags & StateFlag_no_bounds_check) != 0) {
 		return;
 	}
@@ -801,6 +810,9 @@ gb_internal void lb_emit_multi_pointer_slice_bounds_check(lbProcedure *p, Token 
 
 gb_internal void lb_emit_slice_bounds_check(lbProcedure *p, Token token, lbValue low, lbValue high, lbValue len, bool lower_value_used) {
 	if (build_context.no_bounds_check) {
+		return;
+	}
+	if (p->module->no_bounds_check) {
 		return;
 	}
 	if ((p->state_flags & StateFlag_no_bounds_check) != 0) {

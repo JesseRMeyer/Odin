@@ -8406,7 +8406,9 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 	pt = base_type(pt);
 
 	if (pt->kind == Type_Proc && pt->Proc.calling_convention == ProcCC_Odin) {
-		if ((c->scope->flags & ScopeFlag_ContextDefined) == 0) {
+		// #comp calls are JIT-evaluated and don't need context at the call site.
+		// The purity checker already verifies no context access occurs in the callee.
+		if (!call->CallExpr.comp_eval && (c->scope->flags & ScopeFlag_ContextDefined) == 0) {
 			ERROR_BLOCK();
 			if (c->scope->flags & ScopeFlag_File) {
 				error(call, "Procedures requiring a 'context' cannot be called at the global scope");
@@ -8549,6 +8551,111 @@ gb_internal ExprKind check_call_expr(CheckerContext *c, Operand *operand, Ast *c
 	bool is_objc_call = proc_entity && proc_entity->kind == Entity_Procedure && proc_entity->Procedure.is_objc_impl_or_import;
 	if (is_objc_call) {
 		check_objc_call_expr(c, operand, call, proc_entity, pt);
+	}
+
+	// #comp compile-time evaluation
+	if (call->CallExpr.comp_eval) {
+		ast_node(ce, CallExpr, call);
+
+		// 1. Validate: must be a named procedure
+		if (proc_entity == nullptr || proc_entity->kind != Entity_Procedure) {
+			error(call, "#comp requires a named procedure, not an expression");
+			operand->mode = Addressing_Invalid;
+			return Expr_Expr;
+		}
+
+		// 2. Collect and validate arguments
+		auto comp_args = array_make<CompEvalArg>(temporary_allocator(), 0, ce->args.count);
+		bool args_valid = true;
+		for (isize i = 0; i < ce->args.count; i++) {
+			Ast *arg_expr = ce->args[i];
+			TypeAndValue tav = type_and_value_of_expr(arg_expr);
+
+			// 2a. Validate argument type is comp-compatible
+			if (!is_comp_constant_type(tav.type)) {
+				ERROR_BLOCK();
+				error(arg_expr, "#comp argument %lld has a type that cannot be a compile-time constant", cast(long long)(i + 1));
+				if (tav.type != nullptr) {
+					gbString type_str = type_to_string(tav.type);
+					error_line("\ttype '%s' is not allowed\n", type_str);
+					gb_string_free(type_str);
+					if (is_type_slice(tav.type)) {
+						error_line("\tnote: use a fixed-size array instead of a slice\n");
+					}
+				}
+				args_valid = false;
+				continue;
+			}
+
+			// 2b. Validate argument is a compile-time constant
+			if (tav.mode != Addressing_Constant) {
+				error(arg_expr, "#comp argument %lld is not a compile-time constant", cast(long long)(i + 1));
+				args_valid = false;
+				continue;
+			}
+
+			CompEvalArg arg = {};
+			arg.type = tav.type;
+			arg.value = tav.value;
+			array_add(&comp_args, arg);
+		}
+		if (!args_valid) {
+			operand->mode = Addressing_Invalid;
+			return Expr_Expr;
+		}
+
+		// 3. Validate return type can be a compile-time constant
+		Type *comp_result_type = operand->type;
+		if (comp_result_type == nullptr || !is_comp_constant_type(comp_result_type)) {
+			ERROR_BLOCK();
+			error(call, "result of '#comp %.*s()' cannot be a compile-time constant",
+				LIT(proc_entity->token.string));
+			if (comp_result_type != nullptr) {
+				gbString type_str = type_to_string(comp_result_type);
+				error_line("\treturn type '%s' is not allowed\n", type_str);
+				gb_string_free(type_str);
+			}
+			if (comp_result_type != nullptr && is_type_slice(comp_result_type)) {
+				error_line("\tnote: use a fixed-size array instead of a slice\n");
+			}
+			operand->mode = Addressing_Invalid;
+			return Expr_Expr;
+		}
+
+		// 4. Ensure the callee's body has been type-checked.
+		//    #comp may run during entity checking, before normal body checking order.
+		comp_ensure_body_checked(c, proc_entity);
+
+		// 5. Purity check
+		auto trace = array_make<CompImpurityTrace>(temporary_allocator());
+		if (!check_comp_purity(c, proc_entity, call, &trace)) {
+			report_comp_purity_error(c, call, trace);
+			operand->mode = Addressing_Invalid;
+			return Expr_Expr;
+		}
+
+		// 6. JIT evaluate
+		Slice<CompEvalArg> args_slice = slice_from_array(comp_args);
+		CompEvalResult comp_result = comp_evaluate_with_timeout(
+			c, proc_entity, comp_result_type, args_slice,
+			build_context.comp_timeout_seconds
+		);
+
+		if (!comp_result.ok) {
+			ERROR_BLOCK();
+			error(call, "compile-time evaluation of '#comp %.*s()' failed",
+				LIT(proc_entity->token.string));
+			if (comp_result.panic_msg.len > 0) {
+				error_line("\truntime panic: %.*s\n", LIT(comp_result.panic_msg));
+			}
+			operand->mode = Addressing_Invalid;
+			return Expr_Expr;
+		}
+
+		// 7. Success — transform into a constant
+		operand->mode = Addressing_Constant;
+		operand->value = comp_result.value;
+		return Expr_Expr;
 	}
 
 	return Expr_Expr;

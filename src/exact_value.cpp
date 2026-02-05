@@ -30,6 +30,7 @@ enum ExactValueKind {
 	ExactValue_Procedure  = 9,
 	ExactValue_Typeid     = 10,
 	ExactValue_String16   = 11,
+	ExactValue_RawBytes   = 12,
 
 	ExactValue_Count,
 };
@@ -48,6 +49,7 @@ struct ExactValue {
 		Ast *          value_procedure;
 		Type *         value_typeid;
 		String16       value_string16;
+		struct { u8 *data; i64 size; } value_raw_bytes;
 	};
 };
 
@@ -98,6 +100,9 @@ gb_internal uintptr hash_exact_value(ExactValue v) {
 		break;
 	case ExactValue_Typeid:
 		res = ptr_map_hash_key(v.value_typeid);
+		break;
+	case ExactValue_RawBytes:
+		res = gb_fnv32a(v.value_raw_bytes.data, cast(isize)v.value_raw_bytes.size);
 		break;
 	default:
 		res = gb_fnv32a(&v, gb_size_of(ExactValue));
@@ -183,6 +188,13 @@ gb_internal ExactValue exact_value_procedure(Ast *node) {
 gb_internal ExactValue exact_value_typeid(Type *type) {
 	ExactValue result = {ExactValue_Typeid};
 	result.value_typeid = type;
+	return result;
+}
+
+gb_internal ExactValue exact_value_raw_bytes(u8 *data, i64 size) {
+	ExactValue result = {ExactValue_RawBytes};
+	result.value_raw_bytes.data = data;
+	result.value_raw_bytes.size = size;
 	return result;
 }
 
@@ -1067,6 +1079,18 @@ gb_internal bool compare_exact_values(TokenKind op, ExactValue x, ExactValue y) 
 			return false;
 		}
 		return compare_exact_values_compound_lit(op, x, y);
+
+	case ExactValue_RawBytes:
+		if (op != Token_CmpEq && op != Token_NotEq) {
+			return false;
+		}
+		if (x.value_raw_bytes.size != y.value_raw_bytes.size) {
+			return op == Token_NotEq;
+		}
+		{
+			bool eq = gb_memcompare(x.value_raw_bytes.data, y.value_raw_bytes.data, cast(isize)x.value_raw_bytes.size) == 0;
+			return op == Token_CmpEq ? eq : !eq;
+		}
 	}
 
 	GB_PANIC("Invalid comparison: %d", x.kind);
