@@ -749,7 +749,9 @@ gb_internal CompEvalResult comp_evaluate_with_timeout(
 			result.ok = false;
 			result.panic_msg = str_lit("timed out");
 			worker.detach();
-			// shared intentionally leaked — detached thread still owns it
+			// shared intentionally leaked: the detached worker thread may still
+			// be running and references shared state, so we cannot free it.
+			// This only occurs on timeout, which should be rare in practice.
 			return result;
 		}
 	}

@@ -2422,7 +2422,7 @@ gb_internal WORKER_TASK_PROC(lb_llvm_emit_worker_proc) {
 
 	if (build_context.lto_kind != LTO_None) {
 		if (LLVMWriteBitcodeToFile(wd->m->mod, cast(char *)wd->filepath_obj.text)) {
-			gb_printf_err("Failed to write bitcode file: %.*s\n", LIT(wd->filepath_obj));
+			gb_printf_err("Failed to write bitcode file: %.*s: %s\n", LIT(wd->filepath_obj), strerror(errno));
 			exit_with_errors();
 		}
 #if !defined(GB_SYSTEM_WINDOWS)
@@ -2918,7 +2918,7 @@ gb_internal bool lb_llvm_object_generation(lbGenerator *gen, bool do_threading) 
 
 			if (build_context.lto_kind != LTO_None) {
 				if (LLVMWriteBitcodeToFile(m->mod, cast(char *)filepath_obj.text)) {
-					gb_printf_err("Failed to write bitcode file: %.*s\n", LIT(filepath_obj));
+					gb_printf_err("Failed to write bitcode file: %.*s: %s\n", LIT(filepath_obj), strerror(errno));
 					exit_with_errors();
 					return false;
 				}
@@ -3322,7 +3322,9 @@ gb_internal bool lb_generate_code(lbGenerator *gen) {
 			code_mode);
 		lbModule *m = entry.value;
 		m->target_machine = target_machine;
-		LLVMSetModuleDataLayout(m->mod, LLVMCreateTargetDataLayout(target_machine));
+		LLVMTargetDataRef data_layout = LLVMCreateTargetDataLayout(target_machine);
+		LLVMSetModuleDataLayout(m->mod, data_layout);
+		LLVMDisposeTargetData(data_layout);
 
 	#if !defined(GB_SYSTEM_WINDOWS)
 		if (lb_split_dwarf_enabled()) {

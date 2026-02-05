@@ -519,10 +519,11 @@ gb_internal lbModule *lb_module_of_expr(lbGenerator *gen, Ast *expr) {
 gb_internal lbModule *lb_module_of_entity_internal(lbGenerator *gen, Entity *e, lbModule *curr_module) {
 	lbModule **found = nullptr;
 
-	if (e->kind == Entity_Procedure &&
-	    e->decl_info &&
-	    e->decl_info->code_gen_module.load(std::memory_order_relaxed)) {
-		return e->decl_info->code_gen_module.load(std::memory_order_relaxed);
+	if (e->kind == Entity_Procedure && e->decl_info) {
+		lbModule *mod = e->decl_info->code_gen_module.load(std::memory_order_relaxed);
+		if (mod) {
+			return mod;
+		}
 	}
 	if (e->file) {
 		found = map_get(&gen->modules, cast(void *)e->file);
@@ -2969,7 +2970,7 @@ gb_internal LLVMValueRef OdinLLVMBuildTransmute(lbProcedure *p, LLVMValueRef val
 			for (unsigned i = 0; i < src_count; i++) {
 				LLVMTypeRef sf = LLVMStructGetTypeAtIndex(src_type, i);
 				LLVMTypeRef df = LLVMStructGetTypeAtIndex(dst_type, i);
-				if (lb_sizeof(sf) != lb_sizeof(df)) {
+				if (lb_sizeof(sf) != lb_sizeof(df) || lb_alignof(sf) != lb_alignof(df)) {
 					compatible = false;
 					break;
 				}

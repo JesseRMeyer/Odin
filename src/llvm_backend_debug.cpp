@@ -813,12 +813,14 @@ gb_internal LLVMMetadataRef lb_debug_type_internal(lbModule *m, Type *type) {
 
 		case Basic_any:
 			{
+				unsigned any_size_bits = 8*cast(unsigned)type_size_of(t_any);
 				unsigned typeid_bits = 8*cast(unsigned)type_size_of(t_typeid);
+				unsigned id_offset = any_size_bits - typeid_bits;
 				unsigned any_align = cast(unsigned)gb_max(ptr_bits, typeid_bits);
 				LLVMMetadataRef elements[2] = {};
 				elements[0] = lb_debug_struct_field(m, str_lit("data"), t_rawptr, 0);
-				elements[1] = lb_debug_struct_field(m, str_lit("id"),   t_typeid, ptr_bits);
-				return lb_debug_basic_struct(m, str_lit("any"), ptr_bits+typeid_bits, any_align, elements, gb_count_of(elements));
+				elements[1] = lb_debug_struct_field(m, str_lit("id"),   t_typeid, id_offset);
+				return lb_debug_basic_struct(m, str_lit("any"), any_size_bits, any_align, elements, gb_count_of(elements));
 			}
 
 		// Untyped types

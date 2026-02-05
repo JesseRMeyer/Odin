@@ -1880,6 +1880,9 @@ gb_internal bool parse_build_flags(Array<String> args) {
 			gb_printf_err("Warning: -compress-debug-sections has no effect without -debug\n");
 		}
 	}
+	if (build_context.split_dwarf && build_context.compress_debug_sections) {
+		gb_printf_err("Warning: -compress-debug-sections only applies to the main object file, not split .dwo files\n");
+	}
 
 	return !bad_flags;
 }
