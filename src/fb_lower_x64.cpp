@@ -475,6 +475,75 @@ gb_internal void fb_x64_div(fbLowCtx *ctx, fbInst *inst, bool is_signed, bool wa
 }
 
 // ───────────────────────────────────────────────────────────────────────
+// Branch fixup recording
+// ───────────────────────────────────────────────────────────────────────
+
+gb_internal void fb_x64_record_fixup(fbLowCtx *ctx, u32 code_offset, u32 target_block) {
+	if (ctx->fixup_count >= ctx->fixup_cap) {
+		u32 new_cap = ctx->fixup_cap * 2;
+		if (new_cap < 16) new_cap = 16;
+		ctx->fixups = gb_resize_array(heap_allocator(), ctx->fixups, ctx->fixup_cap, new_cap);
+		ctx->fixup_cap = new_cap;
+	}
+	fbFixup *f = &ctx->fixups[ctx->fixup_count++];
+	f->code_offset  = code_offset;
+	f->target_block = target_block;
+	f->fixup_kind   = 0; // rel32
+}
+
+// Emit jmp rel32 to target_block.
+// current_bi: index of the block currently being lowered (blocks < current_bi are already emitted)
+gb_internal void fb_x64_emit_jmp(fbLowCtx *ctx, u32 target_block, u32 current_bi) {
+	fb_low_emit_byte(ctx, 0xE9);
+	u32 disp_offset = ctx->code_count;
+	if (target_block <= current_bi) {
+		// Backward jump: target block already emitted, compute displacement
+		i32 disp = cast(i32)ctx->block_offsets[target_block] - cast(i32)(disp_offset + 4);
+		fb_x64_imm32(ctx, disp);
+	} else {
+		// Forward jump: placeholder, record fixup
+		fb_x64_imm32(ctx, 0);
+		fb_x64_record_fixup(ctx, disp_offset, target_block);
+	}
+}
+
+// Emit jcc rel32 (near conditional jump) to target_block.
+// cc is the x86 condition code (0x4=E, 0x5=NE, etc.)
+gb_internal void fb_x64_emit_jcc(fbLowCtx *ctx, u8 cc, u32 target_block, u32 current_bi) {
+	fb_low_emit_byte(ctx, 0x0F);
+	fb_low_emit_byte(ctx, cast(u8)(0x80 + cc));
+	u32 disp_offset = ctx->code_count;
+	if (target_block <= current_bi) {
+		i32 disp = cast(i32)ctx->block_offsets[target_block] - cast(i32)(disp_offset + 4);
+		fb_x64_imm32(ctx, disp);
+	} else {
+		fb_x64_imm32(ctx, 0);
+		fb_x64_record_fixup(ctx, disp_offset, target_block);
+	}
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Comparison helper: maps FB_CMP_* opcode to x86 condition code (0x4=E, 0x5=NE, etc.)
+// Used with SETcc (0F 90+cc), Jcc (0F 80+cc), and CMOVcc (0F 40+cc).
+// ───────────────────────────────────────────────────────────────────────
+
+gb_internal u8 fb_x64_cmp_to_cc(fbOp op) {
+	switch (op) {
+	case FB_CMP_EQ:  return 0x4;  // E  (equal)
+	case FB_CMP_NE:  return 0x5;  // NE (not equal)
+	case FB_CMP_SLT: return 0xC;  // L  (less, signed)
+	case FB_CMP_SLE: return 0xE;  // LE (less or equal, signed)
+	case FB_CMP_SGT: return 0xF;  // G  (greater, signed)
+	case FB_CMP_SGE: return 0xD;  // GE (greater or equal, signed)
+	case FB_CMP_ULT: return 0x2;  // B  (below, unsigned)
+	case FB_CMP_ULE: return 0x6;  // BE (below or equal, unsigned)
+	case FB_CMP_UGT: return 0x7;  // A  (above, unsigned)
+	case FB_CMP_UGE: return 0x3;  // AE (above or equal, unsigned)
+	default: GB_PANIC("unreachable"); return 0;
+	}
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // Procedure lowering
 // ───────────────────────────────────────────────────────────────────────
 
@@ -752,7 +821,119 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 			case FB_SMOD: fb_x64_div(ctx, inst, true,  true);  break;
 			case FB_UMOD: fb_x64_div(ctx, inst, false, true);  break;
 
+			// ── Integer comparisons ───────────────────────────
+			case FB_CMP_EQ: case FB_CMP_NE:
+			case FB_CMP_SLT: case FB_CMP_SLE:
+			case FB_CMP_SGT: case FB_CMP_SGE:
+			case FB_CMP_ULT: case FB_CMP_ULE:
+			case FB_CMP_UGT: case FB_CMP_UGE: {
+				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rb = fb_x64_resolve_gp(ctx, inst->b, (1u << ra));
+				// CMP ra, rb: REX.W 39 /r (sub without storing result)
+				fb_x64_rex(ctx, true, rb, 0, ra);
+				fb_low_emit_byte(ctx, 0x39);
+				fb_x64_modrm(ctx, 0x03, rb, ra);
+				// SETcc rd_low: 0F (90+cc) modrm(03, 0, rd)
+				// Allocate rd, then emit setcc + movzx.
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, cast(u16)((1u << ra) | (1u << rb)));
+				u8 cc = fb_x64_cmp_to_cc(cast(fbOp)inst->op);
+				// Must always emit REX for byte-register operands to avoid
+				// legacy AH/CH/DH/BH encoding for registers 4-7.
+				fb_x64_rex(ctx, false, 0, 0, rd);
+				fb_low_emit_byte(ctx, 0x0F);
+				fb_low_emit_byte(ctx, cast(u8)(0x90 + cc));
+				fb_x64_modrm(ctx, 0x03, 0, rd);
+				// MOVZX r32, r8: 0F B6 modrm (zero-extends to 64 via 32-bit dest)
+				fb_x64_rex(ctx, false, rd, 0, rd);
+				fb_low_emit_byte(ctx, 0x0F);
+				fb_low_emit_byte(ctx, 0xB6);
+				fb_x64_modrm(ctx, 0x03, rd, rd);
+				break;
+			}
+
+			// ── Select (conditional move) ─────────────────────
+			case FB_SELECT: {
+				// cond in a, true_val in b, false_val in c
+				fbX64Reg rcond = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rtrue = fb_x64_resolve_gp(ctx, inst->b, (1u << rcond));
+				fbX64Reg rfalse = fb_x64_resolve_gp(ctx, inst->c, cast(u16)((1u << rcond) | (1u << rtrue)));
+				// TEST cond8, cond8 — must always emit REX for byte-register
+				// operands to avoid legacy AH/CH/DH/BH encoding for registers 4-7.
+				fb_x64_rex(ctx, false, rcond, 0, rcond);
+				fb_low_emit_byte(ctx, 0x84);
+				fb_x64_modrm(ctx, 0x03, rcond, rcond);
+				// Allocate result
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, cast(u16)((1u << rcond) | (1u << rtrue) | (1u << rfalse)));
+				// MOV rd, false_val (default)
+				fb_x64_mov_rr(ctx, rd, rfalse);
+				// CMOVNZ rd, true_val: REX.W 0F 45 modrm (cmovne)
+				fb_x64_rex(ctx, true, rd, 0, rtrue);
+				fb_low_emit_byte(ctx, 0x0F);
+				fb_low_emit_byte(ctx, 0x45);
+				fb_x64_modrm(ctx, 0x03, rd, rtrue);
+				break;
+			}
+
 			// ── Control flow ───────────────────────────────────
+			case FB_JUMP: {
+				u32 target = cast(u32)inst->imm;
+				// Fallthrough optimization: skip jump if target is the next block
+				if (target != bi + 1) {
+					fb_x64_emit_jmp(ctx, target, bi);
+				}
+				break;
+			}
+
+			case FB_BRANCH: {
+				// cond in a, true_block in b, false_block in c
+				fbX64Reg rcond = fb_x64_resolve_gp(ctx, inst->a, 0);
+				u32 true_block  = inst->b;
+				u32 false_block = inst->c;
+				// TEST cond8, cond8 — must always emit REX for byte-register
+				// operands to avoid legacy AH/CH/DH/BH encoding for registers 4-7.
+				fb_x64_rex(ctx, false, rcond, 0, rcond);
+				fb_low_emit_byte(ctx, 0x84);
+				fb_x64_modrm(ctx, 0x03, rcond, rcond);
+
+				if (false_block == bi + 1) {
+					// False is fallthrough: jnz true_block
+					fb_x64_emit_jcc(ctx, 0x5, true_block, bi); // 0x5 = JNE/JNZ
+				} else if (true_block == bi + 1) {
+					// True is fallthrough: jz false_block
+					fb_x64_emit_jcc(ctx, 0x4, false_block, bi); // 0x4 = JE/JZ
+				} else {
+					// Neither is fallthrough: jnz true + jmp false
+					fb_x64_emit_jcc(ctx, 0x5, true_block, bi);
+					fb_x64_emit_jmp(ctx, false_block, bi);
+				}
+				break;
+			}
+
+			case FB_SWITCH: {
+				// key in a, default_block in b, cases in aux
+				fbX64Reg rkey = fb_x64_resolve_gp(ctx, inst->a, 0);
+				u32 default_block = inst->b;
+				u32 aux_start = inst->c;
+				u32 case_count = cast(u32)inst->imm;
+				// Each case is 2 aux entries: [value, block]
+				for (u32 ci = 0; ci < case_count; ci++) {
+					i64 case_val = cast(i64)cast(i32)p->aux[aux_start + ci * 2];
+					u32 case_block = p->aux[aux_start + ci * 2 + 1];
+					// CMP rkey, imm32: REX.W 81 /7 imm32
+					fb_x64_rex(ctx, true, 7, 0, rkey);
+					fb_low_emit_byte(ctx, 0x81);
+					fb_x64_modrm(ctx, 0x03, 7, rkey);
+					fb_x64_imm32(ctx, cast(i32)case_val);
+					// JE case_block
+					fb_x64_emit_jcc(ctx, 0x4, case_block, bi);
+				}
+				// JMP default_block
+				if (default_block != bi + 1) {
+					fb_x64_emit_jmp(ctx, default_block, bi);
+				}
+				break;
+			}
+
 			case FB_RET:
 				fb_x64_emit_epilogue(ctx);
 				break;
@@ -774,6 +955,17 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				break;
 			}
 		}
+	}
+
+	// Patch forward branch fixups
+	for (u32 fi = 0; fi < ctx->fixup_count; fi++) {
+		fbFixup *f = &ctx->fixups[fi];
+		GB_ASSERT(f->target_block < p->block_count);
+		i32 disp = cast(i32)ctx->block_offsets[f->target_block] - cast(i32)(f->code_offset + 4);
+		ctx->code[f->code_offset + 0] = cast(u8)(disp & 0xFF);
+		ctx->code[f->code_offset + 1] = cast(u8)((disp >> 8) & 0xFF);
+		ctx->code[f->code_offset + 2] = cast(u8)((disp >> 16) & 0xFF);
+		ctx->code[f->code_offset + 3] = cast(u8)((disp >> 24) & 0xFF);
 	}
 }
 
@@ -810,5 +1002,6 @@ gb_internal void fb_lower_all(fbModule *m) {
 		if (ctx.code)           gb_free(heap_allocator(), ctx.code);
 		if (ctx.block_offsets)  gb_free(heap_allocator(), ctx.block_offsets);
 		if (ctx.value_loc)      gb_free(heap_allocator(), ctx.value_loc);
+		if (ctx.fixups)         gb_free(heap_allocator(), ctx.fixups);
 	}
 }
