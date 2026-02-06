@@ -27,6 +27,11 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 		if (e == info->entry_point) {
 			p->is_export = true;
 		}
+		// Respect linkage="strong" — these procs need global visibility
+		// (e.g., runtime.main has @(linkage="strong") to be visible to CRT)
+		if (e->flags & EntityFlag_CustomLinkage_Strong) {
+			p->is_export = true;
+		}
 
 		if (!p->is_foreign) {
 			u32 entry = fb_block_create(p);
