@@ -86,6 +86,21 @@ gb_global Timings global_timings = {0};
 #include "tilde.cpp"
 #endif
 
+#if defined(GB_SYSTEM_LINUX) || defined(GB_SYSTEM_FREEBSD)
+#define ALLOW_FAST_BACKEND 1
+#else
+#define ALLOW_FAST_BACKEND 0
+#endif
+
+#if ALLOW_FAST_BACKEND
+#include "fb_ir.h"
+#include "fb_ir.cpp"
+#include "fb_abi.cpp"
+#include "fb_build.cpp"
+#include "fb_lower_x64.cpp"
+#include "fb_emit_elf.cpp"
+#endif
+
 #include "llvm_backend.cpp"
 
 #include "bug_report.cpp"
@@ -411,6 +426,7 @@ enum BuildFlagKind {
 	BuildFlag_InternalLLVMVerification,
 
 	BuildFlag_Tilde,
+	BuildFlag_Fast,
 
 	BuildFlag_Sanitize,
 	BuildFlag_LTO,
@@ -648,6 +664,10 @@ gb_internal bool parse_build_flags(Array<String> args) {
 
 #if ALLOW_TILDE
 	add_flag(&build_flags, BuildFlag_Tilde,                   str_lit("tilde"),                     BuildFlagParam_None,    Command__does_build);
+#endif
+
+#if ALLOW_FAST_BACKEND
+	add_flag(&build_flags, BuildFlag_Fast,                    str_lit("fast"),                      BuildFlagParam_None,    Command__does_build);
 #endif
 
 	add_flag(&build_flags, BuildFlag_Sanitize,                str_lit("sanitize"),                  BuildFlagParam_String,  Command__does_build, true);
@@ -1638,6 +1658,10 @@ gb_internal bool parse_build_flags(Array<String> args) {
 
 						case BuildFlag_Tilde:
 							build_context.tilde_backend = true;
+							break;
+
+						case BuildFlag_Fast:
+							build_context.fast_backend = true;
 							break;
 
 						case BuildFlag_Sanitize:
@@ -4040,6 +4064,34 @@ int main(int arg_count, char const **arg_ptr) {
 		failed_to_cache_parsing = true;
 	}
 
+#if ALLOW_FAST_BACKEND
+	if (build_context.fast_backend) {
+		LinkerData linker_data = {};
+		MAIN_TIME_SECTION("Fast Backend Code Gen");
+		if (!fb_generate_code(checker, &linker_data)) {
+			return 1;
+		}
+
+		switch (build_context.build_mode) {
+		case BuildMode_Executable:
+		case BuildMode_StaticLibrary:
+		case BuildMode_DynamicLibrary:
+			{
+				i32 result = linker_stage(&linker_data);
+				if (result) {
+					if (build_context.show_timings) {
+						show_timings(checker, &global_timings);
+					}
+					if (build_context.export_dependencies_format != DependenciesExportUnspecified) {
+						export_dependencies(checker);
+					}
+					return result;
+				}
+			}
+			break;
+		}
+	} else
+#endif
 #if ALLOW_TILDE
 	if (build_context.tilde_backend) {
 		LinkerData linker_data = {};

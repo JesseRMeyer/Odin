@@ -480,6 +480,13 @@ gb_internal bool fb_generate_code(Checker *c, LinkerData *ld) {
 	fbModule *m = fb_module_create(c);
 	m->linker_data = ld;
 
+	if (m->target.arch != FB_ARCH_X64) {
+		gb_printf_err("fast backend: only x86-64 is supported (got %s)\n",
+			target_arch_names[build_context.metrics.arch]);
+		fb_module_destroy(m);
+		return false;
+	}
+
 	fb_generate_procedures(m);
 	fb_lower_all(m);
 
