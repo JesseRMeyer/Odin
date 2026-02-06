@@ -166,6 +166,7 @@ gb_internal bool fb_op_has_result(fbOp op) {
 	case FB_TRAP:
 	case FB_DEBUGBREAK:
 	case FB_ATOMIC_STORE:
+	case FB_TAILCALL:
 	case FB_FENCE:
 	case FB_VA_START:
 	case FB_PREFETCH:
@@ -188,7 +189,9 @@ gb_internal u32 fb_inst_emit(fbProc *p, fbOp op, fbType type,
 		p->inst_cap = new_cap;
 	}
 
-	u32 r = fb_op_has_result(op) ? p->next_value++ : FB_NOREG;
+	// type.kind != FBT_VOID: ops like FB_CALL with a void return have
+	// fb_op_has_result()==true but should not allocate a value number.
+	u32 r = (fb_op_has_result(op) && type.kind != FBT_VOID) ? p->next_value++ : FB_NOREG;
 
 	fbInst *inst = &p->insts[p->inst_count];
 	inst->op       = cast(u8)op;
@@ -225,6 +228,25 @@ gb_internal void fb_block_start(fbProc *p, u32 block_id) {
 	GB_ASSERT(block_id < p->block_count);
 	p->current_block = block_id;
 	p->blocks[block_id].first_inst = p->inst_count;
+}
+
+gb_internal u32 fb_slot_create(fbProc *p, u32 size, u32 align, Entity *entity, Type *odin_type) {
+	if (p->slot_count >= p->slot_cap) {
+		u32 new_cap = p->slot_cap * 2;
+		if (new_cap < 16) new_cap = 16;
+		p->slots = gb_resize_array(heap_allocator(), p->slots, p->slot_cap, new_cap);
+		p->slot_cap = new_cap;
+	}
+
+	u32 idx = p->slot_count++;
+	fbStackSlot *s = &p->slots[idx];
+	s->size         = size;
+	s->align        = align;
+	s->frame_offset = 0; // assigned during lowering
+	s->entity       = entity;
+	s->odin_type    = odin_type;
+	s->scope_start  = p->inst_count;
+	return idx;
 }
 
 gb_internal u32 fb_aux_push(fbProc *p, u32 val) {
@@ -290,6 +312,8 @@ gb_internal void fb_proc_destroy(fbProc *p) {
 	if (p->slots)        gb_free(heap_allocator(), p->slots);
 	if (p->aux)          gb_free(heap_allocator(), p->aux);
 	if (p->locs)         gb_free(heap_allocator(), p->locs);
+	if (p->param_locs)   gb_free(heap_allocator(), p->param_locs);
+	if (p->relocs)       gb_free(heap_allocator(), p->relocs);
 	if (p->machine_code) gb_free(heap_allocator(), p->machine_code);
 }
 

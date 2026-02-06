@@ -132,6 +132,7 @@ gb_internal void fb_x64_mov_ri64(fbLowCtx *ctx, fbX64Reg dst, i64 val) {
 // ───────────────────────────────────────────────────────────────────────
 
 gb_internal void fb_x64_spill_reg(fbLowCtx *ctx, fbX64Reg reg);
+gb_internal i32  fb_x64_spill_offset(fbLowCtx *ctx, u32 vreg);
 gb_internal void fb_x64_record_reloc(fbLowCtx *ctx, u32 code_offset, u32 target_proc, i64 addend, fbRelocType reloc_type);
 
 // Emit RIP-relative LEA for a symbol: lea reg, [rip+disp32] + relocation record.
@@ -147,12 +148,19 @@ gb_internal void fb_x64_emit_lea_sym(fbLowCtx *ctx, fbX64Reg reg, u32 sym_idx) {
 }
 
 gb_internal void fb_x64_reset_regs(fbLowCtx *ctx) {
-	// Spill dirty registers before clearing — ensures value_loc is
-	// consistent with reality at block boundaries.
+	// Spill dirty registers and update value_loc for all live registers
+	// before clearing — ensures value_loc is consistent at block boundaries.
 	for (u32 i = 0; i < FB_X64_GP_ALLOC_COUNT; i++) {
 		fbX64Reg r = fb_x64_gp_alloc_order[i];
-		if (ctx->gp[r].vreg != FB_NOREG && ctx->gp[r].dirty) {
+		u32 vreg = ctx->gp[r].vreg;
+		if (vreg == FB_NOREG) continue;
+		if (ctx->gp[r].dirty) {
 			fb_x64_spill_reg(ctx, r);
+		} else {
+			// Clean register: value_loc still says "in register r" but
+			// we're clearing all registers. Point it back to the spill slot.
+			ctx->value_loc[vreg] = fb_x64_spill_offset(ctx, vreg);
+			ctx->gp[r].vreg = FB_NOREG;
 		}
 	}
 	for (int i = 0; i < 16; i++) {
@@ -627,6 +635,14 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 	// Initialize value tracking
 	fb_x64_init_value_loc(ctx);
 
+	// Initialize register state (fbLowCtx is zero-init'd, but gp[i].vreg
+	// must be FB_NOREG, not 0, to avoid stale register claims)
+	for (int i = 0; i < 16; i++) {
+		ctx->gp[i].vreg     = FB_NOREG;
+		ctx->gp[i].last_use = 0;
+		ctx->gp[i].dirty    = false;
+	}
+
 	// Compute stack frame layout
 	fb_x64_compute_frame(ctx);
 
@@ -662,6 +678,26 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 					fb_x64_mov_ri32(ctx, rd, cast(i32)val);
 				} else if (val >= 0 && val <= cast(i64)UINT32_MAX) {
 					// mov r32, imm32 (5 bytes, zero-extends to 64)
+					fb_x64_rex_if_needed(ctx, false, 0, 0, rd);
+					fb_low_emit_byte(ctx, cast(u8)(0xB8 + (rd & 7)));
+					fb_x64_imm32(ctx, cast(i32)val);
+				} else {
+					fb_x64_mov_ri64(ctx, rd, val);
+				}
+				break;
+			}
+
+			// Float bit patterns in imm are loaded into GP registers the same as integers
+			case FB_FCONST: {
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, 0);
+				i64 val = inst->imm;
+				if (val == 0) {
+					fb_x64_rex_if_needed(ctx, false, rd, 0, rd);
+					fb_low_emit_byte(ctx, 0x31);
+					fb_x64_modrm(ctx, 0x03, rd, rd);
+				} else if (val >= INT32_MIN && val <= INT32_MAX) {
+					fb_x64_mov_ri32(ctx, rd, cast(i32)val);
+				} else if (val >= 0 && val <= cast(i64)UINT32_MAX) {
 					fb_x64_rex_if_needed(ctx, false, 0, 0, rd);
 					fb_low_emit_byte(ctx, cast(u8)(0xB8 + (rd & 7)));
 					fb_x64_imm32(ctx, cast(i32)val);
@@ -718,6 +754,7 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 					fb_x64_modrm_indirect(ctx, rd, rptr);
 					break;
 				case FBT_I32:
+				case FBT_F32:
 					// mov rd(32), [rptr]: 8B modrm (zero-extends to 64)
 					fb_x64_rex_if_needed(ctx, false, rd, 0, rptr);
 					fb_low_emit_byte(ctx, 0x8B);
@@ -755,6 +792,7 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 					fb_x64_modrm_indirect(ctx, rval, rptr);
 					break;
 				case FBT_I32:
+				case FBT_F32:
 					// mov dword [rptr], rval(32): 89 modrm
 					fb_x64_rex_if_needed(ctx, false, rval, 0, rptr);
 					fb_low_emit_byte(ctx, 0x89);
@@ -767,6 +805,48 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 					fb_x64_modrm_indirect(ctx, rval, rptr);
 					break;
 				}
+				break;
+			}
+
+			// ── Memory zeroing ─────────────────────────────────
+			case FB_MEMZERO: {
+				// rep stosb: RDI=ptr, RCX=size, AL=0
+				// a=ptr, b=align (unused by rep stosb), imm=size
+				i64 size = inst->imm;
+				if (size == 0) break;
+
+				// Spill RDI, RCX, RAX if occupied
+				fb_x64_spill_reg(ctx, FB_RDI);
+				fb_x64_spill_reg(ctx, FB_RCX);
+				fb_x64_spill_reg(ctx, FB_RAX);
+
+				// Load ptr into RDI
+				fb_x64_move_value_to_reg(ctx, inst->a, FB_RDI);
+
+				// Load size into RCX
+				// mov rcx, imm
+				if (size >= INT32_MIN && size <= INT32_MAX) {
+					fb_x64_mov_ri32(ctx, FB_RCX, cast(i32)size);
+				} else {
+					fb_x64_mov_ri64(ctx, FB_RCX, size);
+				}
+
+				// xor eax, eax (AL=0)
+				fb_x64_rex_if_needed(ctx, false, FB_RAX, 0, FB_RAX);
+				fb_low_emit_byte(ctx, 0x31);
+				fb_x64_modrm(ctx, 0x03, FB_RAX, FB_RAX);
+
+				// rep stosb: F3 AA
+				fb_low_emit_byte(ctx, 0xF3);
+				fb_low_emit_byte(ctx, 0xAA);
+
+				// Mark RDI, RCX, RAX as clobbered
+				ctx->gp[FB_RDI].vreg = FB_NOREG;
+				ctx->gp[FB_RDI].dirty = false;
+				ctx->gp[FB_RCX].vreg = FB_NOREG;
+				ctx->gp[FB_RCX].dirty = false;
+				ctx->gp[FB_RAX].vreg = FB_NOREG;
+				ctx->gp[FB_RAX].dirty = false;
 				break;
 			}
 
@@ -1167,6 +1247,112 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 			case FB_DEBUGBREAK:
 				fb_low_emit_byte(ctx, 0xCC);
 				break;
+
+			case FB_UNDEF: {
+				// Uninitialized value: just allocate a register, leave it uninitialized
+				if (inst->r != FB_NOREG) {
+					fb_x64_alloc_gp(ctx, inst->r, 0);
+				}
+				break;
+			}
+
+			case FB_BITCAST: {
+				// Reinterpret between same-sized types: just move if needed
+				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
+				if (rd != ra) fb_x64_mov_rr(ctx, rd, ra);
+				break;
+			}
+
+			case FB_ZEXT: {
+				// Zero-extend: source type stored in inst->imm as packed fbType
+				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
+				fbTypeKind src_tk = cast(fbTypeKind)(inst->imm & 0xFF);
+
+				switch (src_tk) {
+				case FBT_I1:
+				case FBT_I8:
+					// movzx r32, r/m8: 0F B6 modrm (32-bit result zero-extends to 64)
+					fb_x64_rex_if_needed(ctx, false, rd, 0, ra);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xB6);
+					fb_x64_modrm(ctx, 0x03, rd, ra);
+					break;
+				case FBT_I16:
+					// movzx r32, r/m16: 0F B7 modrm
+					fb_x64_rex_if_needed(ctx, false, rd, 0, ra);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xB7);
+					fb_x64_modrm(ctx, 0x03, rd, ra);
+					break;
+				case FBT_I32:
+					// mov r32, r32: implicit zero-extend to 64 (clears upper 32 bits)
+					fb_x64_rex_if_needed(ctx, false, rd, 0, ra);
+					fb_low_emit_byte(ctx, 0x8B);
+					fb_x64_modrm(ctx, 0x03, rd, ra);
+					break;
+				default:
+					// Already 64-bit or ptr, no-op (just move if needed)
+					if (rd != ra) fb_x64_mov_rr(ctx, rd, ra);
+					break;
+				}
+				break;
+			}
+
+			case FB_SEXT: {
+				// Sign-extend: source type stored in inst->imm as packed fbType
+				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
+				fbTypeKind src_tk = cast(fbTypeKind)(inst->imm & 0xFF);
+
+				switch (src_tk) {
+				case FBT_I1:
+				case FBT_I8:
+					// movsx r64, r/m8: REX.W 0F BE modrm
+					fb_x64_rex(ctx, true, rd, 0, ra);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xBE);
+					fb_x64_modrm(ctx, 0x03, rd, ra);
+					break;
+				case FBT_I16:
+					// movsx r64, r/m16: REX.W 0F BF modrm
+					fb_x64_rex(ctx, true, rd, 0, ra);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xBF);
+					fb_x64_modrm(ctx, 0x03, rd, ra);
+					break;
+				case FBT_I32:
+					// movsxd r64, r/m32: REX.W 63 modrm
+					fb_x64_rex(ctx, true, rd, 0, ra);
+					fb_low_emit_byte(ctx, 0x63);
+					fb_x64_modrm(ctx, 0x03, rd, ra);
+					break;
+				default:
+					// Already 64-bit, no-op
+					if (rd != ra) fb_x64_mov_rr(ctx, rd, ra);
+					break;
+				}
+				break;
+			}
+
+			case FB_TRUNC: {
+				// Truncate: no-op at machine level (value is already in register,
+				// subsequent ops use the smaller operand size based on their own type)
+				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
+				if (rd != ra) fb_x64_mov_rr(ctx, rd, ra);
+				break;
+			}
+
+			case FB_PTR2INT:
+			case FB_INT2PTR: {
+				// On x64, pointers and integers are the same width — trivial mov
+				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
+				if (rd != ra) fb_x64_mov_rr(ctx, rd, ra);
+				break;
+			}
 
 			default:
 				// Unimplemented opcode — emit ud2 as trap
