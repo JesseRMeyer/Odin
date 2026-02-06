@@ -1,5 +1,9 @@
 // Fast Backend — x86-64 instruction lowering
 
+// ───────────────────────────────────────────────────────────────────────
+// Code emission primitives
+// ───────────────────────────────────────────────────────────────────────
+
 gb_internal void fb_low_emit_byte(fbLowCtx *ctx, u8 byte) {
 	if (ctx->code_count >= ctx->code_cap) {
 		u32 new_cap = ctx->code_cap * 2;
@@ -16,14 +20,475 @@ gb_internal void fb_low_emit_bytes(fbLowCtx *ctx, u8 const *bytes, u32 count) {
 	}
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// x86-64 encoding helpers
+// ───────────────────────────────────────────────────────────────────────
+
+// Caller-saved GP registers available for allocation (excludes RSP, RBP)
+gb_global fbX64Reg const fb_x64_gp_alloc_order[] = {
+	FB_RAX, FB_RCX, FB_RDX, FB_RSI, FB_RDI,
+	FB_R8, FB_R9, FB_R10, FB_R11,
+};
+gb_global u32 const FB_X64_GP_ALLOC_COUNT = gb_count_of(fb_x64_gp_alloc_order);
+
+// REX prefix: 0100WRXB
+// W=1 for 64-bit operand size, R=high bit of reg, X=high bit of index, B=high bit of rm/base
+gb_internal void fb_x64_rex(fbLowCtx *ctx, bool w, u8 reg, u8 index, u8 rm) {
+	u8 byte = 0x40;
+	if (w)          byte |= 0x08;
+	if (reg & 0x08) byte |= 0x04;  // REX.R
+	if (index & 0x08) byte |= 0x02;  // REX.X
+	if (rm & 0x08) byte |= 0x01;  // REX.B
+	fb_low_emit_byte(ctx, byte);
+}
+
+// Emit REX only if needed (any register >= R8, or W bit needed)
+gb_internal void fb_x64_rex_if_needed(fbLowCtx *ctx, bool w, u8 reg, u8 index, u8 rm) {
+	if (w || (reg & 0x08) || (index & 0x08) || (rm & 0x08)) {
+		fb_x64_rex(ctx, w, reg, index, rm);
+	}
+}
+
+// ModRM byte: mod(2) | reg(3) | rm(3)
+gb_internal void fb_x64_modrm(fbLowCtx *ctx, u8 mod, u8 reg, u8 rm) {
+	fb_low_emit_byte(ctx, cast(u8)((mod << 6) | ((reg & 7) << 3) | (rm & 7)));
+}
+
+// SIB byte: scale(2) | index(3) | base(3)
+gb_internal void fb_x64_sib(fbLowCtx *ctx, u8 scale, u8 index, u8 base) {
+	fb_low_emit_byte(ctx, cast(u8)((scale << 6) | ((index & 7) << 3) | (base & 7)));
+}
+
+gb_internal void fb_x64_imm8(fbLowCtx *ctx, i8 val) {
+	fb_low_emit_byte(ctx, cast(u8)val);
+}
+
+gb_internal void fb_x64_imm32(fbLowCtx *ctx, i32 val) {
+	fb_low_emit_byte(ctx, cast(u8)(val & 0xFF));
+	fb_low_emit_byte(ctx, cast(u8)((val >> 8) & 0xFF));
+	fb_low_emit_byte(ctx, cast(u8)((val >> 16) & 0xFF));
+	fb_low_emit_byte(ctx, cast(u8)((val >> 24) & 0xFF));
+}
+
+gb_internal void fb_x64_imm64(fbLowCtx *ctx, i64 val) {
+	for (int i = 0; i < 8; i++) {
+		fb_low_emit_byte(ctx, cast(u8)((val >> (i * 8)) & 0xFF));
+	}
+}
+
+// Encode [rbp + disp32] addressing (mod=10, rm=5)
+gb_internal void fb_x64_modrm_rbp_disp32(fbLowCtx *ctx, u8 reg, i32 disp) {
+	fb_x64_modrm(ctx, 0x02, reg, FB_RBP);
+	fb_x64_imm32(ctx, disp);
+}
+
+// Encode [reg] indirect addressing with special-case handling for RBP and RSP.
+// RBP in mod=00 rm=5 means [RIP+disp32], so we use mod=01 with disp8=0.
+// RSP in rm=4 means "SIB follows", so we emit SIB(0, RSP, RSP).
+gb_internal void fb_x64_modrm_indirect(fbLowCtx *ctx, u8 reg, u8 base) {
+	if ((base & 7) == FB_RBP) {
+		// [RBP] -> mod=01, rm=5, disp8=0
+		fb_x64_modrm(ctx, 0x01, reg, base);
+		fb_x64_imm8(ctx, 0);
+	} else if ((base & 7) == FB_RSP) {
+		// [RSP] -> mod=00, rm=4, SIB(0, 4, 4)
+		fb_x64_modrm(ctx, 0x00, reg, base);
+		fb_x64_sib(ctx, 0, FB_RSP, FB_RSP);
+	} else {
+		fb_x64_modrm(ctx, 0x00, reg, base);
+	}
+}
+
+// MOV reg, reg (64-bit)
+gb_internal void fb_x64_mov_rr(fbLowCtx *ctx, fbX64Reg dst, fbX64Reg src) {
+	fb_x64_rex(ctx, true, src, 0, dst);
+	fb_low_emit_byte(ctx, 0x89);
+	fb_x64_modrm(ctx, 0x03, src, dst);
+}
+
+// MOV reg, imm32 (sign-extended to 64-bit): REX.W C7 /0 imm32
+gb_internal void fb_x64_mov_ri32(fbLowCtx *ctx, fbX64Reg dst, i32 val) {
+	fb_x64_rex(ctx, true, 0, 0, dst);
+	fb_low_emit_byte(ctx, 0xC7);
+	fb_x64_modrm(ctx, 0x03, 0, dst);
+	fb_x64_imm32(ctx, val);
+}
+
+// MOV reg, imm64 (movabs): REX.W B8+rd imm64
+gb_internal void fb_x64_mov_ri64(fbLowCtx *ctx, fbX64Reg dst, i64 val) {
+	fb_x64_rex(ctx, true, 0, 0, dst);
+	fb_low_emit_byte(ctx, cast(u8)(0xB8 + (dst & 7)));
+	fb_x64_imm64(ctx, val);
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Register allocator
+// ───────────────────────────────────────────────────────────────────────
+
+gb_internal void fb_x64_reset_regs(fbLowCtx *ctx) {
+	for (int i = 0; i < 16; i++) {
+		ctx->gp[i].vreg     = FB_NOREG;
+		ctx->gp[i].last_use = 0;
+		ctx->gp[i].dirty    = false;
+	}
+}
+
+gb_internal void fb_x64_init_value_loc(fbLowCtx *ctx) {
+	u32 count = ctx->proc->next_value;
+	ctx->value_loc_count = count;
+	if (count > 0) {
+		ctx->value_loc = gb_alloc_array(heap_allocator(), i32, count);
+		for (u32 i = 0; i < count; i++) {
+			ctx->value_loc[i] = FB_LOC_NONE;
+		}
+	}
+}
+
+// Compute spill offset for value vreg: [rbp - slot_area - (vreg+1)*8]
+gb_internal i32 fb_x64_spill_offset(fbLowCtx *ctx, u32 vreg) {
+	return -cast(i32)ctx->frame.slot_area_size - cast(i32)((vreg + 1) * 8);
+}
+
+// Find the least-recently-used register among the allocatable set, skipping masked registers
+gb_internal fbX64Reg fb_x64_find_lru(fbLowCtx *ctx, u16 exclude_mask) {
+	u32 best_use = UINT32_MAX;
+	fbX64Reg best = FB_X64_REG_NONE;
+	for (u32 i = 0; i < FB_X64_GP_ALLOC_COUNT; i++) {
+		fbX64Reg r = fb_x64_gp_alloc_order[i];
+		if ((exclude_mask >> r) & 1) continue;
+		if (ctx->gp[r].vreg == FB_NOREG) continue;
+		if (ctx->gp[r].last_use < best_use) {
+			best_use = ctx->gp[r].last_use;
+			best = r;
+		}
+	}
+	GB_ASSERT(best != FB_X64_REG_NONE);
+	return best;
+}
+
+// Spill a register to its spill slot: mov [rbp+offset], reg
+gb_internal void fb_x64_spill_reg(fbLowCtx *ctx, fbX64Reg reg) {
+	u32 vreg = ctx->gp[reg].vreg;
+	if (vreg == FB_NOREG) return;
+	i32 offset = fb_x64_spill_offset(ctx, vreg);
+	if (ctx->gp[reg].dirty) {
+		// mov [rbp+disp32], reg (64-bit)
+		fb_x64_rex(ctx, true, reg, 0, FB_RBP);
+		fb_low_emit_byte(ctx, 0x89);
+		fb_x64_modrm_rbp_disp32(ctx, reg, offset);
+		ctx->gp[reg].dirty = false;
+	}
+	ctx->value_loc[vreg] = offset;
+	ctx->gp[reg].vreg = FB_NOREG;
+}
+
+// Allocate a GP register for vreg. Finds free or evicts LRU.
+// exclude_mask: bitmask of registers to not allocate (one bit per hardware register)
+gb_internal fbX64Reg fb_x64_alloc_gp(fbLowCtx *ctx, u32 vreg, u16 exclude_mask) {
+	// First: try to find a free register
+	for (u32 i = 0; i < FB_X64_GP_ALLOC_COUNT; i++) {
+		fbX64Reg r = fb_x64_gp_alloc_order[i];
+		if ((exclude_mask >> r) & 1) continue;
+		if (ctx->gp[r].vreg == FB_NOREG) {
+			ctx->gp[r].vreg     = vreg;
+			ctx->gp[r].last_use = ctx->current_inst_idx;
+			ctx->gp[r].dirty    = true;
+			if (vreg != FB_NOREG) {
+				ctx->value_loc[vreg] = cast(i32)r;
+			}
+			return r;
+		}
+	}
+	// Evict LRU (find_lru already respects the mask)
+	fbX64Reg victim = fb_x64_find_lru(ctx, exclude_mask);
+	fb_x64_spill_reg(ctx, victim);
+	ctx->gp[victim].vreg     = vreg;
+	ctx->gp[victim].last_use = ctx->current_inst_idx;
+	ctx->gp[victim].dirty    = true;
+	if (vreg != FB_NOREG) {
+		ctx->value_loc[vreg] = cast(i32)victim;
+	}
+	return victim;
+}
+
+// Resolve a value into a GP register. If already in a register, return it.
+// If spilled, reload it. If not yet materialized, allocate fresh.
+// exclude_mask: bitmask of registers to avoid when allocating (ignored if value already in a register)
+gb_internal fbX64Reg fb_x64_resolve_gp(fbLowCtx *ctx, u32 vreg, u16 exclude_mask) {
+	GB_ASSERT(vreg < ctx->value_loc_count);
+	i32 loc = ctx->value_loc[vreg];
+
+	// Already in a register?
+	if (loc >= 0 && loc < 16) {
+		fbX64Reg r = cast(fbX64Reg)loc;
+		GB_ASSERT(ctx->gp[r].vreg == vreg);
+		ctx->gp[r].last_use = ctx->current_inst_idx;
+		return r;
+	}
+
+	// Spilled or not yet materialized — allocate and reload
+	fbX64Reg r = fb_x64_alloc_gp(ctx, vreg, exclude_mask);
+	if (loc != FB_LOC_NONE) {
+		// Reload from spill slot: mov reg, [rbp+disp32]
+		fb_x64_rex(ctx, true, r, 0, FB_RBP);
+		fb_low_emit_byte(ctx, 0x8B);
+		fb_x64_modrm_rbp_disp32(ctx, r, loc);
+		ctx->gp[r].dirty = false; // just loaded, matches memory
+	}
+	return r;
+}
+
+// Move an IR value into a specific physical register.
+// Handles spilling the current occupant, moving from another register, or reloading from stack.
+gb_internal void fb_x64_move_value_to_reg(fbLowCtx *ctx, u32 vreg, fbX64Reg target) {
+	GB_ASSERT(vreg < ctx->value_loc_count);
+	i32 loc = ctx->value_loc[vreg];
+
+	// Already in the target register — nothing to do
+	if (loc == cast(i32)target) {
+		GB_ASSERT(ctx->gp[target].vreg == vreg);
+		ctx->gp[target].last_use = ctx->current_inst_idx;
+		return;
+	}
+
+	// Spill target if occupied by a different value
+	if (ctx->gp[target].vreg != FB_NOREG && ctx->gp[target].vreg != vreg) {
+		fb_x64_spill_reg(ctx, target);
+	}
+
+	if (loc >= 0 && loc < 16) {
+		// Value is in another register — mov target, src
+		fbX64Reg src = cast(fbX64Reg)loc;
+		fb_x64_mov_rr(ctx, target, src);
+		ctx->gp[src].vreg = FB_NOREG;
+	} else if (loc != FB_LOC_NONE) {
+		// Value is on the stack — reload
+		fb_x64_rex(ctx, true, target, 0, FB_RBP);
+		fb_low_emit_byte(ctx, 0x8B);
+		fb_x64_modrm_rbp_disp32(ctx, target, loc);
+	}
+
+	ctx->gp[target].vreg     = vreg;
+	ctx->gp[target].last_use = ctx->current_inst_idx;
+	ctx->gp[target].dirty    = (loc >= 0 && loc < 16); // dirty if moved from reg, clean if reloaded
+	ctx->value_loc[vreg]     = cast(i32)target;
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Stack frame layout
+// ───────────────────────────────────────────────────────────────────────
+
+gb_internal void fb_x64_compute_frame(fbLowCtx *ctx) {
+	fbProc *p = ctx->proc;
+
+	// Sort slots by alignment descending via index array (preserves slot indices for ALLOCA)
+	u32 *order = nullptr;
+	if (p->slot_count > 0) {
+		order = gb_alloc_array(heap_allocator(), u32, p->slot_count);
+		for (u32 i = 0; i < p->slot_count; i++) order[i] = i;
+		// Insertion sort on order[], comparing alignment descending
+		for (u32 i = 1; i < p->slot_count; i++) {
+			u32 tmp = order[i];
+			u32 j = i;
+			while (j > 0 && p->slots[order[j-1]].align < p->slots[tmp].align) {
+				order[j] = order[j-1];
+				j--;
+			}
+			order[j] = tmp;
+		}
+	}
+
+	// Assign negative offsets from RBP in sorted order
+	i32 offset = 0;
+	for (u32 i = 0; i < p->slot_count; i++) {
+		fbStackSlot *s = &p->slots[order[i]];
+		i32 align = cast(i32)s->align;
+		if (align < 1) align = 1;
+		offset += cast(i32)s->size;
+		// Round up to alignment
+		offset = (offset + align - 1) & ~(align - 1);
+		s->frame_offset = -offset;
+	}
+	ctx->frame.slot_area_size = cast(u32)offset;
+
+	if (order) gb_free(heap_allocator(), order);
+
+	// Spill area: next_value * 8 bytes below slot area
+	u32 spill_bytes = p->next_value * 8;
+
+	// Total = slot_area + spill_area, aligned to 16
+	u32 total = ctx->frame.slot_area_size + spill_bytes;
+	total = (total + 15) & ~15u;
+	ctx->frame.total_frame_size = total;
+}
+
+// Prologue: push rbp / mov rbp, rsp / sub rsp, N
+gb_internal void fb_x64_emit_prologue(fbLowCtx *ctx) {
+	// push rbp
+	fb_low_emit_byte(ctx, 0x55);
+	// mov rbp, rsp
+	fb_x64_rex(ctx, true, FB_RSP, 0, FB_RBP);
+	fb_low_emit_byte(ctx, 0x89);
+	fb_x64_modrm(ctx, 0x03, FB_RSP, FB_RBP);
+
+	if (ctx->frame.total_frame_size > 0) {
+		i32 frame_size = cast(i32)ctx->frame.total_frame_size;
+		fb_x64_rex(ctx, true, 0, 0, FB_RSP);
+		if (frame_size <= 127) {
+			// sub rsp, imm8 (4 bytes)
+			fb_low_emit_byte(ctx, 0x83);
+			fb_x64_modrm(ctx, 0x03, 5, FB_RSP); // /5 = SUB
+			fb_x64_imm8(ctx, cast(i8)frame_size);
+		} else {
+			// sub rsp, imm32 (7 bytes)
+			fb_low_emit_byte(ctx, 0x81);
+			fb_x64_modrm(ctx, 0x03, 5, FB_RSP); // /5 = SUB
+			fb_x64_imm32(ctx, frame_size);
+		}
+	}
+}
+
+// Epilogue: mov rsp, rbp / pop rbp / ret
+gb_internal void fb_x64_emit_epilogue(fbLowCtx *ctx) {
+	// mov rsp, rbp
+	fb_x64_rex(ctx, true, FB_RBP, 0, FB_RSP);
+	fb_low_emit_byte(ctx, 0x89);
+	fb_x64_modrm(ctx, 0x03, FB_RBP, FB_RSP);
+	// pop rbp
+	fb_low_emit_byte(ctx, 0x5D);
+	// ret
+	fb_low_emit_byte(ctx, 0xC3);
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// ALU helper: two-operand pattern (mov rd,ra / OP rd,rb)
+// opcode is the primary opcode byte for the reg,reg form (e.g., 0x01 for ADD)
+// ───────────────────────────────────────────────────────────────────────
+
+gb_internal void fb_x64_alu_rr(fbLowCtx *ctx, fbInst *inst, u8 opcode) {
+	fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+	fbX64Reg rb = fb_x64_resolve_gp(ctx, inst->b, (1u << ra));
+	fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, cast(u16)((1u << ra) | (1u << rb)));
+	if (rd != ra) {
+		fb_x64_mov_rr(ctx, rd, ra);
+	}
+	// OP rd, rb (REX.W opcode modrm)
+	fb_x64_rex(ctx, true, rb, 0, rd);
+	fb_low_emit_byte(ctx, opcode);
+	fb_x64_modrm(ctx, 0x03, rb, rd);
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Shift helper: saves/restores RCX, uses CL as shift amount
+// ext is the /r field: 4=SHL, 5=SHR, 7=SAR, 0=ROL, 1=ROR
+// ───────────────────────────────────────────────────────────────────────
+
+gb_internal void fb_x64_shift_cl(fbLowCtx *ctx, fbInst *inst, u8 ext) {
+	fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+	fbX64Reg rb = fb_x64_resolve_gp(ctx, inst->b, (1u << ra));
+
+	// Move shift amount into RCX (handles spill, move, and tracking)
+	fb_x64_move_value_to_reg(ctx, inst->b, FB_RCX);
+
+	// Allocate dest, excluding both ra and RCX
+	fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, cast(u16)((1u << ra) | (1u << FB_RCX)));
+	if (rd != ra) {
+		fb_x64_mov_rr(ctx, rd, ra);
+	}
+
+	// SHL/SHR/SAR/ROL/ROR rd, cl: REX.W D3 /ext
+	fb_x64_rex(ctx, true, ext, 0, rd);
+	fb_low_emit_byte(ctx, 0xD3);
+	fb_x64_modrm(ctx, 0x03, ext, rd);
+
+	// Mark RCX as free (shift amount consumed)
+	ctx->gp[FB_RCX].vreg = FB_NOREG;
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Division helper: uses RAX:RDX pair
+// is_signed: true for IDIV/CQO, false for DIV/XOR RDX
+// want_remainder: true for MOD (result in RDX), false for DIV (result in RAX)
+// ───────────────────────────────────────────────────────────────────────
+
+gb_internal void fb_x64_div(fbLowCtx *ctx, fbInst *inst, bool is_signed, bool want_remainder) {
+	u16 rax_rdx_mask = cast(u16)((1u << FB_RAX) | (1u << FB_RDX));
+
+	// Resolve divisor first, avoiding RAX/RDX
+	fbX64Reg rb = fb_x64_resolve_gp(ctx, inst->b, 0);
+
+	// If divisor landed in RAX or RDX, move it to a safe register
+	if (rb == FB_RAX || rb == FB_RDX) {
+		fbX64Reg safe = fb_x64_alloc_gp(ctx, FB_NOREG, rax_rdx_mask);
+		fb_x64_mov_rr(ctx, safe, rb);
+		ctx->gp[rb].vreg = FB_NOREG;
+		ctx->gp[safe].vreg = inst->b;
+		ctx->gp[safe].last_use = ctx->current_inst_idx;
+		ctx->gp[safe].dirty = true;
+		ctx->value_loc[inst->b] = cast(i32)safe;
+		rb = safe;
+	}
+
+	// Now safe to spill RAX and RDX (divisor is elsewhere)
+	fb_x64_spill_reg(ctx, FB_RAX);
+	fb_x64_spill_reg(ctx, FB_RDX);
+
+	// Move dividend into RAX
+	fb_x64_move_value_to_reg(ctx, inst->a, FB_RAX);
+
+	// Sign/zero extend into RDX
+	if (is_signed) {
+		// CQO: sign-extend RAX into RDX:RAX
+		fb_x64_rex(ctx, true, 0, 0, 0);
+		fb_low_emit_byte(ctx, 0x99);
+	} else {
+		// xor edx, edx (2 bytes, zero-extends to 64, dependency-breaking)
+		fb_x64_rex_if_needed(ctx, false, FB_RDX, 0, FB_RDX);
+		fb_low_emit_byte(ctx, 0x31);
+		fb_x64_modrm(ctx, 0x03, FB_RDX, FB_RDX);
+	}
+	ctx->gp[FB_RDX].vreg = FB_NOREG; // RDX is now part of dividend, not a user value
+
+	// IDIV/DIV rb: REX.W F7 /7 (IDIV) or /6 (DIV)
+	u8 ext = is_signed ? 7 : 6;
+	fb_x64_rex(ctx, true, ext, 0, rb);
+	fb_low_emit_byte(ctx, 0xF7);
+	fb_x64_modrm(ctx, 0x03, ext, rb);
+
+	// Result is in RAX (quotient) or RDX (remainder)
+	fbX64Reg result_reg = want_remainder ? FB_RDX : FB_RAX;
+	fbX64Reg other_reg  = want_remainder ? FB_RAX : FB_RDX;
+
+	// The non-result register is now dead
+	ctx->gp[other_reg].vreg = FB_NOREG;
+	ctx->gp[other_reg].dirty = false;
+	// RAX no longer holds the dividend
+	if (ctx->value_loc[inst->a] == cast(i32)FB_RAX) {
+		ctx->value_loc[inst->a] = fb_x64_spill_offset(ctx, inst->a);
+	}
+
+	// Assign result
+	ctx->gp[result_reg].vreg = inst->r;
+	ctx->gp[result_reg].last_use = ctx->current_inst_idx;
+	ctx->gp[result_reg].dirty = true;
+	ctx->value_loc[inst->r] = cast(i32)result_reg;
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Procedure lowering
+// ───────────────────────────────────────────────────────────────────────
+
 gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 	fbProc *p = ctx->proc;
 
-	// Prologue: push rbp; mov rbp, rsp
-	fb_low_emit_byte(ctx, 0x55);       // push rbp
-	fb_low_emit_byte(ctx, 0x48);       // REX.W
-	fb_low_emit_byte(ctx, 0x89);       // mov
-	fb_low_emit_byte(ctx, 0xE5);       // rbp <- rsp
+	// Initialize value tracking
+	fb_x64_init_value_loc(ctx);
+
+	// Compute stack frame layout
+	fb_x64_compute_frame(ctx);
+
+	// Emit prologue
+	fb_x64_emit_prologue(ctx);
 
 	// Lower each block
 	for (u32 bi = 0; bi < p->block_count; bi++) {
@@ -31,27 +496,275 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 			ctx->block_offsets[bi] = ctx->code_count;
 		}
 
+		// Reset register state at block start
+		fb_x64_reset_regs(ctx);
+
 		fbBlock *blk = &p->blocks[bi];
 		for (u32 ii = 0; ii < blk->inst_count; ii++) {
-			fbInst *inst = &p->insts[blk->first_inst + ii];
+			ctx->current_inst_idx = blk->first_inst + ii;
+			fbInst *inst = &p->insts[ctx->current_inst_idx];
+
 			switch (cast(fbOp)inst->op) {
+
+			// ── Constants ──────────────────────────────────────
+			case FB_ICONST: {
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, 0);
+				i64 val = inst->imm;
+				if (val == 0) {
+					// xor rd, rd (32-bit clears upper 32)
+					fb_x64_rex_if_needed(ctx, false, rd, 0, rd);
+					fb_low_emit_byte(ctx, 0x31);
+					fb_x64_modrm(ctx, 0x03, rd, rd);
+				} else if (val >= INT32_MIN && val <= INT32_MAX) {
+					fb_x64_mov_ri32(ctx, rd, cast(i32)val);
+				} else if (val >= 0 && val <= cast(i64)UINT32_MAX) {
+					// mov r32, imm32 (5 bytes, zero-extends to 64)
+					fb_x64_rex_if_needed(ctx, false, 0, 0, rd);
+					fb_low_emit_byte(ctx, cast(u8)(0xB8 + (rd & 7)));
+					fb_x64_imm32(ctx, cast(i32)val);
+				} else {
+					fb_x64_mov_ri64(ctx, rd, val);
+				}
+				break;
+			}
+
+			// ── Stack allocation ───────────────────────────────
+			case FB_ALLOCA: {
+				u32 slot_idx = cast(u32)inst->a;
+				GB_ASSERT(slot_idx < p->slot_count);
+				i32 frame_off = p->slots[slot_idx].frame_offset;
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, 0);
+				// lea rd, [rbp + frame_offset]
+				fb_x64_rex(ctx, true, rd, 0, FB_RBP);
+				fb_low_emit_byte(ctx, 0x8D);
+				fb_x64_modrm_rbp_disp32(ctx, rd, frame_off);
+				break;
+			}
+
+			// ── Memory ─────────────────────────────────────────
+			case FB_LOAD: {
+				fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << rptr));
+				fbTypeKind tk = cast(fbTypeKind)(inst->type_raw & 0xFF);
+
+				switch (tk) {
+				case FBT_I8:
+				case FBT_I1:
+					// movzx r32, byte [rptr]: 0F B6 modrm (32-bit dest zero-extends to 64)
+					fb_x64_rex_if_needed(ctx, false, rd, 0, rptr);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xB6);
+					fb_x64_modrm_indirect(ctx, rd, rptr);
+					break;
+				case FBT_I16:
+					// movzx r32, word [rptr]: 0F B7 modrm (32-bit dest zero-extends to 64)
+					fb_x64_rex_if_needed(ctx, false, rd, 0, rptr);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xB7);
+					fb_x64_modrm_indirect(ctx, rd, rptr);
+					break;
+				case FBT_I32:
+					// mov rd(32), [rptr]: 8B modrm (zero-extends to 64)
+					fb_x64_rex_if_needed(ctx, false, rd, 0, rptr);
+					fb_low_emit_byte(ctx, 0x8B);
+					fb_x64_modrm_indirect(ctx, rd, rptr);
+					break;
+				default: // I64, PTR
+					// mov rd, [rptr]: REX.W 8B modrm
+					fb_x64_rex(ctx, true, rd, 0, rptr);
+					fb_low_emit_byte(ctx, 0x8B);
+					fb_x64_modrm_indirect(ctx, rd, rptr);
+					break;
+				}
+				break;
+			}
+
+			case FB_STORE: {
+				fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rval = fb_x64_resolve_gp(ctx, inst->b, (1u << rptr));
+				fbTypeKind tk = cast(fbTypeKind)(inst->type_raw & 0xFF);
+
+				switch (tk) {
+				case FBT_I8:
+				case FBT_I1:
+					// mov byte [rptr], rval(8): REX 88 modrm
+					// Always emit REX to access SIL/DIL/SPL/BPL
+					fb_x64_rex(ctx, false, rval, 0, rptr);
+					fb_low_emit_byte(ctx, 0x88);
+					fb_x64_modrm_indirect(ctx, rval, rptr);
+					break;
+				case FBT_I16:
+					// mov word [rptr], rval(16): 66 REX 89 modrm
+					fb_low_emit_byte(ctx, 0x66);
+					fb_x64_rex_if_needed(ctx, false, rval, 0, rptr);
+					fb_low_emit_byte(ctx, 0x89);
+					fb_x64_modrm_indirect(ctx, rval, rptr);
+					break;
+				case FBT_I32:
+					// mov dword [rptr], rval(32): 89 modrm
+					fb_x64_rex_if_needed(ctx, false, rval, 0, rptr);
+					fb_low_emit_byte(ctx, 0x89);
+					fb_x64_modrm_indirect(ctx, rval, rptr);
+					break;
+				default: // I64, PTR
+					// mov qword [rptr], rval: REX.W 89 modrm
+					fb_x64_rex(ctx, true, rval, 0, rptr);
+					fb_low_emit_byte(ctx, 0x89);
+					fb_x64_modrm_indirect(ctx, rval, rptr);
+					break;
+				}
+				break;
+			}
+
+			// ── Pointer arithmetic ─────────────────────────────
+			case FB_MEMBER: {
+				i64 offset = inst->imm;
+				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
+				if (offset == 0) {
+					if (rd != ra) {
+						fb_x64_mov_rr(ctx, rd, ra);
+					}
+				} else if (offset >= INT32_MIN && offset <= INT32_MAX) {
+					// lea rd, [ra + disp32]
+					fb_x64_rex(ctx, true, rd, 0, ra);
+					fb_low_emit_byte(ctx, 0x8D);
+					if ((ra & 7) == FB_RSP) {
+						// RSP as base needs SIB
+						fb_x64_modrm(ctx, 0x02, rd, 0x04);
+						fb_x64_sib(ctx, 0, FB_RSP, FB_RSP);
+					} else {
+						fb_x64_modrm(ctx, 0x02, rd, ra);
+					}
+					fb_x64_imm32(ctx, cast(i32)offset);
+				} else {
+					// Large offset: mov tmp, imm64; add rd, tmp
+					fbX64Reg tmp = fb_x64_alloc_gp(ctx, FB_NOREG, cast(u16)((1u << ra) | (1u << rd)));
+					fb_x64_mov_ri64(ctx, tmp, offset);
+					if (rd != ra) fb_x64_mov_rr(ctx, rd, ra);
+					fb_x64_rex(ctx, true, tmp, 0, rd);
+					fb_low_emit_byte(ctx, 0x01);
+					fb_x64_modrm(ctx, 0x03, tmp, rd);
+					// Free temp
+					ctx->gp[tmp].vreg = FB_NOREG;
+				}
+				break;
+			}
+
+			case FB_ARRAY: {
+				fbX64Reg rbase = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg ridx = fb_x64_resolve_gp(ctx, inst->b, (1u << rbase));
+				i64 stride = inst->imm;
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, cast(u16)((1u << rbase) | (1u << ridx)));
+
+				// Check if stride is a power of 2 that fits in SIB scale (1,2,4,8)
+				u8 scale_bits = 0xFF;
+				if (stride == 1) scale_bits = 0;
+				else if (stride == 2) scale_bits = 1;
+				else if (stride == 4) scale_bits = 2;
+				else if (stride == 8) scale_bits = 3;
+
+				if (scale_bits != 0xFF && (ridx & 7) != FB_RSP) {
+					// lea rd, [rbase + ridx*scale]
+					fb_x64_rex(ctx, true, rd, ridx, rbase);
+					fb_low_emit_byte(ctx, 0x8D);
+					if ((rbase & 7) == FB_RBP) {
+						// RBP base needs mod=01 disp8=0
+						fb_x64_modrm(ctx, 0x01, rd, 0x04);
+						fb_x64_sib(ctx, scale_bits, ridx, rbase);
+						fb_x64_imm8(ctx, 0);
+					} else {
+						fb_x64_modrm(ctx, 0x00, rd, 0x04);
+						fb_x64_sib(ctx, scale_bits, ridx, rbase);
+					}
+				} else {
+					// General case: imul tmp, ridx, stride; lea rd, [rbase + tmp]
+					fbX64Reg tmp = fb_x64_alloc_gp(ctx, FB_NOREG, cast(u16)((1u << rbase) | (1u << ridx) | (1u << rd)));
+					// imul tmp, ridx, imm32
+					fb_x64_rex(ctx, true, tmp, 0, ridx);
+					fb_low_emit_byte(ctx, 0x69);
+					fb_x64_modrm(ctx, 0x03, tmp, ridx);
+					fb_x64_imm32(ctx, cast(i32)stride);
+
+					// lea rd, [rbase + tmp] via add
+					if (rd != rbase) fb_x64_mov_rr(ctx, rd, rbase);
+					fb_x64_rex(ctx, true, tmp, 0, rd);
+					fb_low_emit_byte(ctx, 0x01);
+					fb_x64_modrm(ctx, 0x03, tmp, rd);
+
+					ctx->gp[tmp].vreg = FB_NOREG;
+				}
+				break;
+			}
+
+			// ── Integer arithmetic ─────────────────────────────
+			case FB_ADD: fb_x64_alu_rr(ctx, inst, 0x01); break; // ADD
+			case FB_SUB: fb_x64_alu_rr(ctx, inst, 0x29); break; // SUB
+			case FB_AND: fb_x64_alu_rr(ctx, inst, 0x21); break; // AND
+			case FB_OR:  fb_x64_alu_rr(ctx, inst, 0x09); break; // OR
+			case FB_XOR: fb_x64_alu_rr(ctx, inst, 0x31); break; // XOR
+
+			case FB_MUL: {
+				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rb = fb_x64_resolve_gp(ctx, inst->b, (1u << ra));
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, cast(u16)((1u << ra) | (1u << rb)));
+				if (rd != ra) fb_x64_mov_rr(ctx, rd, ra);
+				// IMUL rd, rb: REX.W 0F AF modrm
+				fb_x64_rex(ctx, true, rd, 0, rb);
+				fb_low_emit_byte(ctx, 0x0F);
+				fb_low_emit_byte(ctx, 0xAF);
+				fb_x64_modrm(ctx, 0x03, rd, rb);
+				break;
+			}
+
+			case FB_NEG: {
+				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
+				if (rd != ra) fb_x64_mov_rr(ctx, rd, ra);
+				// NEG rd: REX.W F7 /3
+				fb_x64_rex(ctx, true, 3, 0, rd);
+				fb_low_emit_byte(ctx, 0xF7);
+				fb_x64_modrm(ctx, 0x03, 3, rd);
+				break;
+			}
+
+			case FB_NOT: {
+				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
+				if (rd != ra) fb_x64_mov_rr(ctx, rd, ra);
+				// NOT rd: REX.W F7 /2
+				fb_x64_rex(ctx, true, 2, 0, rd);
+				fb_low_emit_byte(ctx, 0xF7);
+				fb_x64_modrm(ctx, 0x03, 2, rd);
+				break;
+			}
+
+			// ── Shifts & rotates ───────────────────────────────
+			case FB_SHL:  fb_x64_shift_cl(ctx, inst, 4); break;
+			case FB_LSHR: fb_x64_shift_cl(ctx, inst, 5); break;
+			case FB_ASHR: fb_x64_shift_cl(ctx, inst, 7); break;
+			case FB_ROL:  fb_x64_shift_cl(ctx, inst, 0); break;
+			case FB_ROR:  fb_x64_shift_cl(ctx, inst, 1); break;
+
+			// ── Division & modulo ──────────────────────────────
+			case FB_SDIV: fb_x64_div(ctx, inst, true,  false); break;
+			case FB_UDIV: fb_x64_div(ctx, inst, false, false); break;
+			case FB_SMOD: fb_x64_div(ctx, inst, true,  true);  break;
+			case FB_UMOD: fb_x64_div(ctx, inst, false, true);  break;
+
+			// ── Control flow ───────────────────────────────────
 			case FB_RET:
-				// Epilogue: mov rsp, rbp; pop rbp; ret
-				fb_low_emit_byte(ctx, 0x48);  // REX.W
-				fb_low_emit_byte(ctx, 0x89);  // mov
-				fb_low_emit_byte(ctx, 0xEC);  // rsp <- rbp
-				fb_low_emit_byte(ctx, 0x5D);  // pop rbp
-				fb_low_emit_byte(ctx, 0xC3);  // ret
+				fb_x64_emit_epilogue(ctx);
 				break;
 
 			case FB_UNREACHABLE:
-				fb_low_emit_byte(ctx, 0x0F);  // ud2
+				fb_low_emit_byte(ctx, 0x0F);
 				fb_low_emit_byte(ctx, 0x0B);
 				break;
 
 			case FB_TRAP:
 			case FB_DEBUGBREAK:
-				fb_low_emit_byte(ctx, 0xCC);  // int3
+				fb_low_emit_byte(ctx, 0xCC);
 				break;
 
 			default:
@@ -94,7 +807,8 @@ gb_internal void fb_lower_all(fbModule *m) {
 			gb_memmove(p->machine_code, ctx.code, ctx.code_count);
 		}
 
-		if (ctx.code)          gb_free(heap_allocator(), ctx.code);
-		if (ctx.block_offsets) gb_free(heap_allocator(), ctx.block_offsets);
+		if (ctx.code)           gb_free(heap_allocator(), ctx.code);
+		if (ctx.block_offsets)  gb_free(heap_allocator(), ctx.block_offsets);
+		if (ctx.value_loc)      gb_free(heap_allocator(), ctx.value_loc);
 	}
 }

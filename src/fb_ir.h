@@ -592,6 +592,36 @@ struct fbBuilder {
 };
 
 // ───────────────────────────────────────────────────────────────────────
+// x86-64 register enum (hardware encoding)
+// ───────────────────────────────────────────────────────────────────────
+
+enum fbX64Reg : u8 {
+	FB_RAX = 0,  FB_RCX = 1,  FB_RDX = 2,  FB_RBX = 3,
+	FB_RSP = 4,  FB_RBP = 5,  FB_RSI = 6,  FB_RDI = 7,
+	FB_R8  = 8,  FB_R9  = 9,  FB_R10 = 10, FB_R11 = 11,
+	FB_R12 = 12, FB_R13 = 13, FB_R14 = 14, FB_R15 = 15,
+	FB_X64_REG_NONE = 0xFF,
+};
+
+// ───────────────────────────────────────────────────────────────────────
+// Register allocator state
+// ───────────────────────────────────────────────────────────────────────
+
+struct fbRegState {
+	u32  vreg;      // IR value in this register (FB_NOREG if free)
+	u32  last_use;  // instruction index of last use (for LRU eviction)
+	bool dirty;     // modified since last spill?
+};
+
+struct fbStackLayout {
+	u32 total_frame_size;  // total bytes subtracted from RSP (16-aligned)
+	u32 slot_area_size;    // bytes used by stack slots
+};
+
+// Location of an IR value: positive = GP register index, negative = spilled
+enum : i32 { FB_LOC_NONE = INT32_MIN };
+
+// ───────────────────────────────────────────────────────────────────────
 // Lowering context (shared between x64/arm64)
 // ───────────────────────────────────────────────────────────────────────
 
@@ -602,6 +632,19 @@ struct fbLowCtx {
 	u32       code_count;
 	u32       code_cap;
 	u32      *block_offsets;
+
+	// x86-64 register file
+	fbRegState gp[16];
+
+	// Value tracking: indexed by IR value ID
+	i32 *value_loc;       // FB_LOC_NONE, or GP register index, or spill slot index (negative)
+	u32  value_loc_count;
+
+	// Current instruction index (for LRU tracking)
+	u32 current_inst_idx;
+
+	// Stack frame layout
+	fbStackLayout frame;
 };
 
 // ───────────────────────────────────────────────────────────────────────
@@ -625,6 +668,8 @@ gb_internal void    fb_block_start(fbProc *p, u32 block_id);
 gb_internal u32     fb_inst_emit(fbProc *p, fbOp op, fbType type,
                                  u32 a, u32 b, u32 c, u32 loc, i64 imm);
 gb_internal u32     fb_aux_push(fbProc *p, u32 val);
+gb_internal u32     fb_slot_create(fbProc *p, u32 size, u32 align,
+                                   Entity *entity, Type *odin_type);
 
 gb_internal String  fb_get_entity_name(fbModule *m, Entity *e);
 gb_internal String  fb_mangle_name(fbModule *m, Entity *e);
