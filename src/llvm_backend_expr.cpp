@@ -4284,6 +4284,12 @@ gb_internal lbValue lb_build_expr_internal(lbProcedure *p, Ast *expr) {
 			if (is_type_slice(source_type) || is_type_dynamic_array(source_type) || is_type_string(source_type)) {
 				return lb_build_slice_expr_value(p, expr);
 			}
+			// MultiPointer with high bound produces a slice — use SSA value path.
+			// Array slicing needs addressable memory (the slice points into the array),
+			// so it stays on the addr path.
+			if (source_type->kind == Type_MultiPointer && se->high != nullptr) {
+				return lb_build_slice_expr_value(p, expr);
+			}
 		}
 		return lb_addr_load(p, lb_build_addr(p, expr));
 	case_end;
@@ -4918,6 +4924,28 @@ gb_internal lbValue lb_build_slice_expr_value(lbProcedure *p, Ast *expr) {
 			: lb_emit_arith(p, Token_Sub, high, low, t_int);
 
 		return lb_make_string_value(p, t_string, elem, new_len);
+	}
+
+	case Type_MultiPointer: {
+		GB_ASSERT(se->high != nullptr);
+		Type *elem_type = type->MultiPointer.elem;
+		Type *slice_type = alloc_type_slice(elem_type);
+
+		low = lb_emit_conv(p, low, t_int);
+		high = lb_emit_conv(p, high, t_int);
+
+		lb_emit_multi_pointer_slice_bounds_check(p, se->open, low, high);
+
+		LLVMValueRef indices[1] = {low.value};
+		lbValue ptr = {};
+		ptr.value = LLVMBuildGEP2(p->builder, lb_type(p->module, elem_type), base.value, indices, 1, "");
+		ptr.type = alloc_type_pointer(elem_type);
+
+		lbValue new_len = (se->low == nullptr)
+			? lb_emit_conv(p, high, t_int)
+			: lb_emit_arith(p, Token_Sub, high, low, t_int);
+
+		return lb_make_slice_value(p, slice_type, ptr, new_len);
 	}
 
 	default:
