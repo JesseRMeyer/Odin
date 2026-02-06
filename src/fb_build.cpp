@@ -41,4 +41,35 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 
 		array_add(&m->procs, p);
 	}
+
+	// Generate __$startup_runtime and __$cleanup_runtime stubs.
+	// The runtime declares these as foreign (signatures only), but every backend
+	// must synthesize implementations. For Phase 2 the bodies are just `ret`.
+	for_array(i, m->procs) {
+		fbProc *p = m->procs[i];
+		if (!p->is_foreign) continue;
+
+		bool is_startup = str_eq(p->name, str_lit("__$startup_runtime"));
+		bool is_cleanup = str_eq(p->name, str_lit("__$cleanup_runtime"));
+		if (!is_startup && !is_cleanup) continue;
+
+		// Convert from foreign declaration to defined stub with global visibility
+		p->is_foreign = false;
+		p->is_export  = true;
+
+		p->inst_cap  = 8;
+		p->insts     = gb_alloc_array(heap_allocator(), fbInst, p->inst_cap);
+		p->block_cap = 2;
+		p->blocks    = gb_alloc_array(heap_allocator(), fbBlock, p->block_cap);
+		p->slot_cap  = 1;
+		p->slots     = gb_alloc_array(heap_allocator(), fbStackSlot, p->slot_cap);
+		p->aux_cap   = 4;
+		p->aux       = gb_alloc_array(heap_allocator(), u32, p->aux_cap);
+		p->loc_cap   = 2;
+		p->locs      = gb_alloc_array(heap_allocator(), fbLoc, p->loc_cap);
+
+		u32 entry = fb_block_create(p);
+		fb_block_start(p, entry);
+		fb_inst_emit(p, FB_RET, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+	}
 }
