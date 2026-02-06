@@ -4086,6 +4086,10 @@ int main(int arg_count, char const **arg_ptr) {
 						export_dependencies(checker);
 					}
 					return result;
+				} else {
+					if (build_context.export_linked_libs_path != "") {
+						export_linked_libraries(&linker_data);
+					}
 				}
 			}
 			break;

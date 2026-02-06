@@ -488,6 +488,20 @@ gb_internal bool fb_generate_code(Checker *c, LinkerData *ld) {
 	}
 
 	fb_generate_procedures(m);
+
+	// Enumerate foreign libraries for the linker
+	for (Entity *e : m->info->required_foreign_imports_through_force) {
+		if (e == nullptr) continue;
+		GB_ASSERT(e->kind == Entity_LibraryName);
+		if (!ptr_set_update(&ld->foreign_libraries_set, e)) {
+			array_add(&ld->foreign_libraries, e);
+		}
+	}
+
+#if defined(GB_SYSTEM_OSX)
+	linker_enable_system_library_linking(ld);
+#endif
+
 	fb_lower_all(m);
 
 	String obj = fb_emit_object(m);
