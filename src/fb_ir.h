@@ -622,6 +622,15 @@ struct fbStackLayout {
 enum : i32 { FB_LOC_NONE = INT32_MIN };
 
 // ───────────────────────────────────────────────────────────────────────
+// Branch fixup (for forward jumps/branches)
+// ───────────────────────────────────────────────────────────────────────
+
+struct fbFixup {
+	u32 code_offset;    // where the rel32 displacement is in the code buffer
+	u32 target_block;   // which block it branches to
+};
+
+// ───────────────────────────────────────────────────────────────────────
 // Lowering context (shared between x64/arm64)
 // ───────────────────────────────────────────────────────────────────────
 
@@ -642,6 +651,11 @@ struct fbLowCtx {
 
 	// Current instruction index (for LRU tracking)
 	u32 current_inst_idx;
+
+	// Branch fixups (forward jumps patched after all blocks are emitted)
+	fbFixup *fixups;
+	u32      fixup_count;
+	u32      fixup_cap;
 
 	// Stack frame layout
 	fbStackLayout frame;

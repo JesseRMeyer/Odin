@@ -498,7 +498,6 @@ gb_internal void fb_x64_record_fixup(fbLowCtx *ctx, u32 code_offset, u32 target_
 	fbFixup *f = &ctx->fixups[ctx->fixup_count++];
 	f->code_offset  = code_offset;
 	f->target_block = target_block;
-	f->fixup_kind   = 0; // rel32
 }
 
 // Emit jmp rel32 to target_block.

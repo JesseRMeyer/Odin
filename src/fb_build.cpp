@@ -1,7 +1,7 @@
 // Fast Backend — entity iteration, procedure IR generation
 //
-// Phase 3: every non-foreign procedure gets a test IR sequence that exercises
-// stack allocation, integer constants, loads/stores, and arithmetic.
+// Phase 4: every non-foreign procedure gets a test IR sequence that exercises
+// multi-block control flow (ICONST, CMP_EQ, BRANCH, JUMP, RET).
 // Full procedure body lowering from AST begins in Phase 6+.
 
 gb_internal void fb_generate_procedures(fbModule *m) {
