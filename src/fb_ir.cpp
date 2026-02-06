@@ -10,11 +10,12 @@ gb_internal fbType fb_data_type(Type *t) {
 	switch (t->kind) {
 	case Type_Basic:
 		switch (t->Basic.kind) {
+		// Boolean types — explicit mapping by size
 		case Basic_bool:
-		case Basic_b8:
-		case Basic_b16:
-		case Basic_b32:
-		case Basic_b64:
+		case Basic_b8:   return FB_I8;
+		case Basic_b16:  return FB_I16;
+		case Basic_b32:  return FB_I32;
+		case Basic_b64:  return FB_I64;
 
 		case Basic_i8:
 		case Basic_u8:
