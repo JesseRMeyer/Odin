@@ -55,6 +55,16 @@ gb_internal fbABIParamInfo fb_abi_classify_type_sysv(Type *t) {
 			info.classes[0] = FB_ABI_SSE;
 			info.num_classes = 1;
 			return info;
+		// Complex/quaternion types contain floats — MEMORY until XMM support (Phase 8)
+		case Basic_complex32:
+		case Basic_complex64:
+		case Basic_complex128:
+		case Basic_quaternion64:
+		case Basic_quaternion128:
+		case Basic_quaternion256:
+			info.classes[0] = FB_ABI_MEMORY;
+			info.num_classes = 1;
+			return info;
 		// String types: {ptr, int} = 16 bytes → 2 × INTEGER
 		case Basic_string:
 		case Basic_string16:
@@ -104,19 +114,12 @@ gb_internal fbABIParamInfo fb_abi_classify_type_sysv(Type *t) {
 		return info;
 
 	default:
-		// Aggregates > 16 bytes or complex types: MEMORY class
-		// Full struct decomposition deferred to Phase 6
-		if (sz <= 8) {
-			info.classes[0] = FB_ABI_INTEGER;
-			info.num_classes = 1;
-		} else if (sz <= 16) {
-			info.classes[0] = FB_ABI_INTEGER;
-			info.classes[1] = FB_ABI_INTEGER;
-			info.num_classes = 2;
-		} else {
-			info.classes[0] = FB_ABI_MEMORY;
-			info.num_classes = 1;
-		}
+		// Aggregates (structs, arrays, unions, tuples, vectors, matrices):
+		// MEMORY is always a safe classification. Proper field-by-field
+		// decomposition (which could classify small integer-only aggregates
+		// into register pairs) requires Phase 6 struct decomposition.
+		info.classes[0] = FB_ABI_MEMORY;
+		info.num_classes = 1;
 		return info;
 	}
 }

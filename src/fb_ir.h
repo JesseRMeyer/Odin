@@ -361,10 +361,15 @@ struct fbProc {
 	u32      reloc_count;
 	u32      reloc_cap;
 
-	// Parameter ABI: param_locs[i] = stack slot index for the i-th GP register arg.
-	// The lowering stores fb_x64_sysv_arg_regs[i] → slots[param_locs[i]] in the prologue.
-	u32    *param_locs;
-	u32     param_count;
+	// Parameter ABI: param_locs[i] maps the i-th GP register argument to a stack
+	// slot and sub-offset. Two-eightbyte params (string, slice) share one 16-byte
+	// slot across two consecutive entries (sub_offset 0 and 8).
+	struct fbParamLoc {
+		u32 slot_idx;
+		i32 sub_offset; // 0 for first/only eightbyte, 8 for second
+	};
+	fbParamLoc *param_locs;
+	u32         param_count;
 
 	// Machine code output (populated by lowering)
 	u8    *machine_code;
@@ -559,6 +564,7 @@ struct fbTargetList {
 	u32           break_block;
 	u32           continue_block;
 	u32           fallthrough_block;
+	i32           scope_index;
 	bool          is_block;
 };
 

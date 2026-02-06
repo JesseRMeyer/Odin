@@ -15,9 +15,16 @@ gb_internal void fb_low_emit_byte(fbLowCtx *ctx, u8 byte) {
 }
 
 gb_internal void fb_low_emit_bytes(fbLowCtx *ctx, u8 const *bytes, u32 count) {
-	for (u32 i = 0; i < count; i++) {
-		fb_low_emit_byte(ctx, bytes[i]);
+	u32 needed = ctx->code_count + count;
+	if (needed > ctx->code_cap) {
+		u32 new_cap = ctx->code_cap * 2;
+		if (new_cap < needed) new_cap = needed;
+		if (new_cap < 256) new_cap = 256;
+		ctx->code = gb_resize_array(heap_allocator(), ctx->code, ctx->code_cap, new_cap);
+		ctx->code_cap = new_cap;
 	}
+	gb_memmove(ctx->code + ctx->code_count, bytes, count);
+	ctx->code_count += count;
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -273,15 +280,15 @@ gb_internal fbX64Reg fb_x64_resolve_gp(fbLowCtx *ctx, u32 vreg, u16 exclude_mask
 		return r;
 	}
 
-	// Spilled or not yet materialized — allocate and reload
+	// Spilled — allocate and reload
+	GB_ASSERT_MSG(loc != FB_LOC_NONE,
+		"fb_x64_resolve_gp: value %u has no location and no symbol reference", vreg);
 	fbX64Reg r = fb_x64_alloc_gp(ctx, vreg, exclude_mask);
-	if (loc != FB_LOC_NONE) {
-		// Reload from spill slot: mov reg, [rbp+disp32]
-		fb_x64_rex(ctx, true, r, 0, FB_RBP);
-		fb_low_emit_byte(ctx, 0x8B);
-		fb_x64_modrm_rbp_disp32(ctx, r, loc);
-		ctx->gp[r].dirty = false; // just loaded, matches memory
-	}
+	// Reload from spill slot: mov reg, [rbp+disp32]
+	fb_x64_rex(ctx, true, r, 0, FB_RBP);
+	fb_low_emit_byte(ctx, 0x8B);
+	fb_x64_modrm_rbp_disp32(ctx, r, loc);
+	ctx->gp[r].dirty = false; // just loaded, matches memory
 	return r;
 }
 
@@ -400,16 +407,19 @@ gb_internal void fb_x64_emit_prologue(fbLowCtx *ctx) {
 	}
 
 	// Store incoming ABI register parameters to their stack slots.
-	// All param slots are register-width (8 bytes), so we always emit a qword MOV.
+	// Each param_locs entry maps one GP register to a slot + sub_offset.
+	// Two-eightbyte params (string, slice) share a single 16-byte slot
+	// across two entries (sub_offset 0 and 8).
 	fbProc *p = ctx->proc;
 	for (u32 i = 0; i < p->param_count && i < FB_X64_SYSV_ARG_COUNT; i++) {
-		u32 slot_idx = p->param_locs[i];
+		u32 slot_idx   = p->param_locs[i].slot_idx;
+		i32 sub_offset = p->param_locs[i].sub_offset;
 		GB_ASSERT(slot_idx < p->slot_count);
 		fbStackSlot *s = &p->slots[slot_idx];
 		// mov qword [rbp+disp32], reg: REX.W 89 modrm
 		fb_x64_rex(ctx, true, fb_x64_sysv_arg_regs[i], 0, FB_RBP);
 		fb_low_emit_byte(ctx, 0x89);
-		fb_x64_modrm_rbp_disp32(ctx, fb_x64_sysv_arg_regs[i], s->frame_offset);
+		fb_x64_modrm_rbp_disp32(ctx, fb_x64_sysv_arg_regs[i], s->frame_offset + sub_offset);
 	}
 }
 
@@ -1374,10 +1384,55 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				break;
 			}
 
+			// ── Float arithmetic (Phase 8: requires XMM register support) ──
+			case FB_FADD: case FB_FSUB: case FB_FMUL: case FB_FDIV:
+			case FB_FNEG: case FB_FABS: case FB_SQRT: case FB_FMIN: case FB_FMAX:
+				GB_PANIC("fast backend: float arithmetic not yet lowered (opcode %d) — requires XMM support (Phase 8)", inst->op);
+				break;
+
+			case FB_CMP_FEQ: case FB_CMP_FNE:
+			case FB_CMP_FLT: case FB_CMP_FLE:
+			case FB_CMP_FGT: case FB_CMP_FGE:
+				GB_PANIC("fast backend: float comparison not yet lowered (opcode %d) — requires XMM support (Phase 8)", inst->op);
+				break;
+
+			case FB_SI2FP: case FB_UI2FP: case FB_FP2SI: case FB_FP2UI:
+			case FB_FPEXT: case FB_FPTRUNC:
+				GB_PANIC("fast backend: float conversion not yet lowered (opcode %d) — requires XMM support (Phase 8)", inst->op);
+				break;
+
+			// ── Atomics (Phase 8) ──
+			case FB_ATOMIC_LOAD: case FB_ATOMIC_STORE:
+			case FB_ATOMIC_XCHG: case FB_ATOMIC_ADD: case FB_ATOMIC_SUB:
+			case FB_ATOMIC_AND: case FB_ATOMIC_OR: case FB_ATOMIC_XOR:
+			case FB_ATOMIC_CAS: case FB_FENCE:
+				GB_PANIC("fast backend: atomic operation not yet lowered (opcode %d)", inst->op);
+				break;
+
+			// ── Wide arithmetic ──
+			case FB_ADDPAIR: case FB_MULPAIR:
+				GB_PANIC("fast backend: wide arithmetic not yet lowered (opcode %d)", inst->op);
+				break;
+
+			// ── Bit manipulation ──
+			case FB_BSWAP: case FB_CLZ: case FB_CTZ: case FB_POPCNT:
+				GB_PANIC("fast backend: bit manipulation not yet lowered (opcode %d)", inst->op);
+				break;
+
+			// ── SIMD (Phase 8) ──
+			case FB_VSHUFFLE: case FB_VEXTRACT: case FB_VINSERT: case FB_VSPLAT:
+				GB_PANIC("fast backend: SIMD operation not yet lowered (opcode %d)", inst->op);
+				break;
+
+			// ── Miscellaneous ──
+			case FB_MEMSET: case FB_VA_START: case FB_PREFETCH:
+			case FB_CYCLE: case FB_ASM: case FB_PHI:
+			case FB_TAILCALL:
+				GB_PANIC("fast backend: operation not yet lowered (opcode %d)", inst->op);
+				break;
+
 			default:
-				// Unimplemented opcode — emit ud2 as trap
-				fb_low_emit_byte(ctx, 0x0F);
-				fb_low_emit_byte(ctx, 0x0B);
+				GB_PANIC("fast backend: unknown opcode %d", inst->op);
 				break;
 			}
 		}

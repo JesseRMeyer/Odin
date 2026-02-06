@@ -478,10 +478,15 @@ struct fbProc {
     u32      reloc_count;
     u32      reloc_cap;
 
-    // Parameter ABI: param_locs[i] = stack slot index for the i-th GP register arg.
-    // The lowering stores the ABI arg register into slots[param_locs[i]] in the prologue.
-    u32    *param_locs;
-    u32     param_count;
+    // Parameter ABI: param_locs[i] maps the i-th GP register argument to a stack
+    // slot and sub-offset within it. Two-eightbyte params (string, slice) share
+    // a single 16-byte slot across two consecutive entries (sub_offset 0 and 8).
+    struct fbParamLoc {
+        u32 slot_idx;
+        i32 sub_offset;  // 0 for first/only eightbyte, 8 for second
+    };
+    fbParamLoc *param_locs;
+    u32         param_count;
 
     // Machine code output (populated by lowering)
     u8    *machine_code;
@@ -906,7 +911,7 @@ for each block B in procedure:
 
 **Exclude mask:** `alloc_gp` and `resolve_gp` accept a `u16 exclude_mask` (one bit per hardware register) that prevents the allocator from choosing or evicting specific registers. This is critical for multi-operand instructions where allocating the destination must not evict a source. For example, `ADD %r, %a, %b` resolves `%a` and `%b` first, then allocates `%r` with `exclude_mask = (1 << ra) | (1 << rb)`. The same mechanism supports instructions that require specific physical registers (e.g., shifts need RCX for the count, division uses RAX:RDX). A dedicated `move_value_to_reg` helper handles the "place this value in this exact register" pattern for shifts and division.
 
-**Ownership invariant:** `resolve_gp` asserts that when `value_loc[vreg]` says a value is in register R, then `gp[R].vreg == vreg`. This catches stale tracking bugs immediately rather than producing silent wrong code.
+**Ownership invariant:** `resolve_gp` asserts that when `value_loc[vreg]` says a value is in register R, then `gp[R].vreg == vreg`. It also asserts that a value has either a valid location (register or spill slot) or a symbol reference — values with `FB_LOC_NONE` and no symbol are programming errors caught at lowering time rather than producing silent wrong code.
 
 **Scratch register reservation:** On x64, RSP and RBP are reserved (frame/stack). On arm64, SP and X29 (FP) are reserved. All other registers are available for allocation.
 
@@ -987,12 +992,12 @@ push rbp
 mov rbp, rsp
 sub rsp, frame_size      ; aligned to 16 (imm8 when ≤127)
 ; Parameter spills: store ABI arg registers into their param stack slots
-mov [rbp+param_offset_0], rdi   ; 1st GP arg
-mov [rbp+param_offset_1], rsi   ; 2nd GP arg
-...                              ; up to 6 GP args (SysV)
+mov [rbp+slot_offset+sub_offset_0], rdi   ; 1st GP arg
+mov [rbp+slot_offset+sub_offset_1], rsi   ; 2nd GP arg
+...                                        ; up to 6 GP args (SysV)
 ```
 
-Parameter slots are always 8 bytes / 8-aligned (register-width), regardless of the Odin parameter type's data width. The SysV ABI leaves upper bits of narrow parameters undefined, so the full register is stored and the IR type system governs load width during the procedure body.
+Single-eightbyte parameters get an 8-byte / 8-aligned slot (`sub_offset = 0`). Two-eightbyte parameters (string, slice — classified as 2×INTEGER by the SysV ABI) share a single 16-byte / 8-aligned slot across two consecutive `param_locs` entries (`sub_offset` 0 and 8), so the two registers are stored contiguously. If both eightbytes of a two-eightbyte param cannot fit in the remaining GP registers, the entire argument falls back to stack passing. The SysV ABI leaves upper bits of narrow parameters undefined, so the full register is stored and the IR type system governs load width during the procedure body.
 
 **x64 epilogue** (before each RET):
 ```asm
@@ -1269,13 +1274,13 @@ Implemented multi-block control flow with forward branch patching, all integer c
 Implemented SysV AMD64 scalar ABI classification, parameter receiving, function calls with register/stack arguments, and relocation emission.
 
 **Files created/modified:**
-- `src/fb_abi.cpp` — SysV AMD64 type classification (scalar, pointer, slice, string, dynamic array, map, enum, bit set; struct decomposition deferred to Phase 6)
-- `src/fb_ir.h` — Added `fbReloc`/`fbRelocType`, `param_locs`/`param_count` to `fbProc`
-- `src/fb_build.cpp` — `fb_setup_params()` creates register-width (8/8) stack slots for GP register params; Odin CC appends context pointer as last GP arg
+- `src/fb_abi.cpp` — SysV AMD64 type classification (scalar, pointer, slice, string, dynamic array, map, enum, bit set; complex/quaternion explicitly MEMORY; aggregates default to MEMORY until Phase 6 struct decomposition)
+- `src/fb_ir.h` — Added `fbReloc`/`fbRelocType`, `fbParamLoc` struct (slot_idx + sub_offset), `param_locs`/`param_count` to `fbProc`
+- `src/fb_build.cpp` — `fb_setup_params()` creates stack slots for GP register params: 8-byte for single-eightbyte, 16-byte for two-eightbyte (string, slice) with sub_offset tracking; Odin CC appends context pointer as last GP arg
 - `src/fb_lower_x64.cpp` — `FB_SYMADDR` → `value_sym` tracking (deferred materialization via RIP-relative LEA); `FB_CALL` lowering: spill all caller-saved, push stack args in reverse, load register args into ABI-mandated registers, emit direct `CALL rel32` (with PLT32 reloc) or indirect `CALL r11`; prologue parameter spills; relocation accumulation
 - `src/fb_emit_elf.cpp` — `.rela.text` emission with proper R_X86_64_PLT32 relocations
 
-**What works:** Direct and indirect function calls with up to 6 GP register arguments + stack overflow arguments. Parameter receiving via prologue spills. PLT32 relocations for cross-procedure calls. Odin CC context parameter passing. Foreign procedure declarations skip heap allocations (no instruction/block/slot/aux/loc arrays allocated — significant since foreign procs often outnumber defined procs). Block tracking enforced via assertions (`fb_block_start` required before `fb_inst_emit`).
+**What works:** Direct and indirect function calls with up to 6 GP register arguments + stack overflow arguments. Parameter receiving via prologue spills with sub-offset support for two-eightbyte params (string, slice share one 16-byte slot). PLT32 relocations for cross-procedure calls. Odin CC context parameter passing. Foreign procedure declarations skip heap allocations (no instruction/block/slot/aux/loc arrays allocated — significant since foreign procs often outnumber defined procs). Block tracking enforced via assertions (`fb_block_start` required before `fb_inst_emit`).
 
 **Remaining:**
 - Struct return via sret (hidden pointer)
@@ -1300,12 +1305,15 @@ Core AST-to-IR translation with expression, statement, and address builders.
 
 **What works:**
 - `fb_build_expr()` — integer/float/bool/nil literals, identifiers, binary ops (arithmetic, bitwise, comparison), unary ops (not, neg), casts, field access (`.member`), indexing (arrays, slices, dynamic arrays, strings), procedure calls, implicit context access
-- `fb_build_stmt()` — assignments (=, +=, etc.), if/else, for loops (with break/continue), switch statements, return, defer, block scopes, labeled break/continue
+- `fb_build_stmt()` — assignments (=, +=, etc. with correct float opcode selection), if/else, for loops (with break/continue), switch statements, return (with defer emission), defer (three-mode algorithm: Default/Return/Branch), block scopes, labeled break/continue (with cross-scope defer emission)
 - `fb_build_addr()` — Default (pointer), Context (implicit context field chains), partial SOA addressing
 - `fb_emit_conv()` — int↔int (sext/zext/trunc), float↔float (fpext/fptrunc), int↔float, bool↔float, float→bool, ptr↔int conversions
+- `fb_type_is_signed()` — correctly returns false for pointers, bitsets, and non-integer types (unsigned by default)
 - Variable → stack slot mapping via `fb_add_local()`
 - Context parameter handling (Odin CC appends context pointer)
-- Scope/defer stack management with proper labeled break/continue resolution
+- Defer execution: LIFO deferred statement emission at scope close (Default), return (Return — all scopes), and break/continue (Branch — scopes above target). `fbTargetList` carries `scope_index` for cross-scope defer resolution
+- Multi-return explicitly guarded with `GB_ASSERT_MSG` (both Odin CC and non-Odin CC call paths)
+- Compound literals (`Ast_CompoundLit`) produce an explicit panic rather than falling through to generic TODO
 - CmpAnd/CmpOr lowered correctly using temp alloca (not cross-block SELECT)
 - Runtime stubs: `__$startup_runtime` and `__$cleanup_runtime` synthesized as `ret` stubs
 - `EntityFlag_CustomLinkage_Strong` respected for proper global symbol visibility
@@ -1337,10 +1345,12 @@ Built-in procedure dispatch and float opcode correction.
 - Memory builtins: `mem_copy` (MEMCPY → rep movsb), `mem_zero` (MEMZERO → rep stosb)
 - Bit manipulation: `byte_swap` (BSWAP), `count_ones` (POPCNT), `count_zeros` (NOT+POPCNT), `count_leading_zeros` (CLZ), `count_trailing_zeros` (CTZ)
 - Misc: `trap`/`debug_trap`/`unreachable`, `expect` (passthrough), `read_cycle_counter` (CYCLE), `cpu_relax` (no-op)
-- Float arithmetic uses correct SSE opcodes (was incorrectly using integer opcodes)
+- Float arithmetic uses correct SSE opcodes in both binary expressions and compound assignments (`+=`, `-=`, `*=`, `/=`)
 - Type conversion via call syntax (`int(x)`, `f32(y)`) now handled
+- x64 lowering: unimplemented opcodes produce categorized `GB_PANIC` messages (float arithmetic, float comparison, float conversion, atomics, wide arithmetic, bit manipulation, SIMD, miscellaneous) instead of silent `ud2` traps
+- `fb_x64_resolve_gp` asserts when a value has no location and no symbol reference, catching dangling value references early
 
-**Not yet lowered in x64:** BSWAP, POPCNT, CLZ, CTZ opcodes (IR emitted, lowering TODO)
+**Not yet lowered in x64:** BSWAP, POPCNT, CLZ, CTZ opcodes (IR emitted, lowering TODO); float arithmetic/comparison/conversion (requires XMM register support, Phase 8)
 
 ### Phase 7: Remaining Odin Features (TODO)
 

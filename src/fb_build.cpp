@@ -25,7 +25,7 @@ gb_internal void fb_setup_params(fbProc *p) {
 	if (max_gp_params == 0) return;
 
 	// Temporary: allocate for the hard upper bound on GP register params
-	u32 *locs = gb_alloc_array(heap_allocator(), u32, FB_X64_SYSV_MAX_GP_ARGS);
+	auto *locs = gb_alloc_array(heap_allocator(), fbProc::fbParamLoc, FB_X64_SYSV_MAX_GP_ARGS);
 
 	// Process declared parameters
 	TypeTuple *params = proc_type->params ? &proc_type->params->Tuple : nullptr;
@@ -51,22 +51,33 @@ gb_internal void fb_setup_params(fbProc *p) {
 		}
 
 		// INTEGER class: each eightbyte consumes one GP register.
-		// Param slots are always register-width (8 bytes, 8-aligned).
-		// The SysV ABI says upper bits of narrow params are undefined,
-		// so we store the full register and let the IR type system govern load width.
-		for (u8 ci = 0; ci < abi.num_classes; ci++) {
-			if (abi.classes[ci] != FB_ABI_INTEGER) continue;
-			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) break; // overflow to stack
-
+		// Two-eightbyte params (string, slice) get a single 16-byte slot;
+		// single-eightbyte params get an 8-byte slot.
+		if (abi.num_classes == 2 && abi.classes[0] == FB_ABI_INTEGER && abi.classes[1] == FB_ABI_INTEGER) {
+			// SysV ABI: if both eightbytes can't fit in registers, pass on stack
+			if (gp_idx + 2 > FB_X64_SYSV_MAX_GP_ARGS) continue;
+			u32 slot = fb_slot_create(p, 16, 8, e, param_type);
+			locs[gp_idx].slot_idx   = slot;
+			locs[gp_idx].sub_offset = 0;
+			gp_idx++;
+			locs[gp_idx].slot_idx   = slot;
+			locs[gp_idx].sub_offset = 8;
+			gp_idx++;
+		} else {
+			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) continue;
 			u32 slot = fb_slot_create(p, 8, 8, e, param_type);
-			locs[gp_idx++] = slot;
+			locs[gp_idx].slot_idx   = slot;
+			locs[gp_idx].sub_offset = 0;
+			gp_idx++;
 		}
 	}
 
 	// Odin CC: append context pointer as the last GP parameter
 	if (has_context && gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
 		u32 slot = fb_slot_create(p, 8, 8, nullptr, nullptr);
-		locs[gp_idx++] = slot;
+		locs[gp_idx].slot_idx   = slot;
+		locs[gp_idx].sub_offset = 0;
+		gp_idx++;
 	}
 
 	if (gp_idx > 0) {
@@ -99,36 +110,33 @@ gb_internal fbValue fb_value_nil(void) {
 	return v;
 }
 
+gb_internal fbValue fb_make_value(u32 id, Type *type) {
+	fbValue v = {};
+	v.id = id;
+	v.type = type;
+	return v;
+}
+
 // ───────────────────────────────────────────────────────────────────────
 // Step 2: Builder instruction helpers
 // ───────────────────────────────────────────────────────────────────────
 
 gb_internal fbValue fb_emit(fbBuilder *b, fbOp op, fbType type, u32 a, u32 bb, u32 c, i64 imm) {
 	u32 r = fb_inst_emit(b->proc, op, type, a, bb, c, 0, imm);
-	fbValue val = {};
-	val.id = r;
-	// Determine Odin type from the fb type for common cases
-	val.type = nullptr;
-	return val;
+	return fb_make_value(r, nullptr);
 }
 
 gb_internal fbValue fb_emit_typed(fbBuilder *b, fbOp op, Type *odin_type, u32 a, u32 bb, u32 c, i64 imm) {
 	fbType ft = fb_data_type(odin_type);
 	u32 r = fb_inst_emit(b->proc, op, ft, a, bb, c, 0, imm);
-	fbValue val = {};
-	val.id = r;
-	val.type = odin_type;
-	return val;
+	return fb_make_value(r, odin_type);
 }
 
 gb_internal fbValue fb_emit_iconst(fbBuilder *b, Type *type, i64 val) {
 	fbType ft = fb_data_type(type);
 	if (ft.kind == FBT_VOID) ft = FB_I64;
 	u32 r = fb_inst_emit(b->proc, FB_ICONST, ft, FB_NOREG, FB_NOREG, FB_NOREG, 0, val);
-	fbValue v = {};
-	v.id = r;
-	v.type = type;
-	return v;
+	return fb_make_value(r, type);
 }
 
 gb_internal fbValue fb_emit_fconst(fbBuilder *b, Type *type, f64 val) {
@@ -143,20 +151,14 @@ gb_internal fbValue fb_emit_fconst(fbBuilder *b, Type *type, f64 val) {
 		gb_memmove(&bits, &val, 8);
 	}
 	u32 r = fb_inst_emit(b->proc, FB_FCONST, ft, FB_NOREG, FB_NOREG, FB_NOREG, 0, bits);
-	fbValue v = {};
-	v.id = r;
-	v.type = type;
-	return v;
+	return fb_make_value(r, type);
 }
 
 gb_internal fbValue fb_emit_load(fbBuilder *b, fbValue ptr, Type *elem_type) {
 	fbType ft = fb_data_type(elem_type);
 	if (ft.kind == FBT_VOID) ft = FB_I64; // aggregate: load as i64
 	u32 r = fb_inst_emit(b->proc, FB_LOAD, ft, ptr.id, FB_NOREG, FB_NOREG, 0, 0);
-	fbValue v = {};
-	v.id = r;
-	v.type = elem_type;
-	return v;
+	return fb_make_value(r, elem_type);
 }
 
 gb_internal void fb_emit_store(fbBuilder *b, fbValue ptr, fbValue val) {
@@ -170,10 +172,7 @@ gb_internal void fb_emit_store(fbBuilder *b, fbValue ptr, fbValue val) {
 
 gb_internal fbValue fb_emit_alloca_from_slot(fbBuilder *b, u32 slot_idx) {
 	u32 r = fb_inst_emit(b->proc, FB_ALLOCA, FB_PTR, slot_idx, FB_NOREG, FB_NOREG, 0, 0);
-	fbValue v = {};
-	v.id = r;
-	v.type = nullptr; // pointer type
-	return v;
+	return fb_make_value(r, nullptr);
 }
 
 gb_internal void fb_emit_jump(fbBuilder *b, u32 target_block) {
@@ -196,28 +195,19 @@ gb_internal fbValue fb_emit_arith(fbBuilder *b, fbOp op, fbValue lhs, fbValue rh
 	fbType ft = fb_data_type(type);
 	if (ft.kind == FBT_VOID) ft = FB_I64;
 	u32 r = fb_inst_emit(b->proc, op, ft, lhs.id, rhs.id, FB_NOREG, 0, 0);
-	fbValue v = {};
-	v.id = r;
-	v.type = type;
-	return v;
+	return fb_make_value(r, type);
 }
 
 gb_internal fbValue fb_emit_cmp(fbBuilder *b, fbOp cmp_op, fbValue lhs, fbValue rhs) {
 	u32 r = fb_inst_emit(b->proc, cmp_op, FB_I1, lhs.id, rhs.id, FB_NOREG, 0, 0);
-	fbValue v = {};
-	v.id = r;
-	v.type = t_bool;
-	return v;
+	return fb_make_value(r, t_bool);
 }
 
 gb_internal fbValue fb_emit_select(fbBuilder *b, fbValue cond, fbValue t, fbValue f, Type *type) {
 	fbType ft = fb_data_type(type);
 	if (ft.kind == FBT_VOID) ft = FB_I64;
 	u32 r = fb_inst_emit(b->proc, FB_SELECT, ft, cond.id, t.id, f.id, 0, 0);
-	fbValue v = {};
-	v.id = r;
-	v.type = type;
-	return v;
+	return fb_make_value(r, type);
 }
 
 gb_internal void fb_emit_memzero(fbBuilder *b, fbValue ptr, i64 size, i64 align) {
@@ -238,26 +228,17 @@ gb_internal void fb_emit_memcpy(fbBuilder *b, fbValue dst, fbValue src, fbValue 
 
 gb_internal fbValue fb_emit_symaddr(fbBuilder *b, u32 proc_idx) {
 	u32 r = fb_inst_emit(b->proc, FB_SYMADDR, FB_PTR, FB_NOREG, FB_NOREG, FB_NOREG, 0, cast(i64)proc_idx);
-	fbValue v = {};
-	v.id = r;
-	v.type = nullptr;
-	return v;
+	return fb_make_value(r, nullptr);
 }
 
 gb_internal fbValue fb_emit_member(fbBuilder *b, fbValue base, i64 byte_offset) {
 	u32 r = fb_inst_emit(b->proc, FB_MEMBER, FB_PTR, base.id, FB_NOREG, FB_NOREG, 0, byte_offset);
-	fbValue v = {};
-	v.id = r;
-	v.type = nullptr;
-	return v;
+	return fb_make_value(r, nullptr);
 }
 
 gb_internal fbValue fb_emit_array_access(fbBuilder *b, fbValue base, fbValue index, i64 stride) {
 	u32 r = fb_inst_emit(b->proc, FB_ARRAY, FB_PTR, base.id, index.id, FB_NOREG, 0, stride);
-	fbValue v = {};
-	v.id = r;
-	v.type = nullptr;
-	return v;
+	return fb_make_value(r, nullptr);
 }
 
 // Create a new block and return its id (does NOT switch to it)
@@ -287,7 +268,8 @@ gb_internal bool fb_block_is_terminated(fbBuilder *b) {
 // Step 3: Core builder functions
 // ───────────────────────────────────────────────────────────────────────
 
-// Determine if an Odin type is signed integer
+// Determine if an Odin type is signed integer.
+// Pointers, bitsets, and other non-integer types default to unsigned.
 gb_internal bool fb_type_is_signed(Type *t) {
 	t = core_type(t);
 	if (t->kind == Type_Basic) {
@@ -296,7 +278,7 @@ gb_internal bool fb_type_is_signed(Type *t) {
 	if (t->kind == Type_Enum) {
 		return fb_type_is_signed(t->Enum.base_type);
 	}
-	return true; // default to signed
+	return false;
 }
 
 gb_internal fbValue fb_const_value(fbBuilder *b, Type *type, ExactValue value) {
@@ -579,17 +561,11 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 			// Extend
 			fbOp op = fb_type_is_signed(src_type) ? FB_SEXT : FB_ZEXT;
 			u32 r = fb_inst_emit(b->proc, op, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(src_ft));
-			fbValue v = {};
-			v.id = r;
-			v.type = dst_type;
-			return v;
+			return fb_make_value(r, dst_type);
 		} else if (dst_size < src_size) {
 			// Truncate
 			u32 r = fb_inst_emit(b->proc, FB_TRUNC, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(src_ft));
-			fbValue v = {};
-			v.id = r;
-			v.type = dst_type;
-			return v;
+			return fb_make_value(r, dst_type);
 		}
 		// Same size, just rebrand
 		val.type = dst_type;
@@ -599,10 +575,7 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 	// Bool → Integer
 	if (src_ft.kind == FBT_I1 && fb_type_is_integer(dst_ft)) {
 		u32 r = fb_inst_emit(b->proc, FB_ZEXT, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, 0);
-		fbValue v = {};
-		v.id = r;
-		v.type = dst_type;
-		return v;
+		return fb_make_value(r, dst_type);
 	}
 
 	// Integer → Bool
@@ -620,59 +593,41 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 	// Pointer → Integer
 	if (src_ft.kind == FBT_PTR && fb_type_is_integer(dst_ft)) {
 		u32 r = fb_inst_emit(b->proc, FB_PTR2INT, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, 0);
-		fbValue v = {};
-		v.id = r;
-		v.type = dst_type;
-		return v;
+		return fb_make_value(r, dst_type);
 	}
 
 	// Integer → Pointer
 	if (fb_type_is_integer(src_ft) && dst_ft.kind == FBT_PTR) {
 		u32 r = fb_inst_emit(b->proc, FB_INT2PTR, FB_PTR, val.id, FB_NOREG, FB_NOREG, 0, 0);
-		fbValue v = {};
-		v.id = r;
-		v.type = dst_type;
-		return v;
+		return fb_make_value(r, dst_type);
 	}
 
 	// Float → Float conversions
 	if (fb_type_is_float(src_ft) && fb_type_is_float(dst_ft)) {
 		fbOp op = (dst_size > src_size) ? FB_FPEXT : FB_FPTRUNC;
 		u32 r = fb_inst_emit(b->proc, op, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(src_ft));
-		fbValue v = {};
-		v.id = r;
-		v.type = dst_type;
-		return v;
+		return fb_make_value(r, dst_type);
 	}
 
 	// Int → Float conversions
 	if (fb_type_is_integer(src_ft) && fb_type_is_float(dst_ft)) {
 		fbOp op = fb_type_is_signed(src_type) ? FB_SI2FP : FB_UI2FP;
 		u32 r = fb_inst_emit(b->proc, op, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(src_ft));
-		fbValue v = {};
-		v.id = r;
-		v.type = dst_type;
-		return v;
+		return fb_make_value(r, dst_type);
 	}
 
 	// Float → Int conversions
 	if (fb_type_is_float(src_ft) && fb_type_is_integer(dst_ft)) {
 		fbOp op = fb_type_is_signed(dst_type) ? FB_FP2SI : FB_FP2UI;
 		u32 r = fb_inst_emit(b->proc, op, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(src_ft));
-		fbValue v = {};
-		v.id = r;
-		v.type = dst_type;
-		return v;
+		return fb_make_value(r, dst_type);
 	}
 
 	// Bool → Float: zero-extend to i32 first, then UI2FP
 	if (src_ft.kind == FBT_I1 && fb_type_is_float(dst_ft)) {
 		u32 ext = fb_inst_emit(b->proc, FB_ZEXT, FB_I32, val.id, FB_NOREG, FB_NOREG, 0, 0);
 		u32 r = fb_inst_emit(b->proc, FB_UI2FP, dst_ft, ext, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(FB_I32));
-		fbValue v = {};
-		v.id = r;
-		v.type = dst_type;
-		return v;
+		return fb_make_value(r, dst_type);
 	}
 
 	// Float → Bool: compare != 0.0
@@ -684,10 +639,7 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 	// Same-size bitcast
 	if (src_size == dst_size && src_size > 0) {
 		u32 r = fb_inst_emit(b->proc, FB_BITCAST, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, 0);
-		fbValue v = {};
-		v.id = r;
-		v.type = dst_type;
-		return v;
+		return fb_make_value(r, dst_type);
 	}
 
 	GB_PANIC("fb_emit_conv: unhandled conversion from %d to %d", src_ft.kind, dst_ft.kind);
@@ -738,10 +690,7 @@ gb_internal fbValue fb_build_binary_expr(fbBuilder *b, Ast *expr) {
 			fbType ft = fb_data_type(type);
 			if (ft.kind == FBT_VOID) ft = FB_I64;
 			u32 not_r = fb_inst_emit(b->proc, FB_NOT, ft, right.id, FB_NOREG, FB_NOREG, 0, 0);
-			fbValue notb = {};
-			notb.id = not_r;
-			notb.type = type;
-			return fb_emit_arith(b, FB_AND, left, notb, type);
+			return fb_emit_arith(b, FB_AND, left, fb_make_value(not_r, type), type);
 		}
 		case Token_Shl: op = FB_SHL; break;
 		case Token_Shr:
@@ -869,10 +818,7 @@ gb_internal fbValue fb_build_unary_expr(fbBuilder *b, Ast *expr) {
 		if (ft.kind == FBT_VOID) ft = FB_I64;
 		fbOp neg_op = fb_type_is_float(ft) ? FB_FNEG : FB_NEG;
 		u32 r = fb_inst_emit(b->proc, neg_op, ft, val.id, FB_NOREG, FB_NOREG, 0, 0);
-		fbValue v = {};
-		v.id = r;
-		v.type = type;
-		return v;
+		return fb_make_value(r, type);
 	}
 	case Token_Xor: {
 		// Bitwise complement
@@ -880,10 +826,7 @@ gb_internal fbValue fb_build_unary_expr(fbBuilder *b, Ast *expr) {
 		fbType ft = fb_data_type(type);
 		if (ft.kind == FBT_VOID) ft = FB_I64;
 		u32 r = fb_inst_emit(b->proc, FB_NOT, ft, val.id, FB_NOREG, FB_NOREG, 0, 0);
-		fbValue v = {};
-		v.id = r;
-		v.type = type;
-		return v;
+		return fb_make_value(r, type);
 	}
 	case Token_Not: {
 		// Logical not: compare with zero
@@ -945,7 +888,10 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 				result_type = results->variables[results->variables.count - 1]->type;
 			} else {
 				result_type = proc_type->Proc.results;
-				if (result_type->kind == Type_Tuple && result_type->Tuple.variables.count == 1) {
+				if (result_type->kind == Type_Tuple) {
+					GB_ASSERT_MSG(result_type->Tuple.variables.count == 1,
+						"fast backend: multi-return not yet supported for non-Odin CC (got %td results)",
+						result_type->Tuple.variables.count);
 					result_type = result_type->Tuple.variables[0]->type;
 				}
 			}
@@ -954,11 +900,7 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	}
 
 	u32 r = fb_inst_emit(b->proc, FB_CALL, ret_ft, target.id, aux_start, arg_count, 0, 0);
-
-	fbValue result = {};
-	result.id = r;
-	result.type = result_type;
-	return result;
+	return fb_make_value(r, result_type);
 }
 
 gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
@@ -1069,11 +1011,12 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 
 	case Ast_Uninit: {
 		u32 r = fb_inst_emit(b->proc, FB_UNDEF, fb_data_type(type), FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
-		fbValue v = {};
-		v.id = r;
-		v.type = type;
-		return v;
+		return fb_make_value(r, type);
 	}
+
+	case Ast_CompoundLit:
+		GB_PANIC("fast backend: compound literals not yet supported");
+		break;
 
 	default:
 		GB_PANIC("TODO fb_build_expr %.*s", LIT(ast_strings[expr->kind]));
@@ -1092,8 +1035,47 @@ gb_internal void fb_scope_open(fbBuilder *b, Scope *scope) {
 	array_add(&b->scope_stack, scope);
 }
 
-gb_internal void fb_scope_close(fbBuilder *b, fbDeferExitKind kind, u32 block) {
-	// TODO: defer execution in Phase 6b
+// Emit a single deferred statement inline at the current insertion point.
+gb_internal void fb_build_defer_stmt(fbBuilder *b, fbDefer const &d) {
+	if (fb_block_is_terminated(b)) return;
+	if (d.kind == fbDefer_Node) {
+		fb_build_stmt(b, d.stmt);
+	}
+	// fbDefer_Proc: deferred procedure calls not yet implemented
+}
+
+// Emit deferred statements according to the exit kind.
+//
+// Default: LIFO execution of defers in the current scope only, popped after emission.
+// Return:  LIFO execution of ALL defers (all scopes), not popped (stack unwinds naturally).
+// Branch:  LIFO execution of defers whose scope_index > target scope, not popped.
+gb_internal void fb_emit_defer_stmts(fbBuilder *b, fbDeferExitKind kind, i32 target_scope_index) {
+	isize i = b->defer_stack.count;
+	while (i-- > 0) {
+		fbDefer const &d = b->defer_stack[i];
+
+		switch (kind) {
+		case fbDeferExit_Default:
+			if (d.scope_index == b->scope_index && d.scope_index > 0) {
+				fb_build_defer_stmt(b, d);
+				array_pop(&b->defer_stack);
+				continue;
+			}
+			return; // stop at first non-matching scope
+		case fbDeferExit_Return:
+			fb_build_defer_stmt(b, d);
+			break;
+		case fbDeferExit_Branch:
+			if (target_scope_index < d.scope_index) {
+				fb_build_defer_stmt(b, d);
+			}
+			break;
+		}
+	}
+}
+
+gb_internal void fb_scope_close(fbBuilder *b, fbDeferExitKind kind, i32 target_scope_index) {
+	fb_emit_defer_stmts(b, kind, target_scope_index);
 	GB_ASSERT(b->scope_index > 0);
 	b->scope_index -= 1;
 	array_pop(&b->scope_stack);
@@ -1159,37 +1141,35 @@ gb_internal void fb_build_return_stmt(fbBuilder *b, Slice<Ast *> const &results)
 	GB_ASSERT(pt->kind == Type_Proc);
 
 	if (results.count == 0) {
+		fb_emit_defer_stmts(b, fbDeferExit_Return, 0);
 		fb_emit_ret_void(b);
 		return;
 	}
 
+	GB_ASSERT_MSG(results.count == 1,
+		"fast backend: multi-return not yet supported (got %td results)", results.count);
+
 	// Single return value
-	if (results.count == 1) {
-		fbValue val = fb_build_expr(b, results[0]);
+	fbValue val = fb_build_expr(b, results[0]);
 
-		// Convert to the actual return type
-		TypeProc *proc_type = &pt->Proc;
-		if (proc_type->results != nullptr) {
-			TypeTuple *res = &proc_type->results->Tuple;
-			bool is_odin_cc = (proc_type->calling_convention == ProcCC_Odin);
-			Type *ret_type = nullptr;
-			if (is_odin_cc && res->variables.count > 0) {
-				ret_type = res->variables[res->variables.count - 1]->type;
-			} else if (res->variables.count > 0) {
-				ret_type = res->variables[0]->type;
-			}
-			if (ret_type != nullptr) {
-				val = fb_emit_conv(b, val, ret_type);
-			}
+	// Convert to the actual return type
+	TypeProc *proc_type = &pt->Proc;
+	if (proc_type->results != nullptr) {
+		TypeTuple *res = &proc_type->results->Tuple;
+		bool is_odin_cc = (proc_type->calling_convention == ProcCC_Odin);
+		Type *ret_type = nullptr;
+		if (is_odin_cc && res->variables.count > 0) {
+			ret_type = res->variables[res->variables.count - 1]->type;
+		} else if (res->variables.count > 0) {
+			ret_type = res->variables[0]->type;
 		}
-
-		fb_emit_ret(b, val);
-		return;
+		if (ret_type != nullptr) {
+			val = fb_emit_conv(b, val, ret_type);
+		}
 	}
 
-	// Multi-return: just return the last value for now (Phase 6b for full support)
-	fbValue last = fb_build_expr(b, results[results.count - 1]);
-	fb_emit_ret(b, last);
+	fb_emit_defer_stmts(b, fbDeferExit_Return, 0);
+	fb_emit_ret(b, val);
 }
 
 gb_internal void fb_build_assign_stmt(fbBuilder *b, AstAssignStmt *as) {
@@ -1222,11 +1202,14 @@ gb_internal void fb_build_assign_stmt(fbBuilder *b, AstAssignStmt *as) {
 
 		fbOp op;
 		Type *type = addr.type;
+		bool is_float = fb_type_is_float(fb_data_type(type));
 		switch (as->op.kind) {
-		case Token_AddEq: op = FB_ADD; break;
-		case Token_SubEq: op = FB_SUB; break;
-		case Token_MulEq: op = FB_MUL; break;
-		case Token_QuoEq: op = fb_type_is_signed(type) ? FB_SDIV : FB_UDIV; break;
+		case Token_AddEq: op = is_float ? FB_FADD : FB_ADD; break;
+		case Token_SubEq: op = is_float ? FB_FSUB : FB_SUB; break;
+		case Token_MulEq: op = is_float ? FB_FMUL : FB_MUL; break;
+		case Token_QuoEq:
+			op = is_float ? FB_FDIV : (fb_type_is_signed(type) ? FB_SDIV : FB_UDIV);
+			break;
 		case Token_ModEq: op = fb_type_is_signed(type) ? FB_SMOD : FB_UMOD; break;
 		case Token_AndEq: op = FB_AND; break;
 		case Token_OrEq:  op = FB_OR;  break;
@@ -1237,10 +1220,7 @@ gb_internal void fb_build_assign_stmt(fbBuilder *b, AstAssignStmt *as) {
 			fbType ft = fb_data_type(type);
 			if (ft.kind == FBT_VOID) ft = FB_I64;
 			u32 not_r = fb_inst_emit(b->proc, FB_NOT, ft, rhs.id, FB_NOREG, FB_NOREG, 0, 0);
-			fbValue notb = {};
-			notb.id = not_r;
-			notb.type = type;
-			fbValue result = fb_emit_arith(b, FB_AND, old_val, notb, type);
+			fbValue result = fb_emit_arith(b, FB_AND, old_val, fb_make_value(not_r, type), type);
 			fb_addr_store(b, addr, result);
 			return;
 		}
@@ -1345,6 +1325,7 @@ gb_internal void fb_build_for_stmt(fbBuilder *b, Ast *node) {
 	tl.prev = b->target_list;
 	tl.break_block = done_block;
 	tl.continue_block = post_block;
+	tl.scope_index = b->scope_index;
 	tl.is_block = false;
 	b->target_list = &tl;
 
@@ -1412,6 +1393,7 @@ gb_internal void fb_build_stmt(fbBuilder *b, Ast *node) {
 			tl.prev = b->target_list;
 			tl.break_block = done_block;
 			tl.continue_block = 0;
+			tl.scope_index = b->scope_index;
 			tl.is_block = true;
 			b->target_list = &tl;
 			tl_ptr = &tl;
@@ -1484,6 +1466,7 @@ gb_internal void fb_build_stmt(fbBuilder *b, Ast *node) {
 	case Ast_BranchStmt: {
 		ast_node(bs, BranchStmt, node);
 		u32 target_block = 0;
+		i32 target_scope = b->scope_index;
 
 		if (bs->label != nullptr) {
 			// Labeled break/continue: resolve the Ast_Ident through its entity
@@ -1500,6 +1483,13 @@ gb_internal void fb_build_stmt(fbBuilder *b, Ast *node) {
 					break;
 				}
 			}
+			// For labeled branches, find the target scope from the target list
+			for (fbTargetList *t = b->target_list; t != nullptr; t = t->prev) {
+				if (t->break_block == target_block || t->continue_block == target_block) {
+					target_scope = t->scope_index;
+					break;
+				}
+			}
 		} else {
 			for (fbTargetList *t = b->target_list; t != nullptr; t = t->prev) {
 				if (t->is_block) continue;
@@ -1509,11 +1499,15 @@ gb_internal void fb_build_stmt(fbBuilder *b, Ast *node) {
 				case Token_continue: target_block = t->continue_block; break;
 				default: break;
 				}
-				if (target_block != 0) break;
+				if (target_block != 0) {
+					target_scope = t->scope_index;
+					break;
+				}
 			}
 		}
 
 		if (target_block != 0) {
+			fb_emit_defer_stmts(b, fbDeferExit_Branch, target_scope);
 			fb_emit_jump(b, target_block);
 		}
 		break;
@@ -1588,7 +1582,7 @@ gb_internal void fb_procedure_begin(fbBuilder *b) {
 			// Find this entity's slot in param_locs
 			bool found = false;
 			for (u32 pi = 0; pi < b->proc->param_count; pi++) {
-				u32 slot_idx = b->proc->param_locs[pi];
+				u32 slot_idx = b->proc->param_locs[pi].slot_idx;
 				fbStackSlot *slot = &b->proc->slots[slot_idx];
 				if (slot->entity == param_e) {
 					fbValue ptr = fb_emit_alloca_from_slot(b, slot_idx);
@@ -1611,7 +1605,7 @@ gb_internal void fb_procedure_begin(fbBuilder *b) {
 	// Odin CC: register context pointer
 	if (proc_type->calling_convention == ProcCC_Odin && b->proc->param_count > 0) {
 		// Context pointer is the last param slot
-		u32 ctx_slot = b->proc->param_locs[b->proc->param_count - 1];
+		u32 ctx_slot = b->proc->param_locs[b->proc->param_count - 1].slot_idx;
 		fbStackSlot *slot = &b->proc->slots[ctx_slot];
 		if (slot->entity == nullptr) {
 			// This is the context pointer slot
