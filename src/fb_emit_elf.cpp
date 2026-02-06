@@ -199,6 +199,15 @@ enum {
 	FB_ELF_SEC_COUNT    = 6,
 };
 
+gb_internal void fb_file_write_padding(gbFile *f, u64 current, u64 target) {
+	u8 zeros[64] = {};
+	for (u64 rem = target - current; rem > 0; ) {
+		u64 chunk = gb_min(rem, 64);
+		gb_file_write(f, zeros, cast(isize)chunk);
+		rem -= chunk;
+	}
+}
+
 gb_internal String fb_emit_elf(fbModule *m) {
 	// 1. Build .text section: concatenate all proc machine code
 	fbBuf text_buf = {};
@@ -505,14 +514,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	}
 
 	// Pad to symtab alignment
-	{
-		u64 cur = ehdr_size + text_size;
-		while (cur < symtab_offset) {
-			u8 z = 0;
-			gb_file_write(&f, &z, 1);
-			cur++;
-		}
-	}
+	fb_file_write_padding(&f, ehdr_size + text_size, symtab_offset);
 
 	// Write .symtab
 	gb_file_write(&f, syms, sizeof(Elf64_Sym) * actual_sym_count);
@@ -526,14 +528,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	// .rela.text is empty, nothing to write
 
 	// Pad to section header alignment
-	{
-		u64 cur = relatext_offset + relatext_size;
-		while (cur < shdr_offset) {
-			u8 z = 0;
-			gb_file_write(&f, &z, 1);
-			cur++;
-		}
-	}
+	fb_file_write_padding(&f, relatext_offset + relatext_size, shdr_offset);
 
 	// Write section headers
 	gb_file_write(&f, shdrs, sizeof(shdrs));
