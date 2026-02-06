@@ -228,23 +228,37 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		fb_buf_append(&text_buf, p->machine_code, p->machine_code_size);
 	}
 
-	// 2. Build .strtab (symbol name strings)
+	// 2. Build .strtab and .symtab in a single pass
+	//
+	// ELF requires all STB_LOCAL symbols before STB_GLOBAL symbols.
+	// Algorithm: count pass to determine local/global split, then a single
+	// allocation and population pass. No rebuild or strtab reset needed.
 	fbBuf strtab = {};
 	fb_buf_init(&strtab, 1024);
 	fb_buf_append_byte(&strtab, 0); // first byte must be null
 
-	// 3. Build .symtab
-	// Count symbols: null + file + one per proc
-	u32 sym_count = 2 + cast(u32)m->procs.count; // null + file + procs
-	Elf64_Sym *syms = gb_alloc_array(heap_allocator(), Elf64_Sym, sym_count);
-	gb_zero_size(syms, sizeof(Elf64_Sym) * sym_count);
+	// Count pass: determine local_count and global_count
+	u32 local_count  = 0;
+	u32 global_count = 0;
+	for_array(i, m->procs) {
+		fbProc *p = m->procs[i];
+		if (p->is_foreign || p->is_export) {
+			global_count++;
+		} else {
+			local_count++;
+		}
+	}
+
+	// Allocate: null + file + locals + globals
+	u32 actual_sym_count = 2 + local_count + global_count;
+	Elf64_Sym *syms = gb_alloc_array(heap_allocator(), Elf64_Sym, actual_sym_count);
+	gb_zero_size(syms, sizeof(Elf64_Sym) * actual_sym_count);
 
 	// Entry 0: null symbol (already zeroed)
 
 	// Entry 1: file symbol
 	{
 		String obj_path = fb_filepath_obj(m);
-		// Extract basename for file symbol
 		isize last_slash = -1;
 		for (isize j = obj_path.len - 1; j >= 0; j--) {
 			if (obj_path.text[j] == '/' || obj_path.text[j] == '\\') {
@@ -257,128 +271,56 @@ gb_internal String fb_emit_elf(fbModule *m) {
 			basename = make_string(obj_path.text + last_slash + 1, obj_path.len - last_slash - 1);
 		}
 
-		char *fname = gb_alloc_array(heap_allocator(), char, basename.len + 1);
-		gb_memmove(fname, basename.text, basename.len);
-		fname[basename.len] = 0;
-
-		syms[1].st_name  = fb_buf_append_str(&strtab, fname);
+		syms[1].st_name  = fb_buf_append_odin_str(&strtab, basename);
 		syms[1].st_info  = ELF64_ST_INFO(STB_LOCAL, STT_FILE);
 		syms[1].st_other = 0;
 		syms[1].st_shndx = SHN_ABS;
 		syms[1].st_value = 0;
 		syms[1].st_size  = 0;
-
-		gb_free(heap_allocator(), fname);
 	}
 
-	// Count local vs global symbols for sh_info
-	// ELF requires: all STB_LOCAL symbols come before STB_GLOBAL
-	// We'll do two passes: first locals, then globals
-	u32 local_count = 2; // null + file are local
-
-	// First pass: count locals (non-exported, non-foreign procs)
-	for_array(i, m->procs) {
-		fbProc *p = m->procs[i];
-		if (!p->is_foreign && !p->is_export) {
-			local_count++;
-		}
-	}
-
-	// Rebuild symbol table with proper ordering
-	u32 actual_sym_count = 2 + cast(u32)m->procs.count;
-	gb_free(heap_allocator(), syms);
-	syms = gb_alloc_array(heap_allocator(), Elf64_Sym, actual_sym_count);
-	gb_zero_size(syms, sizeof(Elf64_Sym) * actual_sym_count);
-
-	// Re-add file symbol
-	{
-		String obj_path = fb_filepath_obj(m);
-		isize last_slash = -1;
-		for (isize j = obj_path.len - 1; j >= 0; j--) {
-			if (obj_path.text[j] == '/' || obj_path.text[j] == '\\') {
-				last_slash = j;
-				break;
-			}
-		}
-		String basename = obj_path;
-		if (last_slash >= 0) {
-			basename = make_string(obj_path.text + last_slash + 1, obj_path.len - last_slash - 1);
-		}
-		char *fname = gb_alloc_array(heap_allocator(), char, basename.len + 1);
-		gb_memmove(fname, basename.text, basename.len);
-		fname[basename.len] = 0;
-
-		// Reset strtab — rebuild from scratch
-		strtab.count = 0;
-		fb_buf_append_byte(&strtab, 0);
-
-		syms[1].st_name  = fb_buf_append_str(&strtab, fname);
-		syms[1].st_info  = ELF64_ST_INFO(STB_LOCAL, STT_FILE);
-		syms[1].st_other = 0;
-		syms[1].st_shndx = SHN_ABS;
-		syms[1].st_value = 0;
-		syms[1].st_size  = 0;
-
-		gb_free(heap_allocator(), fname);
-	}
-
-	// Second pass: add local procs, then global procs
-	u32 sym_idx = 2;
+	// Single pass: locals at [2 .. 2+local_count), globals at [2+local_count .. end)
+	u32 local_idx  = 2;
+	u32 global_idx = 2 + local_count;
 
 	// Map from proc index to symbol index (for future relocation use)
 	u32 *proc_sym_idx = gb_alloc_array(heap_allocator(), u32, m->procs.count);
 
-	// Locals first (non-foreign, non-export)
 	for_array(i, m->procs) {
 		fbProc *p = m->procs[i];
-		if (p->is_foreign || p->is_export) continue;
+		u32 idx;
 
-		char *name_cstr = gb_alloc_array(heap_allocator(), char, p->name.len + 1);
-		gb_memmove(name_cstr, p->name.text, p->name.len);
-		name_cstr[p->name.len] = 0;
+		if (p->is_foreign || p->is_export) {
+			idx = global_idx++;
+			syms[idx].st_name  = fb_buf_append_odin_str(&strtab, p->name);
+			syms[idx].st_other = 0;
 
-		syms[sym_idx].st_name  = fb_buf_append_str(&strtab, name_cstr);
-		syms[sym_idx].st_info  = ELF64_ST_INFO(STB_LOCAL, STT_FUNC);
-		syms[sym_idx].st_other = 0;
-		syms[sym_idx].st_shndx = FB_ELF_SEC_TEXT;
-		syms[sym_idx].st_value = proc_text_offsets[i];
-		syms[sym_idx].st_size  = p->machine_code_size;
-
-		gb_free(heap_allocator(), name_cstr);
-		proc_sym_idx[i] = sym_idx;
-		sym_idx++;
-	}
-
-	// Then globals (exported + foreign)
-	for_array(i, m->procs) {
-		fbProc *p = m->procs[i];
-		if (!p->is_foreign && !p->is_export) continue;
-
-		char *name_cstr = gb_alloc_array(heap_allocator(), char, p->name.len + 1);
-		gb_memmove(name_cstr, p->name.text, p->name.len);
-		name_cstr[p->name.len] = 0;
-
-		syms[sym_idx].st_name  = fb_buf_append_str(&strtab, name_cstr);
-		syms[sym_idx].st_other = 0;
-
-		if (p->is_foreign) {
-			syms[sym_idx].st_info  = ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE);
-			syms[sym_idx].st_shndx = SHN_UNDEF;
-			syms[sym_idx].st_value = 0;
-			syms[sym_idx].st_size  = 0;
+			if (p->is_foreign) {
+				syms[idx].st_info  = ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE);
+				syms[idx].st_shndx = SHN_UNDEF;
+				syms[idx].st_value = 0;
+				syms[idx].st_size  = 0;
+			} else {
+				syms[idx].st_info  = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
+				syms[idx].st_shndx = FB_ELF_SEC_TEXT;
+				syms[idx].st_value = proc_text_offsets[i];
+				syms[idx].st_size  = p->machine_code_size;
+			}
 		} else {
-			syms[sym_idx].st_info  = ELF64_ST_INFO(STB_GLOBAL, STT_FUNC);
-			syms[sym_idx].st_shndx = FB_ELF_SEC_TEXT;
-			syms[sym_idx].st_value = proc_text_offsets[i];
-			syms[sym_idx].st_size  = p->machine_code_size;
+			idx = local_idx++;
+			syms[idx].st_name  = fb_buf_append_odin_str(&strtab, p->name);
+			syms[idx].st_info  = ELF64_ST_INFO(STB_LOCAL, STT_FUNC);
+			syms[idx].st_other = 0;
+			syms[idx].st_shndx = FB_ELF_SEC_TEXT;
+			syms[idx].st_value = proc_text_offsets[i];
+			syms[idx].st_size  = p->machine_code_size;
 		}
 
-		gb_free(heap_allocator(), name_cstr);
-		proc_sym_idx[i] = sym_idx;
-		sym_idx++;
+		proc_sym_idx[i] = idx;
 	}
 
-	actual_sym_count = sym_idx;
+	// local_sym_count includes null + file + local procs (for sh_info)
+	u32 local_sym_count = 2 + local_count;
 
 	// 4. Build .shstrtab (section name strings)
 	fbBuf shstrtab = {};
@@ -435,7 +377,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	shdrs[FB_ELF_SEC_SYMTAB].sh_offset    = symtab_offset;
 	shdrs[FB_ELF_SEC_SYMTAB].sh_size      = symtab_size;
 	shdrs[FB_ELF_SEC_SYMTAB].sh_link      = FB_ELF_SEC_STRTAB; // associated string table
-	shdrs[FB_ELF_SEC_SYMTAB].sh_info      = local_count;        // first non-local symbol index
+	shdrs[FB_ELF_SEC_SYMTAB].sh_info      = local_sym_count;    // first non-local symbol index
 	shdrs[FB_ELF_SEC_SYMTAB].sh_addralign = 8;
 	shdrs[FB_ELF_SEC_SYMTAB].sh_entsize   = sizeof(Elf64_Sym);
 
