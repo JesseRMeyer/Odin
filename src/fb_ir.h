@@ -266,6 +266,22 @@ gb_internal fbType fb_type_unpack(u16 raw) {
 }
 
 // ───────────────────────────────────────────────────────────────────────
+// Relocations
+// ───────────────────────────────────────────────────────────────────────
+
+enum fbRelocType : u32 {
+	FB_RELOC_PC32  = 2,   // R_X86_64_PC32
+	FB_RELOC_PLT32 = 4,   // R_X86_64_PLT32
+};
+
+struct fbReloc {
+	u32         code_offset;   // byte offset in this proc's machine code
+	u32         target_proc;   // proc index in m->procs
+	i64         addend;        // typically -4
+	fbRelocType reloc_type;
+};
+
+// ───────────────────────────────────────────────────────────────────────
 // Block
 // ───────────────────────────────────────────────────────────────────────
 
@@ -339,6 +355,16 @@ struct fbProc {
 
 	// Current block during IR construction
 	u32 current_block;
+
+	// Relocations (populated by lowering, consumed by ELF emission)
+	fbReloc *relocs;
+	u32      reloc_count;
+	u32      reloc_cap;
+
+	// Parameter ABI: param_locs[i] = stack slot index for the i-th GP register arg.
+	// The lowering stores fb_x64_sysv_arg_regs[i] → slots[param_locs[i]] in the prologue.
+	u32    *param_locs;
+	u32     param_count;
 
 	// Machine code output (populated by lowering)
 	u8    *machine_code;
@@ -574,6 +600,7 @@ struct fbBuilder {
 	DeclInfo *decl;
 
 	// Scoping & control flow
+	i32                     scope_index;
 	Array<Scope *>          scope_stack;
 	Array<fbContextData>    context_stack;
 	Array<fbDefer>          defer_stack;
@@ -602,6 +629,9 @@ enum fbX64Reg : u8 {
 	FB_R12 = 12, FB_R13 = 13, FB_R14 = 14, FB_R15 = 15,
 	FB_X64_REG_NONE = 0xFF,
 };
+
+// SysV AMD64 ABI: max integer/pointer argument registers
+enum : u32 { FB_X64_SYSV_MAX_GP_ARGS = 6 };
 
 // ───────────────────────────────────────────────────────────────────────
 // Register allocator state
@@ -657,6 +687,15 @@ struct fbLowCtx {
 	u32      fixup_count;
 	u32      fixup_cap;
 
+	// Call relocations (accumulated during lowering, copied to fbProc)
+	fbReloc *relocs;
+	u32      reloc_count;
+	u32      reloc_cap;
+
+	// Symbol references: value_sym[vreg] = proc index when vreg is a SYMADDR.
+	// FB_NOREG means the vreg is not a symbol reference.
+	u32     *value_sym;
+
 	// Stack frame layout
 	fbStackLayout frame;
 };
@@ -694,3 +733,18 @@ gb_internal void    fb_lower_proc_x64(fbLowCtx *ctx);
 gb_internal void    fb_lower_all(fbModule *m);
 gb_internal String  fb_emit_elf(fbModule *m);
 gb_internal String  fb_emit_object(fbModule *m);
+
+// AST walker (fb_build.cpp)
+gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr);
+gb_internal fbAddr  fb_build_addr(fbBuilder *b, Ast *expr);
+gb_internal void    fb_build_stmt(fbBuilder *b, Ast *node);
+gb_internal void    fb_build_stmt_list(fbBuilder *b, Slice<Ast *> const &stmts);
+gb_internal fbValue fb_addr_load(fbBuilder *b, fbAddr addr);
+gb_internal void    fb_addr_store(fbBuilder *b, fbAddr addr, fbValue val);
+gb_internal fbAddr  fb_add_local(fbBuilder *b, Type *type, Entity *entity, bool zero_init);
+gb_internal fbValue fb_const_value(fbBuilder *b, Type *type, ExactValue value);
+gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type);
+
+// Built-in procedures (fb_build_builtin.cpp)
+gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr,
+                                          TypeAndValue const &tv, BuiltinProcId id);

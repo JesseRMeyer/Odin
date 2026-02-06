@@ -97,6 +97,7 @@ gb_global Timings global_timings = {0};
 #include "fb_ir.cpp"
 #include "fb_abi.cpp"
 #include "fb_build.cpp"
+#include "fb_build_builtin.cpp"
 #include "fb_lower_x64.cpp"
 #include "fb_emit_elf.cpp"
 #endif

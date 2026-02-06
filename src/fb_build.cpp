@@ -221,7 +221,19 @@ gb_internal fbValue fb_emit_select(fbBuilder *b, fbValue cond, fbValue t, fbValu
 }
 
 gb_internal void fb_emit_memzero(fbBuilder *b, fbValue ptr, i64 size, i64 align) {
-	fb_inst_emit(b->proc, FB_MEMZERO, FB_VOID, ptr.id, cast(u32)align, FB_NOREG, 0, size);
+	// Encoding: a=ptr, b=size_value, imm=alignment
+	fbValue size_val = fb_emit_iconst(b, t_int, size);
+	fb_inst_emit(b->proc, FB_MEMZERO, FB_VOID, ptr.id, size_val.id, FB_NOREG, 0, align);
+}
+
+gb_internal void fb_emit_memzero_v(fbBuilder *b, fbValue ptr, fbValue size, i64 align) {
+	// Encoding: a=ptr, b=size_value, imm=alignment
+	fb_inst_emit(b->proc, FB_MEMZERO, FB_VOID, ptr.id, size.id, FB_NOREG, 0, align);
+}
+
+gb_internal void fb_emit_memcpy(fbBuilder *b, fbValue dst, fbValue src, fbValue size, i64 align) {
+	// Encoding: a=dst, b=src, c=size_value, imm=alignment
+	fb_inst_emit(b->proc, FB_MEMCPY, FB_VOID, dst.id, src.id, size.id, 0, align);
 }
 
 gb_internal fbValue fb_emit_symaddr(fbBuilder *b, u32 proc_idx) {
@@ -706,13 +718,14 @@ gb_internal fbValue fb_build_binary_expr(fbBuilder *b, Ast *expr) {
 		fbValue left  = fb_build_expr(b, be->left);
 		fbValue right = fb_build_expr(b, be->right);
 
+		bool is_float = fb_type_is_float(fb_data_type(type));
 		fbOp op;
 		switch (be->op.kind) {
-		case Token_Add: op = FB_ADD; break;
-		case Token_Sub: op = FB_SUB; break;
-		case Token_Mul: op = FB_MUL; break;
+		case Token_Add: op = is_float ? FB_FADD : FB_ADD; break;
+		case Token_Sub: op = is_float ? FB_FSUB : FB_SUB; break;
+		case Token_Mul: op = is_float ? FB_FMUL : FB_MUL; break;
 		case Token_Quo:
-			op = fb_type_is_signed(type) ? FB_SDIV : FB_UDIV;
+			op = is_float ? FB_FDIV : (fb_type_is_signed(type) ? FB_SDIV : FB_UDIV);
 			break;
 		case Token_Mod:
 			op = fb_type_is_signed(type) ? FB_SMOD : FB_UMOD;
@@ -749,16 +762,31 @@ gb_internal fbValue fb_build_binary_expr(fbBuilder *b, Ast *expr) {
 		fbValue left  = fb_build_expr(b, be->left);
 		fbValue right = fb_build_expr(b, be->right);
 
+		Type *operand_type = left.type ? left.type : type;
+		bool is_float = fb_type_is_float(fb_data_type(operand_type));
+		bool is_signed = fb_type_is_signed(operand_type);
+
 		fbOp op;
-		bool is_signed = fb_type_is_signed(left.type ? left.type : type);
-		switch (be->op.kind) {
-		case Token_CmpEq: op = FB_CMP_EQ; break;
-		case Token_NotEq: op = FB_CMP_NE; break;
-		case Token_Lt:    op = is_signed ? FB_CMP_SLT : FB_CMP_ULT; break;
-		case Token_LtEq:  op = is_signed ? FB_CMP_SLE : FB_CMP_ULE; break;
-		case Token_Gt:    op = is_signed ? FB_CMP_SGT : FB_CMP_UGT; break;
-		case Token_GtEq:  op = is_signed ? FB_CMP_SGE : FB_CMP_UGE; break;
-		default: GB_PANIC("unreachable"); op = FB_CMP_EQ; break;
+		if (is_float) {
+			switch (be->op.kind) {
+			case Token_CmpEq: op = FB_CMP_FEQ; break;
+			case Token_NotEq: op = FB_CMP_FNE; break;
+			case Token_Lt:    op = FB_CMP_FLT; break;
+			case Token_LtEq:  op = FB_CMP_FLE; break;
+			case Token_Gt:    op = FB_CMP_FGT; break;
+			case Token_GtEq:  op = FB_CMP_FGE; break;
+			default: GB_PANIC("unreachable"); op = FB_CMP_FEQ; break;
+			}
+		} else {
+			switch (be->op.kind) {
+			case Token_CmpEq: op = FB_CMP_EQ; break;
+			case Token_NotEq: op = FB_CMP_NE; break;
+			case Token_Lt:    op = is_signed ? FB_CMP_SLT : FB_CMP_ULT; break;
+			case Token_LtEq:  op = is_signed ? FB_CMP_SLE : FB_CMP_ULE; break;
+			case Token_Gt:    op = is_signed ? FB_CMP_SGT : FB_CMP_UGT; break;
+			case Token_GtEq:  op = is_signed ? FB_CMP_SGE : FB_CMP_UGE; break;
+			default: GB_PANIC("unreachable"); op = FB_CMP_EQ; break;
+			}
 		}
 
 		fbValue cmp = fb_emit_cmp(b, op, left, right);
@@ -839,7 +867,8 @@ gb_internal fbValue fb_build_unary_expr(fbBuilder *b, Ast *expr) {
 		fbValue val = fb_build_expr(b, ue->expr);
 		fbType ft = fb_data_type(type);
 		if (ft.kind == FBT_VOID) ft = FB_I64;
-		u32 r = fb_inst_emit(b->proc, FB_NEG, ft, val.id, FB_NOREG, FB_NOREG, 0, 0);
+		fbOp neg_op = fb_type_is_float(ft) ? FB_FNEG : FB_NEG;
+		u32 r = fb_inst_emit(b->proc, neg_op, ft, val.id, FB_NOREG, FB_NOREG, 0, 0);
 		fbValue v = {};
 		v.id = r;
 		v.type = type;
@@ -1002,8 +1031,33 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 		return fb_emit_conv(b, val, type);
 	}
 
-	case Ast_CallExpr:
+	case Ast_CallExpr: {
+		ast_node(ce, CallExpr, expr);
+
+		TypeAndValue proc_tv = type_and_value_of_expr(ce->proc);
+
+		// Type conversion via call syntax: int(x), f32(y), etc.
+		if (proc_tv.mode == Addressing_Type) {
+			GB_ASSERT(ce->args.count == 1);
+			fbValue val = fb_build_expr(b, ce->args[0]);
+			return fb_emit_conv(b, val, type);
+		}
+
+		// Built-in procedure: len(s), min(a,b), etc.
+		if (proc_tv.mode == Addressing_Builtin) {
+			Ast *proc_expr = unparen_expr(ce->proc);
+			Entity *e = entity_of_node(proc_expr);
+			BuiltinProcId id = BuiltinProc_Invalid;
+			if (e != nullptr) {
+				id = cast(BuiltinProcId)e->Builtin.id;
+			} else {
+				id = BuiltinProc_DIRECTIVE;
+			}
+			return fb_build_builtin_proc(b, expr, tv, id);
+		}
+
 		return fb_build_call_expr(b, expr);
+	}
 
 	case Ast_SelectorExpr:
 	case Ast_IndexExpr:

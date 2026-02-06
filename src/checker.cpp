@@ -1285,6 +1285,7 @@ gb_internal void init_universal(void) {
 
 	add_global_bool_constant("ODIN_VALGRIND_SUPPORT",           bc->ODIN_VALGRIND_SUPPORT);
 	add_global_bool_constant("ODIN_TILDE",                      bc->tilde_backend);
+	add_global_bool_constant("ODIN_FAST_BACKEND",               bc->fast_backend);
 
 	add_global_constant("ODIN_COMPILE_TIMESTAMP", t_untyped_integer, exact_value_i64(odin_compile_timestamp()));
 

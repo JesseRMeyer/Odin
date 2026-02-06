@@ -810,26 +810,17 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 
 			// ── Memory zeroing ─────────────────────────────────
 			case FB_MEMZERO: {
-				// rep stosb: RDI=ptr, RCX=size, AL=0
-				// a=ptr, b=align (unused by rep stosb), imm=size
-				i64 size = inst->imm;
-				if (size == 0) break;
+				// rep stosb: RDI=dst, RCX=size, AL=0
+				// Encoding: a=dst, b=size_value, imm=alignment
 
 				// Spill RDI, RCX, RAX if occupied
 				fb_x64_spill_reg(ctx, FB_RDI);
 				fb_x64_spill_reg(ctx, FB_RCX);
 				fb_x64_spill_reg(ctx, FB_RAX);
 
-				// Load ptr into RDI
+				// Load dst into RDI, size into RCX
 				fb_x64_move_value_to_reg(ctx, inst->a, FB_RDI);
-
-				// Load size into RCX
-				// mov rcx, imm
-				if (size >= INT32_MIN && size <= INT32_MAX) {
-					fb_x64_mov_ri32(ctx, FB_RCX, cast(i32)size);
-				} else {
-					fb_x64_mov_ri64(ctx, FB_RCX, size);
-				}
+				fb_x64_move_value_to_reg(ctx, inst->b, FB_RCX);
 
 				// xor eax, eax (AL=0)
 				fb_x64_rex_if_needed(ctx, false, FB_RAX, 0, FB_RAX);
@@ -847,6 +838,35 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				ctx->gp[FB_RCX].dirty = false;
 				ctx->gp[FB_RAX].vreg = FB_NOREG;
 				ctx->gp[FB_RAX].dirty = false;
+				break;
+			}
+
+			// ── Memory copy ───────────────────────────────────
+			case FB_MEMCPY: {
+				// rep movsb: RDI=dst, RSI=src, RCX=size
+				// Encoding: a=dst, b=src, c=size_value, imm=alignment
+
+				// Spill RDI, RSI, RCX if occupied
+				fb_x64_spill_reg(ctx, FB_RDI);
+				fb_x64_spill_reg(ctx, FB_RSI);
+				fb_x64_spill_reg(ctx, FB_RCX);
+
+				// Load dst, src, size into the required registers
+				fb_x64_move_value_to_reg(ctx, inst->a, FB_RDI);
+				fb_x64_move_value_to_reg(ctx, inst->b, FB_RSI);
+				fb_x64_move_value_to_reg(ctx, inst->c, FB_RCX);
+
+				// rep movsb: F3 A4
+				fb_low_emit_byte(ctx, 0xF3);
+				fb_low_emit_byte(ctx, 0xA4);
+
+				// Mark RDI, RSI, RCX as clobbered
+				ctx->gp[FB_RDI].vreg = FB_NOREG;
+				ctx->gp[FB_RDI].dirty = false;
+				ctx->gp[FB_RSI].vreg = FB_NOREG;
+				ctx->gp[FB_RSI].dirty = false;
+				ctx->gp[FB_RCX].vreg = FB_NOREG;
+				ctx->gp[FB_RCX].dirty = false;
 				break;
 			}
 
