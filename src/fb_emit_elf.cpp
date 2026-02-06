@@ -165,9 +165,12 @@ gb_internal u32 fb_buf_append_str(fbBuf *b, char const *s) {
 }
 
 gb_internal void fb_buf_align(fbBuf *b, u32 align) {
-	while (b->count % align != 0) {
-		fb_buf_append_byte(b, 0);
-	}
+	u32 rem = b->count % align;
+	if (rem == 0) return;
+	u32 pad = align - rem;
+	fb_buf_grow(b, pad);
+	gb_memset(b->data + b->count, 0, cast(isize)pad);
+	b->count += pad;
 }
 
 // ───────────────────────────────────────────────────────────────────────
