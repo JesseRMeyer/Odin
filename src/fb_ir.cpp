@@ -257,26 +257,29 @@ gb_internal fbProc *fb_proc_create(fbModule *m, Entity *e) {
 	p->odin_type = e->type;
 	p->name      = fb_get_entity_name(m, e);
 
-	// Init arrays with small defaults
-	p->inst_cap  = 64;
-	p->insts     = gb_alloc_array(heap_allocator(), fbInst, p->inst_cap);
-
-	p->block_cap = 8;
-	p->blocks    = gb_alloc_array(heap_allocator(), fbBlock, p->block_cap);
-
-	p->slot_cap  = 16;
-	p->slots     = gb_alloc_array(heap_allocator(), fbStackSlot, p->slot_cap);
-
-	p->aux_cap   = 32;
-	p->aux       = gb_alloc_array(heap_allocator(), u32, p->aux_cap);
-
-	p->loc_cap   = 16;
-	p->locs      = gb_alloc_array(heap_allocator(), fbLoc, p->loc_cap);
+	p->is_foreign = e->Procedure.is_foreign;
+	p->is_export  = e->Procedure.is_export;
 
 	p->current_block = FB_NOREG; // no active block until fb_block_start
 
-	p->is_foreign = e->Procedure.is_foreign;
-	p->is_export  = e->Procedure.is_export;
+	// Foreign procs are extern declarations — no IR, no machine code.
+	// Skip heap allocations; all pointers remain NULL, caps stay 0.
+	if (!p->is_foreign) {
+		p->inst_cap  = 64;
+		p->insts     = gb_alloc_array(heap_allocator(), fbInst, p->inst_cap);
+
+		p->block_cap = 8;
+		p->blocks    = gb_alloc_array(heap_allocator(), fbBlock, p->block_cap);
+
+		p->slot_cap  = 16;
+		p->slots     = gb_alloc_array(heap_allocator(), fbStackSlot, p->slot_cap);
+
+		p->aux_cap   = 32;
+		p->aux       = gb_alloc_array(heap_allocator(), u32, p->aux_cap);
+
+		p->loc_cap   = 16;
+		p->locs      = gb_alloc_array(heap_allocator(), fbLoc, p->loc_cap);
+	}
 
 	return p;
 }
