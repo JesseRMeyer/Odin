@@ -178,6 +178,9 @@ gb_internal bool fb_op_has_result(fbOp op) {
 
 gb_internal u32 fb_inst_emit(fbProc *p, fbOp op, fbType type,
                               u32 a, u32 b, u32 c, u32 loc, i64 imm) {
+	GB_ASSERT_MSG(p->current_block < p->block_count,
+		"fb_inst_emit: no active block");
+
 	if (p->inst_count >= p->inst_cap) {
 		u32 new_cap = p->inst_cap * 2;
 		if (new_cap < 64) new_cap = 64;
@@ -199,11 +202,7 @@ gb_internal u32 fb_inst_emit(fbProc *p, fbOp op, fbType type,
 	inst->imm      = imm;
 
 	p->inst_count++;
-
-	// Update current block's instruction count
-	if (p->current_block < p->block_count) {
-		p->blocks[p->current_block].inst_count++;
-	}
+	p->blocks[p->current_block].inst_count++;
 
 	return r;
 }
@@ -217,7 +216,7 @@ gb_internal u32 fb_block_create(fbProc *p) {
 	}
 
 	u32 id = p->block_count++;
-	p->blocks[id].first_inst  = p->inst_count;
+	p->blocks[id].first_inst  = UINT32_MAX; // sentinel until fb_block_start
 	p->blocks[id].inst_count  = 0;
 	return id;
 }
@@ -273,6 +272,8 @@ gb_internal fbProc *fb_proc_create(fbModule *m, Entity *e) {
 
 	p->loc_cap   = 16;
 	p->locs      = gb_alloc_array(heap_allocator(), fbLoc, p->loc_cap);
+
+	p->current_block = FB_NOREG; // no active block until fb_block_start
 
 	p->is_foreign = e->Procedure.is_foreign;
 	p->is_export  = e->Procedure.is_export;
