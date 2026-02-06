@@ -108,10 +108,12 @@ gb_internal i32 fb_type_size(fbType t) {
 }
 
 gb_internal i32 fb_type_align(fbType t) {
-	// Alignment matches size for all scalar types
 	i32 sz = fb_type_size(t);
 	if (t.lanes > 0) {
-		return sz * t.lanes;
+		i32 total = sz * cast(i32)t.lanes;
+		i32 align = cast(i32)next_pow2(cast(i64)total);
+		i32 max_align = cast(i32)build_context.max_simd_align;
+		return gb_min(align, max_align);
 	}
 	return sz;
 }
