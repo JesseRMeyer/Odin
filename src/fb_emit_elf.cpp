@@ -164,6 +164,15 @@ gb_internal u32 fb_buf_append_str(fbBuf *b, char const *s) {
 	return offset;
 }
 
+gb_internal u32 fb_buf_append_odin_str(fbBuf *b, String s) {
+	u32 offset = b->count;
+	fb_buf_grow(b, cast(u32)s.len + 1);
+	gb_memmove(b->data + b->count, s.text, s.len);
+	b->count += cast(u32)s.len;
+	fb_buf_append_byte(b, 0);
+	return offset;
+}
+
 gb_internal void fb_buf_align(fbBuf *b, u32 align) {
 	u32 rem = b->count % align;
 	if (rem == 0) return;
@@ -471,9 +480,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 
 	// 8. Write to file
 	String filepath = fb_filepath_obj(m);
-	char *filepath_cstr = gb_alloc_array(heap_allocator(), char, filepath.len + 1);
-	gb_memmove(filepath_cstr, filepath.text, filepath.len);
-	filepath_cstr[filepath.len] = 0;
+	char *filepath_cstr = alloc_cstring(heap_allocator(), filepath);
 
 	gbFile f = {};
 	gbFileError ferr = gb_file_create(&f, filepath_cstr);
