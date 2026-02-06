@@ -125,7 +125,17 @@ gb_internal void fb_x64_mov_ri64(fbLowCtx *ctx, fbX64Reg dst, i64 val) {
 // Register allocator
 // ───────────────────────────────────────────────────────────────────────
 
+gb_internal void fb_x64_spill_reg(fbLowCtx *ctx, fbX64Reg reg);
+
 gb_internal void fb_x64_reset_regs(fbLowCtx *ctx) {
+	// Spill dirty registers before clearing — ensures value_loc is
+	// consistent with reality at block boundaries.
+	for (u32 i = 0; i < FB_X64_GP_ALLOC_COUNT; i++) {
+		fbX64Reg r = fb_x64_gp_alloc_order[i];
+		if (ctx->gp[r].vreg != FB_NOREG && ctx->gp[r].dirty) {
+			fb_x64_spill_reg(ctx, r);
+		}
+	}
 	for (int i = 0; i < 16; i++) {
 		ctx->gp[i].vreg     = FB_NOREG;
 		ctx->gp[i].last_use = 0;
@@ -874,9 +884,13 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				break;
 			}
 
+			// Field conventions for control-flow ops:
+			//   JUMP:   a=target_block
+			//   BRANCH: a=cond, b=true_block, c=false_block
+			//   SWITCH: a=key, b=default_block, c=aux_start, imm=case_count
 			// ── Control flow ───────────────────────────────────
 			case FB_JUMP: {
-				u32 target = cast(u32)inst->imm;
+				u32 target = inst->a;
 				// Fallthrough optimization: skip jump if target is the next block
 				if (target != bi + 1) {
 					fb_x64_emit_jmp(ctx, target, bi);
@@ -885,10 +899,17 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 			}
 
 			case FB_BRANCH: {
-				// cond in a, true_block in b, false_block in c
-				fbX64Reg rcond = fb_x64_resolve_gp(ctx, inst->a, 0);
 				u32 true_block  = inst->b;
 				u32 false_block = inst->c;
+				// Identical targets: degenerate to unconditional jump
+				if (true_block == false_block) {
+					if (true_block != bi + 1) {
+						fb_x64_emit_jmp(ctx, true_block, bi);
+					}
+					break;
+				}
+				// cond in a, true_block in b, false_block in c
+				fbX64Reg rcond = fb_x64_resolve_gp(ctx, inst->a, 0);
 				// TEST cond8, cond8 — must always emit REX for byte-register
 				// operands to avoid legacy AH/CH/DH/BH encoding for registers 4-7.
 				fb_x64_rex(ctx, false, rcond, 0, rcond);

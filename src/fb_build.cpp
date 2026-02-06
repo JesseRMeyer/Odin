@@ -1,9 +1,8 @@
 // Fast Backend — entity iteration, procedure IR generation
 //
-// Phase 2: every non-foreign procedure gets a void-return stub (push rbp / mov rbp,rsp /
-// pop rbp / ret). Return values are not yet populated, so RAX is nondeterministic.
-// This exists purely for pipeline validation (parse → check → IR → lower → emit → link).
-// Full procedure body lowering begins in Phase 4+.
+// Phase 3: every non-foreign procedure gets a test IR sequence that exercises
+// stack allocation, integer constants, loads/stores, and arithmetic.
+// Full procedure body lowering from AST begins in Phase 6+.
 
 gb_internal void fb_generate_procedures(fbModule *m) {
 	CheckerInfo *info = m->info;
@@ -34,8 +33,26 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 		}
 
 		if (!p->is_foreign) {
-			u32 entry = fb_block_create(p);
-			fb_block_start(p, entry);
+			// Phase 4 test IR: multi-block control flow
+			// Block 0: ICONST 42 → ICONST 0 → CMP_EQ → BRANCH(cond, block1, block2)
+			// Block 1: ICONST 1 → JUMP block2
+			// Block 2: RET
+			u32 block0 = fb_block_create(p);
+			u32 block1 = fb_block_create(p);
+			u32 block2 = fb_block_create(p);
+
+			fb_block_start(p, block0);
+			u32 const42 = fb_inst_emit(p, FB_ICONST, FB_I64, FB_NOREG, FB_NOREG, FB_NOREG, 0, 42);
+			u32 const0  = fb_inst_emit(p, FB_ICONST, FB_I64, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+			u32 cmp     = fb_inst_emit(p, FB_CMP_EQ, FB_I1, const42, const0, FB_NOREG, 0, 0);
+			fb_inst_emit(p, FB_BRANCH, FB_VOID, cmp, block1, block2, 0, 0);
+
+			fb_block_start(p, block1);
+			u32 const1 = fb_inst_emit(p, FB_ICONST, FB_I64, FB_NOREG, FB_NOREG, FB_NOREG, 0, 1);
+			gb_unused(const1);
+			fb_inst_emit(p, FB_JUMP, FB_VOID, block2, FB_NOREG, FB_NOREG, 0, 0);
+
+			fb_block_start(p, block2);
 			fb_inst_emit(p, FB_RET, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
 		}
 
