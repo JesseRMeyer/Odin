@@ -31,6 +31,12 @@ gb_global fbX64Reg const fb_x64_gp_alloc_order[] = {
 };
 gb_global u32 const FB_X64_GP_ALLOC_COUNT = gb_count_of(fb_x64_gp_alloc_order);
 
+// SysV AMD64 ABI: integer/pointer argument registers in order
+gb_global fbX64Reg const fb_x64_sysv_arg_regs[] = {
+	FB_RDI, FB_RSI, FB_RDX, FB_RCX, FB_R8, FB_R9,
+};
+gb_global u32 const FB_X64_SYSV_ARG_COUNT = gb_count_of(fb_x64_sysv_arg_regs);
+
 // REX prefix: 0100WRXB
 // W=1 for 64-bit operand size, R=high bit of reg, X=high bit of index, B=high bit of rm/base
 gb_internal void fb_x64_rex(fbLowCtx *ctx, bool w, u8 reg, u8 index, u8 rm) {
@@ -126,6 +132,19 @@ gb_internal void fb_x64_mov_ri64(fbLowCtx *ctx, fbX64Reg dst, i64 val) {
 // ───────────────────────────────────────────────────────────────────────
 
 gb_internal void fb_x64_spill_reg(fbLowCtx *ctx, fbX64Reg reg);
+gb_internal void fb_x64_record_reloc(fbLowCtx *ctx, u32 code_offset, u32 target_proc, i64 addend, fbRelocType reloc_type);
+
+// Emit RIP-relative LEA for a symbol: lea reg, [rip+disp32] + relocation record.
+// Used by both resolve_gp (which picks any free register) and move_value_to_reg
+// (which targets a specific register).
+gb_internal void fb_x64_emit_lea_sym(fbLowCtx *ctx, fbX64Reg reg, u32 sym_idx) {
+	fb_x64_rex(ctx, true, reg, 0, 5); // rm=5 for RIP-relative
+	fb_low_emit_byte(ctx, 0x8D);
+	fb_x64_modrm(ctx, 0x00, reg, 5); // mod=00 rm=5 → [RIP+disp32]
+	u32 disp_offset = ctx->code_count;
+	fb_x64_imm32(ctx, 0); // placeholder
+	fb_x64_record_reloc(ctx, disp_offset, sym_idx, -4, FB_RELOC_PC32);
+}
 
 gb_internal void fb_x64_reset_regs(fbLowCtx *ctx) {
 	// Spill dirty registers before clearing — ensures value_loc is
@@ -148,8 +167,10 @@ gb_internal void fb_x64_init_value_loc(fbLowCtx *ctx) {
 	ctx->value_loc_count = count;
 	if (count > 0) {
 		ctx->value_loc = gb_alloc_array(heap_allocator(), i32, count);
+		ctx->value_sym = gb_alloc_array(heap_allocator(), u32, count);
 		for (u32 i = 0; i < count; i++) {
 			ctx->value_loc[i] = FB_LOC_NONE;
+			ctx->value_sym[i] = FB_NOREG;
 		}
 	}
 }
@@ -236,6 +257,14 @@ gb_internal fbX64Reg fb_x64_resolve_gp(fbLowCtx *ctx, u32 vreg, u16 exclude_mask
 		return r;
 	}
 
+	// Symbol materialization: SYMADDR values have no register or spill slot,
+	// only a symbol reference. Materialize via lea reg, [rip+disp32].
+	if (loc == FB_LOC_NONE && ctx->value_sym && ctx->value_sym[vreg] != FB_NOREG) {
+		fbX64Reg r = fb_x64_alloc_gp(ctx, vreg, exclude_mask);
+		fb_x64_emit_lea_sym(ctx, r, ctx->value_sym[vreg]);
+		return r;
+	}
+
 	// Spilled or not yet materialized — allocate and reload
 	fbX64Reg r = fb_x64_alloc_gp(ctx, vreg, exclude_mask);
 	if (loc != FB_LOC_NONE) {
@@ -276,6 +305,11 @@ gb_internal void fb_x64_move_value_to_reg(fbLowCtx *ctx, u32 vreg, fbX64Reg targ
 		fb_x64_rex(ctx, true, target, 0, FB_RBP);
 		fb_low_emit_byte(ctx, 0x8B);
 		fb_x64_modrm_rbp_disp32(ctx, target, loc);
+	} else if (ctx->value_sym && ctx->value_sym[vreg] != FB_NOREG) {
+		// SYMADDR value — materialize via RIP-relative LEA
+		fb_x64_emit_lea_sym(ctx, target, ctx->value_sym[vreg]);
+	} else {
+		GB_PANIC("fb_x64_move_value_to_reg: value %u has no location and no symbol", vreg);
 	}
 
 	ctx->gp[target].vreg     = vreg;
@@ -355,6 +389,19 @@ gb_internal void fb_x64_emit_prologue(fbLowCtx *ctx) {
 			fb_x64_modrm(ctx, 0x03, 5, FB_RSP); // /5 = SUB
 			fb_x64_imm32(ctx, frame_size);
 		}
+	}
+
+	// Store incoming ABI register parameters to their stack slots.
+	// All param slots are register-width (8 bytes), so we always emit a qword MOV.
+	fbProc *p = ctx->proc;
+	for (u32 i = 0; i < p->param_count && i < FB_X64_SYSV_ARG_COUNT; i++) {
+		u32 slot_idx = p->param_locs[i];
+		GB_ASSERT(slot_idx < p->slot_count);
+		fbStackSlot *s = &p->slots[slot_idx];
+		// mov qword [rbp+disp32], reg: REX.W 89 modrm
+		fb_x64_rex(ctx, true, fb_x64_sysv_arg_regs[i], 0, FB_RBP);
+		fb_low_emit_byte(ctx, 0x89);
+		fb_x64_modrm_rbp_disp32(ctx, fb_x64_sysv_arg_regs[i], s->frame_offset);
 	}
 }
 
@@ -500,6 +547,24 @@ gb_internal void fb_x64_record_fixup(fbLowCtx *ctx, u32 code_offset, u32 target_
 	f->target_block = target_block;
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// Call relocation recording
+// ───────────────────────────────────────────────────────────────────────
+
+gb_internal void fb_x64_record_reloc(fbLowCtx *ctx, u32 code_offset, u32 target_proc, i64 addend, fbRelocType reloc_type) {
+	if (ctx->reloc_count >= ctx->reloc_cap) {
+		u32 new_cap = ctx->reloc_cap * 2;
+		if (new_cap < 16) new_cap = 16;
+		ctx->relocs = gb_resize_array(heap_allocator(), ctx->relocs, ctx->reloc_cap, new_cap);
+		ctx->reloc_cap = new_cap;
+	}
+	fbReloc *r = &ctx->relocs[ctx->reloc_count++];
+	r->code_offset = code_offset;
+	r->target_proc = target_proc;
+	r->addend      = addend;
+	r->reloc_type  = reloc_type;
+}
+
 // Emit jmp rel32 to target_block.
 // current_bi: index of the block currently being lowered (blocks < current_bi are already emitted)
 gb_internal void fb_x64_emit_jmp(fbLowCtx *ctx, u32 target_block, u32 current_bi) {
@@ -607,6 +672,17 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 			}
 
 			// ── Stack allocation ───────────────────────────────
+			// ── Symbol address (deferred materialization) ────
+			case FB_SYMADDR: {
+				// Record the symbol reference; do NOT allocate a register or emit code.
+				// If CALL uses this value, it emits a direct call rel32.
+				// If any other instruction uses it, resolve_gp materializes via lea [rip+disp32].
+				u32 proc_idx = cast(u32)inst->imm;
+				ctx->value_sym[inst->r] = proc_idx;
+				// value_loc stays FB_LOC_NONE — resolve_gp checks value_sym
+				break;
+			}
+
 			case FB_ALLOCA: {
 				u32 slot_idx = cast(u32)inst->a;
 				GB_ASSERT(slot_idx < p->slot_count);
@@ -954,9 +1030,133 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				break;
 			}
 
-			case FB_RET:
+			// ── Function calls ────────────────────────────────
+			case FB_CALL: {
+				// CALL: a = target_value_id, b = aux_start, c = arg_count, flags = calling_convention
+				u32 target = inst->a;
+				u32 aux_start = inst->b;
+				u32 arg_count = inst->c;
+
+				// 1. Spill all occupied caller-saved registers
+				for (u32 ri = 0; ri < FB_X64_GP_ALLOC_COUNT; ri++) {
+					fbX64Reg r = fb_x64_gp_alloc_order[ri];
+					if (ctx->gp[r].vreg != FB_NOREG) {
+						fb_x64_spill_reg(ctx, r);
+					}
+				}
+
+				// 2. Count stack args and compute alignment padding
+				u32 reg_args = arg_count < FB_X64_SYSV_ARG_COUNT ? arg_count : FB_X64_SYSV_ARG_COUNT;
+				u32 stack_arg_count = arg_count > FB_X64_SYSV_ARG_COUNT ? arg_count - FB_X64_SYSV_ARG_COUNT : 0;
+				u32 stack_padding = (stack_arg_count & 1) ? 8 : 0; // 16-byte alignment
+
+				// 3. Adjust stack for alignment padding
+				if (stack_padding > 0) {
+					// sub rsp, 8
+					fb_x64_rex(ctx, true, 0, 0, FB_RSP);
+					fb_low_emit_byte(ctx, 0x83);
+					fb_x64_modrm(ctx, 0x03, 5, FB_RSP);
+					fb_x64_imm8(ctx, 8);
+				}
+
+				// 4. Push stack args in reverse order (from spill slots)
+				for (u32 ai = arg_count; ai > FB_X64_SYSV_ARG_COUNT; ai--) {
+					u32 arg_vreg = p->aux[aux_start + (ai - 1)];
+					i32 arg_loc = ctx->value_loc[arg_vreg];
+					if (arg_loc >= 0 && arg_loc < 16) {
+						// Value is in a register — push reg
+						fb_x64_rex_if_needed(ctx, false, 0, 0, cast(u8)arg_loc);
+						fb_low_emit_byte(ctx, cast(u8)(0x50 + (arg_loc & 7)));
+					} else {
+						// Value is on the stack — push qword [rbp+offset]
+						i32 offset = (arg_loc != FB_LOC_NONE) ? arg_loc : fb_x64_spill_offset(ctx, arg_vreg);
+						fb_x64_rex_if_needed(ctx, false, 6, 0, FB_RBP);
+						fb_low_emit_byte(ctx, 0xFF);
+						fb_x64_modrm_rbp_disp32(ctx, 6, offset); // /6 = PUSH
+					}
+				}
+
+				// 5. Load register args into ABI-mandated registers.
+				//
+				// IMPORTANT: After spill-all (step 1), gp[] is cleared and all values
+				// reside in spill slots. This loop loads values from spill slots into
+				// fixed argument registers WITHOUT updating gp[] or value_loc[],
+				// because these registers are caller-saved and will be clobbered by
+				// the callee. No register allocation may occur between this loop
+				// and the call instruction emission in step 6.
+				for (u32 ai = 0; ai < reg_args; ai++) {
+					u32 arg_vreg = p->aux[aux_start + ai];
+					fbX64Reg dest = fb_x64_sysv_arg_regs[ai];
+					i32 arg_loc = ctx->value_loc[arg_vreg];
+					if (arg_loc >= 0 && arg_loc < 16 && cast(fbX64Reg)arg_loc == dest) {
+						// Already in the right register (unlikely after spill-all, but handle it)
+						continue;
+					}
+					if (arg_loc >= 0 && arg_loc < 16) {
+						// In another register — mov
+						fb_x64_mov_rr(ctx, dest, cast(fbX64Reg)arg_loc);
+					} else {
+						// On stack — reload
+						i32 offset = (arg_loc != FB_LOC_NONE) ? arg_loc : fb_x64_spill_offset(ctx, arg_vreg);
+						fb_x64_rex(ctx, true, dest, 0, FB_RBP);
+						fb_low_emit_byte(ctx, 0x8B);
+						fb_x64_modrm_rbp_disp32(ctx, dest, offset);
+					}
+				}
+
+				// 6. Emit call instruction
+				if (ctx->value_sym && ctx->value_sym[target] != FB_NOREG) {
+					// Direct call: call rel32 with PLT32 relocation
+					fb_low_emit_byte(ctx, 0xE8);
+					u32 disp_offset = ctx->code_count;
+					fb_x64_imm32(ctx, 0); // placeholder
+					fb_x64_record_reloc(ctx, disp_offset, ctx->value_sym[target], -4, FB_RELOC_PLT32);
+				} else {
+					// Indirect call: reload target to R11, call r11
+					i32 target_loc = ctx->value_loc[target];
+					i32 offset = (target_loc != FB_LOC_NONE) ? target_loc : fb_x64_spill_offset(ctx, target);
+					fb_x64_rex(ctx, true, FB_R11, 0, FB_RBP);
+					fb_low_emit_byte(ctx, 0x8B);
+					fb_x64_modrm_rbp_disp32(ctx, FB_R11, offset);
+					// call r11: REX 41 FF /2 r11
+					fb_x64_rex(ctx, false, 0, 0, FB_R11);
+					fb_low_emit_byte(ctx, 0xFF);
+					fb_x64_modrm(ctx, 0x03, 2, FB_R11);
+				}
+
+				// 7. Clean up stack args + padding
+				u32 stack_cleanup = stack_arg_count * 8 + stack_padding;
+				if (stack_cleanup > 0) {
+					fb_x64_rex(ctx, true, 0, 0, FB_RSP);
+					if (stack_cleanup <= 127) {
+						fb_low_emit_byte(ctx, 0x83);
+						fb_x64_modrm(ctx, 0x03, 0, FB_RSP); // /0 = ADD
+						fb_x64_imm8(ctx, cast(i8)stack_cleanup);
+					} else {
+						fb_low_emit_byte(ctx, 0x81);
+						fb_x64_modrm(ctx, 0x03, 0, FB_RSP);
+						fb_x64_imm32(ctx, cast(i32)stack_cleanup);
+					}
+				}
+
+				// 8. Capture return value (if non-void, result is in RAX)
+				if (inst->r != FB_NOREG) {
+					ctx->gp[FB_RAX].vreg     = inst->r;
+					ctx->gp[FB_RAX].last_use = ctx->current_inst_idx;
+					ctx->gp[FB_RAX].dirty    = true;
+					ctx->value_loc[inst->r]  = cast(i32)FB_RAX;
+				}
+				break;
+			}
+
+			case FB_RET: {
+				// If returning a value, move it to RAX
+				if (inst->a != FB_NOREG) {
+					fb_x64_move_value_to_reg(ctx, inst->a, FB_RAX);
+				}
 				fb_x64_emit_epilogue(ctx);
 				break;
+			}
 
 			case FB_UNREACHABLE:
 				fb_low_emit_byte(ctx, 0x0F);
@@ -1019,9 +1219,19 @@ gb_internal void fb_lower_all(fbModule *m) {
 			gb_memmove(p->machine_code, ctx.code, ctx.code_count);
 		}
 
+		// Copy relocations from lowering context to proc
+		p->reloc_count = ctx.reloc_count;
+		p->reloc_cap   = ctx.reloc_count;
+		if (ctx.reloc_count > 0) {
+			p->relocs = gb_alloc_array(heap_allocator(), fbReloc, ctx.reloc_count);
+			gb_memmove(p->relocs, ctx.relocs, sizeof(fbReloc) * ctx.reloc_count);
+		}
+
 		if (ctx.code)           gb_free(heap_allocator(), ctx.code);
 		if (ctx.block_offsets)  gb_free(heap_allocator(), ctx.block_offsets);
 		if (ctx.value_loc)      gb_free(heap_allocator(), ctx.value_loc);
+		if (ctx.value_sym)      gb_free(heap_allocator(), ctx.value_sym);
 		if (ctx.fixups)         gb_free(heap_allocator(), ctx.fixups);
+		if (ctx.relocs)         gb_free(heap_allocator(), ctx.relocs);
 	}
 }

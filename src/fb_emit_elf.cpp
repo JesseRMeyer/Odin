@@ -61,6 +61,13 @@ enum : Elf64_Half {
 };
 
 #define ELF64_ST_INFO(b, t) (((b) << 4) | ((t) & 0xF))
+#define ELF64_R_INFO(sym, type) (((Elf64_Xword)(sym) << 32) | ((type) & 0xffffffffULL))
+
+// Relocation type constants
+enum : Elf64_Word {
+	R_X86_64_PC32  = 2,
+	R_X86_64_PLT32 = 4,
+};
 
 #pragma pack(push, 1)
 
@@ -322,7 +329,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	// local_sym_count includes null + file + local procs (for sh_info)
 	u32 local_sym_count = 2 + local_count;
 
-	// 4. Build .shstrtab (section name strings)
+	// 3. Build .shstrtab (section name strings)
 	fbBuf shstrtab = {};
 	fb_buf_init(&shstrtab, 128);
 	fb_buf_append_byte(&shstrtab, 0);
@@ -332,7 +339,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	u32 shname_shstrtab  = fb_buf_append_str(&shstrtab, ".shstrtab");
 	u32 shname_relatext  = fb_buf_append_str(&shstrtab, ".rela.text");
 
-	// 5. Calculate layout offsets
+	// 4. Calculate layout offsets
 	u64 ehdr_size = sizeof(Elf64_Ehdr);
 
 	u64 text_offset = ehdr_size;
@@ -349,9 +356,28 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	u64 shstrtab_offset = strtab_offset + strtab_size;
 	u64 shstrtab_size   = shstrtab.count;
 
-	// .rela.text — empty for Phase 2
+	// 5. Build .rela.text — relocations for call instructions
+	fbBuf rela_buf = {};
+	fb_buf_init(&rela_buf, 256);
+	for_array(pi, m->procs) {
+		fbProc *p = m->procs[pi];
+		if (p->is_foreign || p->reloc_count == 0) continue;
+		for (u32 ri = 0; ri < p->reloc_count; ri++) {
+			fbReloc *rel = &p->relocs[ri];
+			Elf64_Rela rela = {};
+			rela.r_offset = proc_text_offsets[pi] + rel->code_offset;
+			Elf64_Word elf_type = (rel->reloc_type == FB_RELOC_PLT32) ? R_X86_64_PLT32 : R_X86_64_PC32;
+			rela.r_info   = ELF64_R_INFO(proc_sym_idx[rel->target_proc], elf_type);
+			rela.r_addend = rel->addend;
+			fb_buf_append(&rela_buf, &rela, sizeof(Elf64_Rela));
+		}
+	}
+
 	u64 relatext_offset = shstrtab_offset + shstrtab_size;
-	u64 relatext_size   = 0;
+	u64 relatext_size   = rela_buf.count;
+	if (relatext_size > 0) {
+		if (relatext_offset % 8 != 0) relatext_offset += 8 - (relatext_offset % 8);
+	}
 
 	// Section headers — align to 8
 	u64 shdr_offset = relatext_offset + relatext_size;
@@ -395,7 +421,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	shdrs[FB_ELF_SEC_SHSTRTAB].sh_size      = shstrtab_size;
 	shdrs[FB_ELF_SEC_SHSTRTAB].sh_addralign = 1;
 
-	// Section 5: .rela.text (empty for now)
+	// Section 5: .rela.text
 	shdrs[FB_ELF_SEC_RELATEXT].sh_name      = shname_relatext;
 	shdrs[FB_ELF_SEC_RELATEXT].sh_type      = SHT_RELA;
 	shdrs[FB_ELF_SEC_RELATEXT].sh_offset    = relatext_offset;
@@ -441,6 +467,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		fb_buf_free(&text_buf);
 		fb_buf_free(&strtab);
 		fb_buf_free(&shstrtab);
+		fb_buf_free(&rela_buf);
 		gb_free(heap_allocator(), syms);
 		gb_free(heap_allocator(), proc_text_offsets);
 		gb_free(heap_allocator(), proc_sym_idx);
@@ -467,7 +494,11 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	// Write .shstrtab
 	gb_file_write(&f, shstrtab.data, shstrtab.count);
 
-	// .rela.text is empty, nothing to write
+	// Write .rela.text
+	if (rela_buf.count > 0) {
+		fb_file_write_padding(&f, shstrtab_offset + shstrtab_size, relatext_offset);
+		gb_file_write(&f, rela_buf.data, rela_buf.count);
+	}
 
 	// Pad to section header alignment
 	fb_file_write_padding(&f, relatext_offset + relatext_size, shdr_offset);
@@ -482,6 +513,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	fb_buf_free(&text_buf);
 	fb_buf_free(&strtab);
 	fb_buf_free(&shstrtab);
+	fb_buf_free(&rela_buf);
 	gb_free(heap_allocator(), syms);
 	gb_free(heap_allocator(), proc_text_offsets);
 	gb_free(heap_allocator(), proc_sym_idx);
