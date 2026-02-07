@@ -1619,6 +1619,116 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 		return fb_emit_conv(b, value, type);
 	}
 
+	case Ast_TernaryIfExpr: {
+		ast_node(te, TernaryIfExpr, expr);
+		GB_ASSERT(te->y != nullptr);
+
+		fbType ft = fb_data_type(type);
+
+		// Optimization: for scalar types with side-effect-free arms,
+		// evaluate both and use SELECT (no control flow needed).
+		if (ft.kind != FBT_VOID) {
+			auto is_trivial = [](Ast *e) -> bool {
+				e = unparen_expr(e);
+				TypeAndValue tav = type_and_value_of_expr(e);
+				if (tav.mode == Addressing_Constant) return true;
+				if (e->kind == Ast_Ident) return true;
+				if (e->kind == Ast_SelectorExpr) {
+					Ast *operand = unparen_expr(e->SelectorExpr.expr);
+					if (operand && operand->kind == Ast_Ident) return true;
+				}
+				if (e->kind == Ast_UnaryExpr && e->UnaryExpr.op.kind != Token_And) {
+					Ast *operand = unparen_expr(e->UnaryExpr.expr);
+					TypeAndValue otav = type_and_value_of_expr(operand);
+					if (otav.mode == Addressing_Constant) return true;
+					if (operand->kind == Ast_Ident) return true;
+				}
+				return false;
+			};
+			if (is_trivial(te->x) && is_trivial(te->y)) {
+				fbValue cond = fb_build_expr(b, te->cond);
+				cond = fb_emit_conv(b, cond, t_bool);
+				fbValue x = fb_emit_conv(b, fb_build_expr(b, te->x), type);
+				fbValue y = fb_emit_conv(b, fb_build_expr(b, te->y), type);
+				return fb_emit_select(b, cond, x, y, type);
+			}
+		}
+
+		// General path: branch into separate blocks, merge via temp alloca.
+		fbAddr result = fb_add_local(b, type, nullptr, false);
+
+		u32 then_block = fb_new_block(b);
+		u32 else_block = fb_new_block(b);
+		u32 done_block = fb_new_block(b);
+
+		fbValue cond = fb_build_expr(b, te->cond);
+		cond = fb_emit_conv(b, cond, t_bool);
+		fb_emit_branch(b, cond, then_block, else_block);
+
+		// Then: evaluate x, store to result
+		fb_set_block(b, then_block);
+		fbValue x_val = fb_build_expr(b, te->x);
+		x_val = fb_emit_conv(b, x_val, type);
+		if (ft.kind != FBT_VOID) {
+			fb_addr_store(b, result, x_val);
+		} else {
+			fb_emit_copy_value(b, result.base, x_val, type);
+		}
+		if (!fb_block_is_terminated(b)) {
+			fb_emit_jump(b, done_block);
+		}
+
+		// Else: evaluate y, store to result
+		fb_set_block(b, else_block);
+		fbValue y_val = fb_build_expr(b, te->y);
+		y_val = fb_emit_conv(b, y_val, type);
+		if (ft.kind != FBT_VOID) {
+			fb_addr_store(b, result, y_val);
+		} else {
+			fb_emit_copy_value(b, result.base, y_val, type);
+		}
+		if (!fb_block_is_terminated(b)) {
+			fb_emit_jump(b, done_block);
+		}
+
+		fb_set_block(b, done_block);
+		if (ft.kind != FBT_VOID) {
+			return fb_addr_load(b, result);
+		}
+		// Aggregate: return pointer tagged with aggregate type
+		fbValue r = result.base;
+		r.type = type;
+		return r;
+	}
+
+	case Ast_TernaryWhenExpr: {
+		ast_node(te, TernaryWhenExpr, expr);
+		// Compile-time conditional: condition is a known bool constant.
+		TypeAndValue cond_tv = type_and_value_of_expr(te->cond);
+		GB_ASSERT(cond_tv.mode == Addressing_Constant);
+		GB_ASSERT(cond_tv.value.kind == ExactValue_Bool);
+		if (cond_tv.value.value_bool) {
+			return fb_emit_conv(b, fb_build_expr(b, te->x), type);
+		} else {
+			return fb_emit_conv(b, fb_build_expr(b, te->y), type);
+		}
+	}
+
+	case Ast_ImplicitSelectorExpr: {
+		// .Field_Name in enum/union context — always a compile-time constant.
+		TypeAndValue tav = type_and_value_of_expr(expr);
+		GB_ASSERT_MSG(tav.mode == Addressing_Constant,
+			"ImplicitSelectorExpr expected Addressing_Constant, got %d", tav.mode);
+		return fb_const_value(b, type, tav.value);
+	}
+
+	case Ast_SelectorCallExpr: {
+		ast_node(se, SelectorCallExpr, expr);
+		// The checker has already rewritten obj.method(args) into a regular call.
+		GB_ASSERT(se->modified_call);
+		return fb_build_expr(b, se->call);
+	}
+
 	default:
 		GB_PANIC("TODO fb_build_expr %.*s", LIT(ast_strings[expr->kind]));
 		break;

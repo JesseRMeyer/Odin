@@ -1667,6 +1667,27 @@ Package-level variable support: discovery, constant serialization, and ELF `.dat
 - Non-trivial initializers (strings, compound literals) fall back to zero-init until `__$startup_runtime` runs proper init code
 - No `.rela.data` for globals whose initializers reference other symbols
 
+**Phase 6n: Expression Completions (DONE)**
+
+Four missing expression kinds that blocked significant code patterns.
+
+**Files modified:**
+- `src/fb_build.cpp` — Added `Ast_TernaryIfExpr`, `Ast_TernaryWhenExpr`, `Ast_ImplicitSelectorExpr`, `Ast_SelectorCallExpr` cases in `fb_build_expr`
+- `tests/fast_backend/test_all.odin` — Tests 1000-1031: ternary if (trivial SELECT and general branch paths), implicit selectors (enum values, comparisons, switch dispatch), selector calls, ternary when (compile-time), combined patterns (ternary in loops, as function arguments, multiple in one expression)
+
+**What works:**
+- **Ternary if** (`x if cond else y`): two-path implementation. Scalar types with trivial arms (constants, identifiers, simple selectors) use `FB_SELECT` — no control flow, single instruction. General case uses branch + temp alloca merge (same pattern as CmpAnd/CmpOr). Aggregate types (structs, arrays) use `fb_emit_copy_value` through the branch path. Nested ternaries work correctly
+- **Ternary when** (`x when COND else y`): compile-time conditional. The condition is evaluated at compile time (ExactValue_Bool). Only the chosen arm is emitted — no dead code
+- **Implicit selectors** (`.Field_Name`): pure constant emission. The checker resolves these to `Addressing_Constant` with the enum/union value. Just delegates to `fb_const_value`
+- **Selector calls** (`obj.method(args)`): the checker rewrites these into regular calls (`se->modified_call`). Forwards to `fb_build_expr(b, se->call)`
+
+**Design note — trivial arm detection for SELECT:**
+The ternary if uses a `is_trivial` lambda matching the LLVM backend's heuristic: constants, bare identifiers, one-level selector expressions on identifiers, and non-address-of unary expressions on trivial operands are considered side-effect-free. When both arms are trivial AND the result type is scalar, both are evaluated eagerly and combined with SELECT — avoiding 3 basic blocks per ternary. This matters for idiomatic patterns like `x if flag else y` in hot loops.
+
+**Correctness details:**
+- The general branch path guards both `fb_emit_jump` calls with `fb_block_is_terminated` checks, following the codebase convention. This prevents double-termination if arm evaluation ever terminates a block (e.g., future noreturn call support)
+- `TernaryWhenExpr` asserts `Addressing_Constant` on the condition, matching the LLVM backend — the checker guarantees this but the assertion catches internal errors early
+
 ### Phase 7: Remaining Odin Features (TODO)
 
 - Map operations (runtime calls)

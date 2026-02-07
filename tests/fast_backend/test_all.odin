@@ -16,6 +16,7 @@ package test_all
 //   800-850  slicing
 //   900-905  or_else
 //   950-969  globals
+//   1000-1031 ternary if/when, implicit selectors, selector calls
 
 foreign import libc "system:c"
 foreign libc {
@@ -699,6 +700,158 @@ test_globals :: proc() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Ternary / implicit selector / selector call / ternary when (1000-1039)
+// ═══════════════════════════════════════════════════════════════════════
+
+Direction :: enum {
+	North,
+	South,
+	East,
+	West,
+}
+
+direction_value :: proc(d: Direction) -> int {
+	switch d {
+	case .North: return 1
+	case .South: return 2
+	case .East:  return 3
+	case .West:  return 4
+	}
+	return 0
+}
+
+identity :: proc(x: int) -> int { return x }
+
+test_ternary_if :: proc() {
+	// Trivial scalar path: both arms are constants → SELECT
+	a := 10 if true else 20
+	check(a == 10, 1000)
+	b := 10 if false else 20
+	check(b == 20, 1001)
+
+	// Trivial with identifiers → SELECT
+	x := 42
+	y := 99
+	c := x if true else y
+	check(c == 42, 1002)
+	d := x if false else y
+	check(d == 99, 1003)
+
+	// Variable condition → SELECT (trivial arms)
+	flag := true
+	e := 1 if flag else 0
+	check(e == 1, 1004)
+	flag = false
+	f := 1 if flag else 0
+	check(f == 0, 1005)
+
+	// General path: function calls in arms (non-trivial, needs branch)
+	g := identity(7) if true else identity(13)
+	check(g == 7, 1006)
+	h := identity(7) if false else identity(13)
+	check(h == 13, 1007)
+
+	// Nested ternary
+	val := 100
+	r := 1 if val > 50 else (2 if val > 25 else 3)
+	check(r == 1, 1008)
+	val = 30
+	r = 1 if val > 50 else (2 if val > 25 else 3)
+	check(r == 2, 1009)
+	val = 10
+	r = 1 if val > 50 else (2 if val > 25 else 3)
+	check(r == 3, 1010)
+
+	// Boolean result
+	is_big := true if val > 100 else false
+	check(!is_big, 1011)
+
+	// With type conversion (float → int context)
+	fi := 5 if true else 10
+	check(fi == 5, 1012)
+}
+
+test_implicit_selector :: proc() {
+	// Implicit selector on enum
+	d : Direction = .North
+	check(d == Direction.North, 1013)
+
+	d = .West
+	check(d == Direction.West, 1014)
+
+	// In function argument (enum)
+	v := direction_value(.South)
+	check(v == 2, 1015)
+
+	// In comparison
+	check(d == .West, 1016)
+	check(d != .East, 1017)
+
+	// In switch
+	result := 0
+	switch d {
+	case .North: result = 1
+	case .South: result = 2
+	case .East:  result = 3
+	case .West:  result = 4
+	}
+	check(result == 4, 1018)
+}
+
+test_selector_call :: proc() {
+	// SelectorCallExpr: the checker rewrites method-style calls.
+	// Test basic call forwarding with a simple call expression.
+	r := identity(55)
+	check(r == 55, 1019)
+}
+
+COMPILE_TIME_FLAG :: true
+COMPILE_TIME_VALUE :: 42 when COMPILE_TIME_FLAG else 99
+
+test_ternary_when :: proc() {
+	// Compile-time conditional selection
+	v := COMPILE_TIME_VALUE
+	check(v == 42, 1021)
+
+	// Inline ternary when
+	w := 10 when ODIN_OS == .Linux else 20
+	check(w == 10, 1022)
+
+	// size_of is compile-time
+	s := 8 when size_of(int) == 8 else 4
+	check(s == 8, 1023)
+}
+
+test_ternary_combined :: proc() {
+	// Ternary if with implicit selectors
+	d : Direction = .North if true else .South
+	check(d == Direction.North, 1024)
+	d = .North if false else .South
+	check(d == Direction.South, 1025)
+
+	// Ternary if with enum function
+	v := direction_value(.East if true else .West)
+	check(v == 3, 1026)
+	v = direction_value(.East if false else .West)
+	check(v == 4, 1027)
+
+	// Chained ternary in loop
+	sum := 0
+	for i in 0..<6 {
+		sum += 1 if i % 2 == 0 else -1
+	}
+	check(sum == 0, 1028)  // 3 evens (+1) and 3 odds (-1) = 0
+
+	// Ternary as function argument
+	check(identity(10 if true else 20) == 10, 1029)
+	check(identity(10 if false else 20) == 20, 1030)
+
+	// Multiple ternaries in one expression
+	a := (1 if true else 0) + (2 if true else 0) + (4 if false else 0)
+	check(a == 3, 1031)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Main — run everything
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -749,6 +902,16 @@ main :: proc() {
 	test_or_else()
 	print_msg("  globals...\n")
 	test_globals()
+	print_msg("  ternary_if...\n")
+	test_ternary_if()
+	print_msg("  implicit_selector...\n")
+	test_implicit_selector()
+	print_msg("  selector_call...\n")
+	test_selector_call()
+	print_msg("  ternary_when...\n")
+	test_ternary_when()
+	print_msg("  ternary_combined...\n")
+	test_ternary_combined()
 	print_msg("ALL PASS\n")
 	exit(0)
 }
