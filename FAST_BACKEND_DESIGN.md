@@ -488,6 +488,21 @@ struct fbProc {
     fbParamLoc *param_locs;
     u32         param_count;
 
+    // Split return convention: split_returns_index is the first param_locs entry
+    // for hidden output pointer parameters. split_returns_count is how many.
+    i32 split_returns_index;
+    i32 split_returns_count;
+
+    // XMM parameter ABI (non-Odin CC only): maps SSE-classified float params
+    // to XMM0-XMM7. The prologue spills these to stack slots.
+    struct fbXmmParamLoc {
+        u32 slot_idx;     // stack slot for spill
+        u8  xmm_idx;     // XMM register number (0-7)
+        u8  float_kind;   // FBT_F32 or FBT_F64
+    };
+    fbXmmParamLoc *xmm_param_locs;
+    u32            xmm_param_count;
+
     // Machine code output (populated by lowering)
     u8    *machine_code;
     u32    machine_code_size;
@@ -1059,12 +1074,13 @@ A `fb_x64_float_cmp_nan_safe` helper factors the four NaN-unsafe patterns.
 
 **Float conversions:**
 - `SI2FP`: `CVTSI2SS`/`CVTSI2SD`. Sub-i32 sources (i8, i16) require `MOVSX` sign-extension first — `LOAD` uses `MOVZX` (zero-extension), so without the sign-extend, `i8(-1)` = `0xFF` converts as 255.0 instead of -1.0.
-- `UI2FP`: `CVTSI2SS`/`CVTSI2SD` with zero-extension. Known limitation: u64 values ≥ 2^63 are not handled specially.
-- `FP2SI`/`FP2UI`: `CVTTSS2SI`/`CVTTSD2SI` with truncation toward zero.
+- `UI2FP`: Full u64 range via halving trick. If the sign bit is set (value ≥ 2^63): halve with round-to-odd (`shr 1` + `or` low bit), convert signed, then `addss`/`addsd` to double the result. If positive: direct signed `CVTSI2SS`/`CVTSI2SD`. Uses `test reg,reg` + `jns` with in-place rel8 patching.
+- `FP2UI`: Full u64 range via conditional subtraction. Load 2^63 as float into XMM1, `comiss`/`comisd`. If below: direct signed `CVTTSS2SI`/`CVTTSD2SI`. If above: subtract 2^63 float, convert signed, `btc rd,63` to toggle bit 63 back. Uses `jb` + `jmp` with in-place rel8 patching.
+- `FP2SI`: `CVTTSS2SI`/`CVTTSD2SI` with truncation toward zero.
 - `FPEXT` (f32→f64): `CVTSS2SD`
 - `FPTRUNC` (f64→f32): `CVTSD2SS`
 
-**Float parameters (current limitation):** Float parameters classified as `FB_ABI_SSE` by the SysV classifier are currently routed through GP registers for intra-backend Odin-to-Odin calls. External C calls with float parameters in XMM0-XMM7 require proper XMM ABI routing, which is deferred.
+**Float parameters:** Float parameters classified as `FB_ABI_SSE` are routed through GP registers for intra-backend Odin-to-Odin calls (Odin CC convention). For external C calls (non-Odin CC), SSE-classified float params are received in XMM0-XMM7 and spilled to stack slots in the prologue. At call sites, SSE arguments are tracked with an `sse_mask`/`f64_mask` bitmask pair encoded in the CALL instruction's `imm` field; the lowering loads them from GP spill slots into XMM registers via `movd`/`movq` before the call. Non-Odin CC calls with SSE return types capture from XMM0 and transfer to a GP register.
 
 ### 11.8 Bit Manipulation Lowering (x64)
 
@@ -1122,22 +1138,23 @@ Similar strategy. S_LOCAL records with `DefRangeFramePointerRelFullScope` (simpl
 
 ```
 src/
-├── fb_ir.h                 // IR types, opcode enum, instruction format, builder/lowering structs (~770 lines)
-├── fb_ir.cpp               // Module lifecycle, type helpers, symbol management (~540 lines)
-├── fb_build.cpp            // AST → IR builder (~2600 lines, growing)
+├── fb_ir.h                 // IR types, opcode enum, instruction format, builder/lowering structs (~820 lines)
+├── fb_ir.cpp               // Module lifecycle, type helpers, symbol management (~596 lines)
+├── fb_build.cpp            // AST → IR builder (~3720 lines, growing)
 │                           //   fb_build_expr(), fb_build_stmt(), fb_build_addr(),
 │                           //   fb_build_call(), fb_build_return(), fb_emit_conv(), etc.
 │                           //   Mirrors tilde_expr.cpp + tilde_stmt.cpp + tilde_proc.cpp
-├── fb_abi.cpp              // ABI classification for SysV AMD64 (~126 lines, scalar + two-eightbyte)
-├── fb_lower_x64.cpp        // x86-64 machine code lowering (~1950 lines)
-│                           //   GP register allocator, XMM scratch encoding helpers,
-│                           //   float/int/bitmanip lowering, NaN-safe float comparisons
+├── fb_abi.cpp              // ABI classification for SysV AMD64 (~172 lines, struct/array decomposition)
+├── fb_lower_x64.cpp        // x86-64 machine code lowering (~2226 lines)
+│                           //   GP register allocator, XMM scratch/ABI encoding helpers,
+│                           //   float/int/bitmanip lowering, NaN-safe float comparisons,
+│                           //   UI2FP halving trick, FP2UI conditional subtraction
 ├── fb_emit_elf.cpp         // ELF object file emission (~700 lines)
 │                           //   Self-contained ELF64 types (no system elf.h dependency)
 │                           //   fbBuf growable byte buffer for section construction
 │                           //   .text, .rodata, .data, .bss, .rela.text sections
 │                           //   Single-pass symbol table with proper LOCAL/GLOBAL ordering
-├── fb_build_builtin.cpp    // Built-in procedure handling (~480 lines)
+├── fb_build_builtin.cpp    // Built-in procedure handling (~473 lines)
 │                           //   len/cap/raw_data for slices, strings, dynamic arrays
 │                           //   min/max (variadic), abs, clamp
 │                           //   ptr_offset, ptr_sub, mem_copy, mem_zero
@@ -1249,8 +1266,8 @@ TOTAL                            ~102
 ```
 
 ~100 opcodes. Each maps 1:1 to a fixed machine instruction template.
-The switch dispatch in the lowering loop handles all of them in ~2000 lines
-per target (x64 currently at ~1950 lines; arm64 not yet implemented).
+The switch dispatch in the lowering loop handles all of them in ~2200 lines
+per target (x64 currently at ~2226 lines; arm64 not yet implemented).
 
 ## 17. Design Invariants
 
@@ -1330,7 +1347,7 @@ Implemented multi-block control flow with forward branch patching, all integer c
 Implemented SysV AMD64 scalar ABI classification, parameter receiving, function calls with register/stack arguments, and relocation emission.
 
 **Files created/modified:**
-- `src/fb_abi.cpp` — SysV AMD64 type classification (scalar, pointer, slice, string, dynamic array, map, enum, bit set; complex/quaternion explicitly MEMORY; aggregates default to MEMORY until Phase 6 struct decomposition)
+- `src/fb_abi.cpp` — SysV AMD64 type classification with struct/array decomposition (scalar, pointer, slice, string, dynamic array, map, enum, bit set; complex/quaternion explicitly MEMORY; small structs/arrays ≤16B with all-INTEGER fields recursively classified as 1×/2×INTEGER)
 - `src/fb_ir.h` — Added `fbReloc`/`fbRelocType`, `fbParamLoc` struct (slot_idx + sub_offset), `param_locs`/`param_count` to `fbProc`
 - `src/fb_build.cpp` — `fb_setup_params()` creates stack slots for GP register params: 8-byte for single-eightbyte, 16-byte for two-eightbyte (string, slice) with sub_offset tracking; Odin CC appends context pointer as last GP arg
 - `src/fb_lower_x64.cpp` — `FB_SYMADDR` → `value_sym` tracking (deferred materialization via RIP-relative LEA); `FB_CALL` lowering: spill all caller-saved, push stack args in reverse, load register args into ABI-mandated registers, emit direct `CALL rel32` (with PLT32 reloc) or indirect `CALL r11`; prologue parameter spills; relocation accumulation
@@ -1340,9 +1357,6 @@ Implemented SysV AMD64 scalar ABI classification, parameter receiving, function 
 
 **Remaining:**
 - Struct return via sret (hidden pointer)
-- XMM ABI for external C calls with float parameters (intra-backend float params use GP registers)
-- MEMORY-class (>16 byte) aggregate passing
-- Full struct ABI decomposition
 - `FB_TAILCALL` lowering
 - Win64 ABI classification
 
@@ -1379,7 +1393,7 @@ Core AST-to-IR translation with expression, statement, and address builders.
 - Full struct/union field access patterns
 - Complex address kinds: Map, SOA (full), RelativePtr, Swizzle, BitField
 - Constant folding in the builder
-- Type assertions, type switches
+- Type switches
 - Inline assembly
 
 **Phase 6b: Built-in Procedures & Float Fix (DONE)**
@@ -1449,7 +1463,7 @@ Implemented x64 lowering for all 25 float and bit manipulation opcodes that were
 - Float arithmetic: FADD, FSUB, FMUL, FDIV, FMIN, FMAX (SSE scalar via XMM0/XMM1 scratch)
 - Float unary: FNEG (XOR sign bit in GP), FABS (AND mask in GP), SQRT (SQRTSS/SQRTSD)
 - Float comparison: all 6 FP comparisons with NaN-safe patterns (see §11.7)
-- Float conversion: SI2FP with sign-extension fix for sub-i32 sources, UI2FP, FP2SI, FP2UI, FPEXT, FPTRUNC
+- Float conversion: SI2FP with sign-extension fix for sub-i32 sources, UI2FP (full u64 range via halving trick), FP2SI, FP2UI (full u64 range via conditional subtraction), FPEXT, FPTRUNC
 - Bit manipulation: BSWAP, POPCNT, CLZ (BSR+XOR), CTZ (BSF)
 - `any` type parameters correctly use 2 GP registers (was broken: 16 bytes misclassified as single-eightbyte)
 - Shift instructions no longer corrupt `value_loc[]` tracking — RCX is properly spilled after the shift, not just cleared
@@ -1688,6 +1702,43 @@ The ternary if uses a `is_trivial` lambda matching the LLVM backend's heuristic:
 - The general branch path guards both `fb_emit_jump` calls with `fb_block_is_terminated` checks, following the codebase convention. This prevents double-termination if arm evaluation ever terminates a block (e.g., future noreturn call support)
 - `TernaryWhenExpr` asserts `Addressing_Constant` on the condition, matching the LLVM backend — the checker guarantees this but the assertion catches internal errors early
 
+**Phase 6o: Union Types, Type Assertions, MEMORY-Class Params (DONE)**
+
+Implemented tagged union support, type assertion expressions, and MEMORY-class aggregate parameter passing.
+
+**Files modified:**
+- `src/fb_build.cpp` — `fb_emit_store_union_variant()` (writes data + tag, handles maybe-pointer, zero-sized variants, memzero of stale data); `fb_emit_conv()` gained union conversion path (value→union via temp alloca); `fb_build_compound_lit()` added `Type_Union` case; two separate type assertion paths: address-of (`&v.(T)`) and value (`v.(T)`), each handling both tuple `(T, bool)` and direct `T` forms with trap-on-mismatch; `fb_build_mutable_value_decl`/`fb_build_assign_stmt` extended to handle aggregate tuple pointers from type assertions (distinct from split-return temps)
+- `src/fb_build.cpp` — MEMORY-class parameters: `fb_setup_params` allocates GP register slots for hidden pointers; procedure begin dereferences MEMORY param pointers via `fb_emit_load`
+- `src/fb_ir.h` — No new types (reuses existing structures)
+- `tests/fast_backend/test_union.odin` — 82 lines of union tests
+
+**What works:**
+- Tagged union creation from compound literals (`Value{i = 42}`)
+- Implicit union conversion in assignment and call arguments
+- Maybe-pointer unions (tag-free, nil = no value)
+- Zero-sized variant handling (memzero stale data region)
+- Type assertion with tuple return: `val, ok := u.(int)`
+- Type assertion with direct return: `val := u.(int)` (traps on mismatch)
+- Address-of type assertion: `ptr, ok := &u.(int)`; `ptr := &u.(int)` (traps on mismatch)
+- MEMORY-class aggregate parameters (>16 bytes) passed as hidden pointers in GP registers
+
+**Phase 6p: C Interop ABI — XMM Parameters, Small Structs, Unsigned Float Conversions (DONE)**
+
+Full SysV AMD64 ABI compliance for C interop: XMM float parameter passing/receiving, small struct decomposition, and correct unsigned-to-float/float-to-unsigned conversions for the full u64 range.
+
+**Files modified:**
+- `src/fb_abi.cpp` — Recursive struct/array ABI decomposition: structs ≤16B with all-INTEGER fields classified as 1×/2×INTEGER; small arrays ≤16B similarly decomposed; packed/raw_union structs conservatively go to MEMORY
+- `src/fb_build.cpp` — `fb_setup_params` routes SSE-classified params to `fbXmmParamLoc` slots for non-Odin CC (XMM0-7); `xmm_param_locs`/`xmm_param_count` stored on fbProc; call codegen tracks `sse_mask`/`f64_mask` bitmasks in CALL instruction `imm` field; small struct arguments (≤8B, 1×INTEGER) loaded as scalar before passing
+- `src/fb_lower_x64.cpp` — Prologue emits `movss`/`movsd` from XMM registers to stack slots; call lowering rewritten for mixed GP/XMM: independent GP and XMM register counting, SSE arg bitmask decoding, GP→XMM transfer via `movd`/`movq`; non-Odin CC SSE return capture from XMM0→GP; `UI2FP` halving trick for full u64 range; `FP2UI` conditional subtraction for full u64 range
+
+**What works:**
+- External C functions receiving float parameters in XMM0-XMM7
+- Mixed integer/float parameter lists with correct register assignment
+- SSE return value capture (f32/f64 from XMM0)
+- Small struct arguments (≤8 bytes) passed as register-width integers
+- `UI2FP` handles values ≥ 2^63 correctly (halving trick)
+- `FP2UI` handles values ≥ 2^63 correctly (conditional subtraction)
+
 ### Phase 7: Remaining Odin Features (TODO)
 
 - Map operations (runtime calls)
@@ -1695,13 +1746,12 @@ The ternary if uses a `is_trivial` lambda matching the LLVM backend's heuristic:
 - Slice operations (`append`, `delete`, `make`, `new`)
 - Dynamic array operations
 - Bit fields, swizzle
-- Type assertions, type switches
+- Type switches
 - Runtime type info generation
 - SIMD builtins, atomic builtins
 
-### Phase 8: SIMD, Atomics, Float ABI (TODO)
+### Phase 8: SIMD, Atomics (TODO)
 
-- XMM register ABI for external C calls with float parameters (XMM0-XMM7)
 - SIMD vector operations (lane-wise arithmetic, shuffles, extracts/inserts)
 - Atomic operations lowering to `lock` prefix / `cmpxchg`
 - Memory fences
