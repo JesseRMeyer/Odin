@@ -321,6 +321,7 @@ gb_internal bool fb_block_is_terminated(fbBuilder *b) {
 gb_internal bool fb_type_is_signed(Type *t) {
 	t = core_type(t);
 	if (t->kind == Type_Basic) {
+		if (t->Basic.flags & BasicFlag_Boolean) return false;
 		return (t->Basic.flags & BasicFlag_Unsigned) == 0;
 	}
 	if (t->kind == Type_Enum) {
@@ -1860,7 +1861,9 @@ gb_internal void fb_build_range_interval(fbBuilder *b, AstBinaryExpr *node,
 	// Post: increment value and index, loop back.
 	fb_set_block(b, post_block);
 	fbValue v = fb_addr_load(b, value);
-	fbValue one = fb_emit_iconst(b, iter_type, 1);
+	fbValue one = is_type_float(iter_type)
+		? fb_emit_fconst(b, iter_type, 1.0)
+		: fb_emit_iconst(b, iter_type, 1);
 	fbOp add_op = is_type_float(iter_type) ? FB_FADD : FB_ADD;
 	fbValue v_next = fb_emit_arith(b, add_op, v, one, iter_type);
 	fb_addr_store(b, value, v_next);
@@ -1914,14 +1917,14 @@ gb_internal void fb_build_range_indexed(fbBuilder *b, AstRangeStmt *rs,
 		elem_type = et->Slice.elem;
 		stride = type_size_of(elem_type);
 		// Slice layout: {data rawptr, len int}
-		count = fb_emit_load(b, fb_emit_member(b, base_addr.base, 8), t_int);
+		count = fb_emit_load(b, fb_emit_member(b, base_addr.base, build_context.ptr_size), t_int);
 		data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
 		break;
 	case Type_DynamicArray:
 		elem_type = et->DynamicArray.elem;
 		stride = type_size_of(elem_type);
 		// Dynamic array layout: {data rawptr, len int, cap int, allocator ...}
-		count = fb_emit_load(b, fb_emit_member(b, base_addr.base, 8), t_int);
+		count = fb_emit_load(b, fb_emit_member(b, base_addr.base, build_context.ptr_size), t_int);
 		data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
 		break;
 	default:

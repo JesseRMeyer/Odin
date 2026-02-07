@@ -28,7 +28,7 @@ gb_internal fbValue fb_builtin_len(fbBuilder *b, Ast *arg_expr) {
 	if (is_type_pointer(t)) {
 		fbValue ptr = fb_build_expr(b, arg_expr);
 		t = base_type(type_deref(type_of_expr(arg_expr)));
-		i64 len_offset = build_context.int_size; // field 1 for all container types
+		i64 len_offset = build_context.ptr_size; // len follows the data pointer
 		return fb_load_field(b, ptr, len_offset, t_int);
 	}
 
@@ -39,16 +39,16 @@ gb_internal fbValue fb_builtin_len(fbBuilder *b, Ast *arg_expr) {
 		return fb_emit_iconst(b, t_int, t->EnumeratedArray.count);
 	case Type_Slice:
 	case Type_DynamicArray: {
-		// Slice:   {data: rawptr, len: int}            → len at int_size
-		// DynArr:  {data: rawptr, len: int, cap: int, alloc: Allocator} → len at int_size
+		// Slice:   {data: rawptr, len: int}            → len at ptr_size
+		// DynArr:  {data: rawptr, len: int, cap: int, alloc: Allocator} → len at ptr_size
 		fbAddr addr = fb_build_addr(b, arg_expr);
-		return fb_load_field(b, addr.base, build_context.int_size, t_int);
+		return fb_load_field(b, addr.base, build_context.ptr_size, t_int);
 	}
 	case Type_Basic:
 		if (is_type_string(t)) {
-			// string: {data: [^]u8, len: int} → len at int_size
+			// string: {data: [^]u8, len: int} → len at ptr_size
 			fbAddr addr = fb_build_addr(b, arg_expr);
-			return fb_load_field(b, addr.base, build_context.int_size, t_int);
+			return fb_load_field(b, addr.base, build_context.ptr_size, t_int);
 		}
 		break;
 	case Type_Map: {
@@ -80,10 +80,10 @@ gb_internal fbValue fb_builtin_cap(fbBuilder *b, Ast *arg_expr) {
 		fbValue ptr = fb_build_expr(b, arg_expr);
 		t = base_type(type_deref(type_of_expr(arg_expr)));
 		if (t->kind == Type_DynamicArray) {
-			return fb_load_field(b, ptr, 2 * build_context.int_size, t_int);
+			return fb_load_field(b, ptr, build_context.ptr_size + build_context.int_size, t_int);
 		}
 		// Slice and string cap == len
-		return fb_load_field(b, ptr, build_context.int_size, t_int);
+		return fb_load_field(b, ptr, build_context.ptr_size, t_int);
 	}
 
 	switch (t->kind) {
@@ -94,18 +94,18 @@ gb_internal fbValue fb_builtin_cap(fbBuilder *b, Ast *arg_expr) {
 	case Type_Slice: {
 		// Slice has no separate cap; cap(slice) == len(slice) in Odin
 		fbAddr addr = fb_build_addr(b, arg_expr);
-		return fb_load_field(b, addr.base, build_context.int_size, t_int);
+		return fb_load_field(b, addr.base, build_context.ptr_size, t_int);
 	}
 	case Type_DynamicArray: {
-		// DynArr: cap is field 2 at 2*int_size
+		// DynArr: cap is field 2 at ptr_size + int_size
 		fbAddr addr = fb_build_addr(b, arg_expr);
-		return fb_load_field(b, addr.base, 2 * build_context.int_size, t_int);
+		return fb_load_field(b, addr.base, build_context.ptr_size + build_context.int_size, t_int);
 	}
 	case Type_Basic:
 		if (is_type_string(t)) {
 			// cap(string) == len(string)
 			fbAddr addr = fb_build_addr(b, arg_expr);
-			return fb_load_field(b, addr.base, build_context.int_size, t_int);
+			return fb_load_field(b, addr.base, build_context.ptr_size, t_int);
 		}
 		break;
 	default:

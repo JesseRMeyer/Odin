@@ -398,7 +398,7 @@ gb_internal void fb_x64_move_value_to_reg(fbLowCtx *ctx, u32 vreg, fbX64Reg targ
 
 	ctx->gp[target].vreg     = vreg;
 	ctx->gp[target].last_use = ctx->current_inst_idx;
-	ctx->gp[target].dirty    = (loc >= 0 && loc < 16); // dirty if moved from reg, clean if reloaded
+	ctx->gp[target].dirty    = (loc >= 0 || loc == FB_LOC_NONE); // clean only when reloaded from spill slot
 	ctx->value_loc[vreg]     = cast(i32)target;
 }
 
@@ -579,8 +579,19 @@ gb_internal void fb_x64_div(fbLowCtx *ctx, fbInst *inst, bool is_signed, bool wa
 	fb_x64_spill_reg(ctx, FB_RAX);
 	fb_x64_spill_reg(ctx, FB_RDX);
 
-	// Move dividend into RAX
+	// Move dividend into RAX, then detach it so DIV's clobber doesn't
+	// leave value_loc pointing at an unwritten spill slot.
 	fb_x64_move_value_to_reg(ctx, inst->a, FB_RAX);
+	if (ctx->gp[FB_RAX].dirty) {
+		// Flush to spill slot so the value survives if needed later.
+		i32 offset = fb_x64_spill_offset(ctx, inst->a);
+		fb_x64_rex(ctx, true, FB_RAX, 0, FB_RBP);
+		fb_low_emit_byte(ctx, 0x89);
+		fb_x64_modrm_rbp_disp32(ctx, FB_RAX, offset);
+		ctx->gp[FB_RAX].dirty = false;
+	}
+	ctx->value_loc[inst->a] = fb_x64_spill_offset(ctx, inst->a);
+	ctx->gp[FB_RAX].vreg = FB_NOREG;
 
 	// Sign/zero extend into RDX
 	if (is_signed) {
@@ -608,10 +619,6 @@ gb_internal void fb_x64_div(fbLowCtx *ctx, fbInst *inst, bool is_signed, bool wa
 	// The non-result register is now dead
 	ctx->gp[other_reg].vreg = FB_NOREG;
 	ctx->gp[other_reg].dirty = false;
-	// RAX no longer holds the dividend
-	if (ctx->value_loc[inst->a] == cast(i32)FB_RAX) {
-		ctx->value_loc[inst->a] = fb_x64_spill_offset(ctx, inst->a);
-	}
 
 	// Assign result
 	ctx->gp[result_reg].vreg = inst->r;
