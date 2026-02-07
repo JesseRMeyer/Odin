@@ -283,6 +283,7 @@ gb_internal fbProc *fb_proc_create(fbModule *m, Entity *e) {
 	p->is_export  = e->Procedure.is_export;
 
 	p->current_block = FB_NOREG; // no active block until fb_block_start
+	p->split_returns_index = -1;
 
 	// Foreign procs are extern declarations — no IR, no machine code.
 	// Skip heap allocations; all pointers remain NULL, caps stay 0.

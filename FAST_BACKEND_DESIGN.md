@@ -850,7 +850,7 @@ struct fbLowCtx {
     // Block-start code offsets (for branch patching)
     u32 *block_offsets;
 
-    // Machine register file (x64 GP only for now; fp/vec added in Phase 8)
+    // Machine register file (GP only — XMM scratch registers are not tracked)
     fbRegState gp[16];    // x64: RAX-R15
 
     // Where is each value? (vreg → location)
@@ -915,7 +915,9 @@ for each block B in procedure:
 
 **Scratch register reservation:** On x64, RSP and RBP are reserved (frame/stack). On arm64, SP and X29 (FP) are reserved. All other registers are available for allocation.
 
-**Callee-saved registers:** At -O0, avoid callee-saved registers entirely (no save/restore overhead). Use only caller-saved registers: x64: RAX, RCX, RDX, RSI, RDI, R8-R11 (9 GP), XMM0-XMM7 (8 FP). arm64: X0-X17 (18 GP), V0-V7 (8 FP).
+**Callee-saved registers:** At -O0, avoid callee-saved registers entirely (no save/restore overhead). Use only caller-saved registers: x64: RAX, RCX, RDX, RSI, RDI, R8-R11 (9 GP). arm64: X0-X17 (18 GP), V0-V7 (8 FP).
+
+**XMM scratch registers:** Float values are stored in GP registers at -O0 (as bit-punned i32/i64). XMM0 and XMM1 are used as **fixed scratch registers** for float computation — operands are moved GP→XMM before SSE instructions, results are moved XMM→GP after. No XMM register allocator or tracking is needed. This simplifies the design significantly at the cost of extra MOVD/MOVQ transfers per float operation, which is acceptable for -O0.
 
 ### 11.3 Code Emission
 
@@ -1020,6 +1022,49 @@ ret
 
 The prologue is prepended to the code buffer after block emission. All code offsets (block_offsets, fixups, line table) are adjusted by the prologue size.
 
+### 11.7 Float Lowering (x64)
+
+Float values live in GP registers as bit-punned integers. XMM0 and XMM1 are fixed scratch registers — no XMM allocation or tracking.
+
+**Float binary arithmetic** (`FADD`, `FSUB`, `FMUL`, `FDIV`, `FMIN`, `FMAX`):
+```
+resolve %a → GP ra;  MOVD/MOVQ ra → XMM0
+resolve %b → GP rb;  MOVD/MOVQ rb → XMM1
+SSE_op XMM0, XMM1    (prefix F3 for f32, F2 for f64)
+alloc  %r → GP rd;   MOVD/MOVQ XMM0 → rd
+```
+
+**Float unary** (`FNEG`, `FABS`, `SQRT`):
+- `FNEG`: XOR sign bit via GP (xor with `0x80000000` / `0x8000000000000000`)
+- `FABS`: AND away sign bit via GP (and with `0x7FFFFFFF` / `0x7FFFFFFFFFFFFFFF`)
+- `SQRT`: GP→XMM0, `SQRTSS`/`SQRTSD`, XMM0→GP
+
+**Float comparisons** (`CMP_FEQ..CMP_FGE`):
+Uses `UCOMISS`/`UCOMISD` which sets ZF, CF, and PF. PF=1 when either operand is NaN.
+- `FGT` (`seta`) and `FGE` (`setae`) are naturally NaN-safe (return false for NaN).
+- `FEQ`: `sete` + `setnp` + `AND` (ordered and equal)
+- `FNE`: `setne` + `setp` + `OR` (unordered or not-equal)
+- `FLT`: `setb` + `setnp` + `AND` (ordered and below)
+- `FLE`: `setbe` + `setnp` + `AND` (ordered and below-or-equal)
+
+A `fb_x64_float_cmp_nan_safe` helper factors the four NaN-unsafe patterns.
+
+**Float conversions:**
+- `SI2FP`: `CVTSI2SS`/`CVTSI2SD`. Sub-i32 sources (i8, i16) require `MOVSX` sign-extension first — `LOAD` uses `MOVZX` (zero-extension), so without the sign-extend, `i8(-1)` = `0xFF` converts as 255.0 instead of -1.0.
+- `UI2FP`: `CVTSI2SS`/`CVTSI2SD` with zero-extension. Known limitation: u64 values ≥ 2^63 are not handled specially.
+- `FP2SI`/`FP2UI`: `CVTTSS2SI`/`CVTTSD2SI` with truncation toward zero.
+- `FPEXT` (f32→f64): `CVTSS2SD`
+- `FPTRUNC` (f64→f32): `CVTSD2SS`
+
+**Float parameters (current limitation):** Float parameters classified as `FB_ABI_SSE` by the SysV classifier are currently routed through GP registers for intra-backend Odin-to-Odin calls. External C calls with float parameters in XMM0-XMM7 require proper XMM ABI routing, which is deferred.
+
+### 11.8 Bit Manipulation Lowering (x64)
+
+- `BSWAP`: `BSWAP r64` (0F C8+rd) — single instruction, result in-place
+- `POPCNT`: `POPCNT r64, r64` (F3 0F B8 /r) — requires POPCNT feature flag
+- `CLZ`: `BSR r64, r64` then `XOR result, 63` — BSR finds highest set bit, XOR inverts to count from MSB
+- `CTZ`: `BSF r64, r64` (0F BC /r) — scans from LSB
+
 ## 12. Debug Info
 
 ### 12.1 DWARF (Linux, macOS)
@@ -1069,19 +1114,21 @@ Similar strategy. S_LOCAL records with `DefRangeFramePointerRelFullScope` (simpl
 
 ```
 src/
-├── fb_ir.h                 // IR types, opcode enum, instruction format, builder/lowering structs (~750 lines)
+├── fb_ir.h                 // IR types, opcode enum, instruction format, builder/lowering structs (~760 lines)
 ├── fb_ir.cpp               // Module lifecycle, type helpers, symbol management (~540 lines)
-├── fb_build.cpp            // AST → IR builder (~1800 lines, growing)
+├── fb_build.cpp            // AST → IR builder (~2100 lines, growing)
 │                           //   fb_build_expr(), fb_build_stmt(), fb_build_addr(),
-│                           //   fb_build_call(), fb_build_return(), etc.
+│                           //   fb_build_call(), fb_build_return(), fb_emit_conv(), etc.
 │                           //   Mirrors tilde_expr.cpp + tilde_stmt.cpp + tilde_proc.cpp
-├── fb_abi.cpp              // ABI classification for SysV AMD64 (~120 lines, scalar only)
-├── fb_lower_x64.cpp        // x86-64 machine code lowering (~1400 lines)
+├── fb_abi.cpp              // ABI classification for SysV AMD64 (~126 lines, scalar + two-eightbyte)
+├── fb_lower_x64.cpp        // x86-64 machine code lowering (~1950 lines)
+│                           //   GP register allocator, XMM scratch encoding helpers,
+│                           //   float/int/bitmanip lowering, NaN-safe float comparisons
 ├── fb_emit_elf.cpp         // ELF object file emission (~530 lines)
 │                           //   Self-contained ELF64 types (no system elf.h dependency)
 │                           //   fbBuf growable byte buffer for section construction
 │                           //   Single-pass symbol table with proper LOCAL/GLOBAL ordering
-├── fb_build_builtin.cpp    // Built-in procedure handling (~340 lines)
+├── fb_build_builtin.cpp    // Built-in procedure handling (~480 lines)
 │                           //   len/cap/raw_data for slices, strings, dynamic arrays
 │                           //   min/max (variadic), abs, clamp
 │                           //   ptr_offset, ptr_sub, mem_copy, mem_zero
@@ -1194,7 +1241,7 @@ TOTAL                            ~102
 
 ~100 opcodes. Each maps 1:1 to a fixed machine instruction template.
 The switch dispatch in the lowering loop handles all of them in ~2000 lines
-per target (x64, arm64).
+per target (x64 currently at ~1950 lines; arm64 not yet implemented).
 
 ## 17. Design Invariants
 
@@ -1284,7 +1331,7 @@ Implemented SysV AMD64 scalar ABI classification, parameter receiving, function 
 
 **Remaining:**
 - Struct return via sret (hidden pointer)
-- SSE/float parameter passing
+- XMM ABI for external C calls with float parameters (intra-backend float params use GP registers)
 - MEMORY-class (>16 byte) aggregate passing
 - Full struct ABI decomposition
 - `FB_TAILCALL` lowering
@@ -1350,8 +1397,6 @@ Built-in procedure dispatch and float opcode correction.
 - x64 lowering: unimplemented opcodes produce categorized `GB_PANIC` messages (float arithmetic, float comparison, float conversion, atomics, wide arithmetic, bit manipulation, SIMD, miscellaneous) instead of silent `ud2` traps
 - `fb_x64_resolve_gp` asserts when a value has no location and no symbol reference, catching dangling value references early
 
-**Not yet lowered in x64:** BSWAP, POPCNT, CLZ, CTZ opcodes (IR emitted, lowering TODO); float arithmetic/comparison/conversion (requires XMM register support, Phase 8)
-
 **Phase 6c: Compound Literals & Entry Point (DONE)**
 
 Struct, array, and nested struct compound literal initialization. Entry point now builds full user code from AST instead of synthetic stub IR.
@@ -1384,6 +1429,122 @@ Struct, array, and nested struct compound literal initialization. Entry point no
 
 **Not yet supported:** Slice literals (`[]int{1,2,3}` — requires runtime allocation), dynamic array literals, map literals, bit_set literals, union literals
 
+**Phase 6d: Float/XMM Lowering & Bug Fixes (DONE)**
+
+Implemented x64 lowering for all 25 float and bit manipulation opcodes that were previously `GB_PANIC` stubs, plus critical bug fixes in ABI classification, shift register tracking, and bool conversion ordering.
+
+**Files modified:**
+- `src/fb_lower_x64.cpp` — XMM encoding helpers (`fb_x64_movd_gp_to_xmm`, `fb_x64_movq_gp_to_xmm`, `fb_x64_gp_to_xmm`, etc.), `fb_x64_float_binop` template, `fb_x64_float_cmp_nan_safe` helper, lowering for 25 opcodes (9 float arith + 6 float cmp + 6 float conv + 4 bit manip); shift helper (`fb_x64_shift_cl`) now spills RCX correctly after use
+- `src/fb_build.cpp` — Bool conversion paths moved before general integer/float paths in `fb_emit_conv`; `fb_emit_cmp` stores source type in `imm` for float comparisons (`ucomiss` vs `ucomisd` selection); SSE-classified parameters allocated as GP slots in `fb_setup_params`
+- `src/fb_abi.cpp` — `Basic_any` (`{rawptr, typeid}` = 16 bytes) correctly classified as 2×INTEGER instead of 1×INTEGER
+
+**What works:**
+- Float arithmetic: FADD, FSUB, FMUL, FDIV, FMIN, FMAX (SSE scalar via XMM0/XMM1 scratch)
+- Float unary: FNEG (XOR sign bit in GP), FABS (AND mask in GP), SQRT (SQRTSS/SQRTSD)
+- Float comparison: all 6 FP comparisons with NaN-safe patterns (see §11.7)
+- Float conversion: SI2FP with sign-extension fix for sub-i32 sources, UI2FP, FP2SI, FP2UI, FPEXT, FPTRUNC
+- Bit manipulation: BSWAP, POPCNT, CLZ (BSR+XOR), CTZ (BSF)
+- `any` type parameters correctly use 2 GP registers (was broken: 16 bytes misclassified as single-eightbyte)
+- Shift instructions no longer corrupt `value_loc[]` tracking — RCX is properly spilled after the shift, not just cleared
+- Bool→int uses ZEXT (not SEXT); int→bool uses CMP_NE against 0 (not TRUNC); bool→float uses UI2FP (not SI2FP); float→bool uses CMP_FNE against 0.0 (not FP2SI). These paths precede general integer/float conversion to prevent FBT_I1 from being caught by the wider `fb_type_is_integer()` predicate
+
+**Bug fixes consolidated:**
+- Shift spill: `fb_x64_shift_cl` replaces manual `gp[RCX].vreg = FB_NOREG` with `fb_x64_spill_reg` so `value_loc` stays consistent
+- `any` ABI: `Basic_any` size is 16 bytes (`{rawptr, typeid}`), not 8 — classified as 2×INTEGER for two-register passing
+- Bool conversion ordering: FBT_I1 ∈ `fb_type_is_integer()` was shadowing bool-specific ZEXT/compare semantics with incorrect SEXT/truncate
+- SI2FP sign-extension: `LOAD` uses `MOVZX` (zero-extension) for i8/i16, so `cvtsi2ss` needs explicit `MOVSX` first to get correct negative values
+
+**Phase 6e: Multi-Return & Context Fix (DONE)**
+
+Implemented Odin calling convention multi-return support and fixed a pre-existing context parameter passing bug.
+
+**Multi-return convention:**
+- Return values 0..N-2 are passed via hidden output pointer parameters
+- Return value N-1 is returned in a register (RAX for integers, XMM0 for floats)
+- Parameter order: [sret] [regular params] [split return ptrs] [context]
+- Split return pointers are caller-allocated stack temporaries; callee stores through them
+
+**Files modified:**
+- `src/fb_ir.h` — Added `split_returns_index` and `split_returns_count` to `fbProc` for tracking hidden output pointer param slots; added `last_call_split_temps` and `last_call_split_count` to `fbBuilder` for communicating split return addresses from call builder to statement-level unpacking
+- `src/fb_ir.cpp` — Initialize `split_returns_index = -1` in `fb_proc_create`
+- `src/fb_build.cpp` — `fb_setup_params` creates split return pointer param slots between regular params and context; `fb_build_call_expr` allocates stack temps, passes hidden output pointers, returns last value; `fb_unpack_multi_return` helper loads values from split temps; `fb_build_return_stmt` stores first N-1 values through hidden output pointers, RETs last value; `fb_build_mutable_value_decl` and `fb_build_assign_stmt` detect multi-return calls (single RHS with Tuple type, multiple LHS names) and unpack via `fb_unpack_multi_return`
+
+**What works:**
+- Two-return functions: `proc() -> (int, bool)`, `proc() -> (bool, int)`
+- Three-return functions: `proc() -> (int, int, bool)`
+- Chained multi-return calls (result of one feeds another)
+- Reassignment with multi-return: `a, b = f()`
+- Blank identifiers in multi-return: `_, ok := f()`, `q, _ := f()`, `_, _, ok := f()`
+- Error-path returns (early returns with different values)
+
+**Bug fix — context parameter passing:**
+- The context pointer was passed as the ALLOCA address (pointer to stack slot) instead of the loaded pointer value. Changed to `fb_addr_load` the context slot before pushing to aux pool. This was a pre-existing bug that happened to work accidentally when the callee didn't dereference the context deeply.
+
+**Phase 6f: Range Statements / For-In Loops (DONE)**
+
+Added `Ast_RangeStmt` support covering integer range intervals and indexed collection iteration.
+
+**Files modified:** `src/fb_build.cpp` (added ~300 lines)
+
+**New functions:**
+- `fb_strip_and_prefix` — strips unary `&` prefix from range variable identifiers
+- `fb_build_range_interval` — handles `for val, idx in lo..<hi` / `lo..=hi` / `lo..hi`
+- `fb_build_range_indexed` — handles `for val, idx in array / slice / dynamic_array`
+- `fb_build_range_stmt` — main dispatch, wired into `fb_build_stmt` as `Ast_RangeStmt` case
+
+**Integer range interval block structure:**
+```
+[entry] store lo → value_slot, store upper → upper_slot, jump → loop
+[loop]  load value, load upper, cmp (< or <=), branch → body/done
+[body]  user code, jump → check (inclusive) or post (exclusive)
+[check] reload value != upper? → post/done  (wrapping guard for inclusive)
+[post]  increment value (and index), jump → loop
+[done]  scope close
+```
+
+The wrapping guard prevents infinite loops when upper equals the type's maximum value on inclusive ranges. Upper bound is stored in a local to survive across blocks in the block-local register allocator.
+
+**Indexed range block structure (forward):**
+```
+[entry] store -1 → index, jump → loop
+[loop]  index += 1, cmp index < count, branch → body/done
+[body]  val = collection[index], user code, jump → loop
+[done]  scope close
+```
+
+**Indexed range (reverse):**
+```
+[entry] store count → index, jump → loop
+[loop]  index -= 1, cmp index < 0, branch → done/body
+[body]  val = collection[index], user code, jump → loop
+[done]  scope close
+```
+
+**Supported iteration types:**
+- Integer ranges: `..<` (exclusive), `..=` (inclusive), `..` (inclusive)
+- Fixed-size arrays (`[N]T`)
+- Slices (`[]T`)
+- Dynamic arrays (`[dynamic]T`)
+- `#reverse` for all indexed types
+
+**Not yet supported:** maps, strings, enums, bitsets, enumerated arrays, SoA structs, tuples.
+
+**What works (46+ checks across 3 test files):**
+- Basic exclusive and inclusive integer ranges with correct bounds
+- Range with value and index bindings
+- Single-element inclusive range (wrapping guard)
+- Negative integer ranges
+- Blank identifier bindings (`_`)
+- Array, slice, dynamic array iteration
+- Nested ranges (including range × array)
+- `break` and `continue` (unlabeled)
+- Labeled `break outer` and `continue outer` across nested ranges
+- `#reverse` array iteration with correct ordering
+- Subslice iteration
+- Ranges inside called procedures with early return
+- Complex loop bodies with multiple locals
+- Dot product via indexed range over slices
+
 ### Phase 7: Remaining Odin Features (TODO)
 
 - Map operations (runtime calls)
@@ -1397,11 +1558,13 @@ Struct, array, and nested struct compound literal initialization. Entry point no
 - Runtime type info generation
 - SIMD builtins, atomic builtins
 
-### Phase 8: Float, SIMD, Atomics (TODO)
+### Phase 8: SIMD, Atomics, Float ABI (TODO)
 
-- SIMD vector operations
+- XMM register ABI for external C calls with float parameters (XMM0-XMM7)
+- SIMD vector operations (lane-wise arithmetic, shuffles, extracts/inserts)
 - Atomic operations lowering to `lock` prefix / `cmpxchg`
 - Memory fences
+- Complex/quaternion type support
 
 ### Phase 9: Debug Info (TODO)
 

@@ -371,6 +371,12 @@ struct fbProc {
 	fbParamLoc *param_locs;
 	u32         param_count;
 
+	// Multi-return: split return hidden output pointer params (Odin CC).
+	// param_locs[split_returns_index + i] is the i-th output pointer param.
+	// -1 means no split returns.
+	i32         split_returns_index;
+	i32         split_returns_count;
+
 	// Machine code output (populated by lowering)
 	u8    *machine_code;
 	u32    machine_code_size;
@@ -620,6 +626,12 @@ struct fbBuilder {
 	// Variable → address mapping
 	PtrMap<Entity *, fbAddr>  variable_map;
 	PtrMap<Entity *, fbAddr>  soa_values_map;
+
+	// Multi-return: after fb_build_call_expr, these hold the temps for
+	// return values 0..N-2 (the split returns).  The caller loads from
+	// these to unpack multi-return values.  NULL when no split returns.
+	fbAddr *last_call_split_temps;
+	i32     last_call_split_count;
 
 	// Procedure flags
 	bool return_by_ptr;
