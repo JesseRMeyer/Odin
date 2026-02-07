@@ -55,7 +55,14 @@ gb_internal void fb_setup_params(fbProc *p) {
 		}
 
 		if (abi.classes[0] == FB_ABI_MEMORY) {
-			// MEMORY class: passed on stack by caller, handled in Phase 6+
+			// MEMORY class: for Odin-to-Odin calls, pass as a hidden pointer
+			// in a GP register. The caller copies the value to a temp and
+			// passes the temp's address.
+			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) continue;
+			u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+			locs[gp_idx].slot_idx   = slot;
+			locs[gp_idx].sub_offset = 0;
+			gp_idx++;
 			continue;
 		}
 
@@ -507,6 +514,44 @@ gb_internal void fb_emit_copy_value(fbBuilder *b, fbValue dst_ptr, fbValue val, 
 	}
 }
 
+// Store a variant value into a union, writing both the data and the tag.
+// union_ptr points to the union memory.  variant_val is the variant data
+// (scalar value or pointer-to-aggregate, as per fb_emit_copy_value convention).
+gb_internal void fb_emit_store_union_variant(fbBuilder *b, fbValue union_ptr, fbValue variant_val,
+                                             Type *union_type, Type *variant_type) {
+	union_type = base_type(union_type);
+	GB_ASSERT(union_type->kind == Type_Union);
+
+	if (is_type_union_maybe_pointer(union_type) || type_size_of(union_type) == 0) {
+		// Maybe-pointer union or zero-size union: just store the data, no tag.
+		fb_emit_copy_value(b, union_ptr, variant_val, variant_type);
+		return;
+	}
+
+	// Store variant data at offset 0 (reinterpret union ptr as variant ptr).
+	if (type_size_of(variant_type) == 0) {
+		// Zero-sized variant: clear the data area so stale data doesn't linger.
+		i64 block_size = union_type->Union.variant_block_size.load(std::memory_order_relaxed);
+		if (block_size > 0) {
+			fb_emit_memzero(b, union_ptr, block_size, 1);
+		}
+	} else {
+		fbValue data_ptr = union_ptr;
+		data_ptr.type = alloc_type_pointer(variant_type);
+		fb_emit_copy_value(b, data_ptr, variant_val, variant_type);
+	}
+
+	// Store the tag.
+	type_size_of(union_type); // ensure layout is cached
+	i64 tag_offset = union_type->Union.variant_block_size.load(std::memory_order_relaxed);
+	Type *tag_type = union_tag_type(union_type);
+	i64 tag_val = union_variant_index(union_type, variant_type);
+
+	fbValue tag_ptr = fb_emit_member(b, union_ptr, tag_offset);
+	fbValue tag_const = fb_emit_iconst(b, tag_type, tag_val);
+	fb_emit_store(b, tag_ptr, tag_const);
+}
+
 // Load a field from an aggregate in memory.
 // base_ptr points to the start of the aggregate; field is at byte_offset.
 gb_internal fbValue fb_load_field(fbBuilder *b, fbValue base_ptr, i64 byte_offset, Type *field_type) {
@@ -762,6 +807,30 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 
 	Type *src_type = val.type;
 	if (are_types_identical(src_type, dst_type)) return val;
+
+	// ── Union conversion: value → union ─────────────────────────
+	if (is_type_union(base_type(dst_type))) {
+		Type *union_type = base_type(dst_type);
+		Type *variant_type = src_type;
+		// Find the matching variant type in the union.
+		for (Type *vt : union_type->Union.variants) {
+			if (are_types_identical(base_type(src_type), base_type(vt))) {
+				variant_type = vt;
+				break;
+			}
+			if (internal_check_is_assignable_to(src_type, vt)) {
+				variant_type = vt;
+				break;
+			}
+		}
+		fbAddr temp = fb_add_local(b, dst_type, nullptr, true);
+		val = fb_emit_conv(b, val, variant_type);
+		fb_emit_store_union_variant(b, temp.base, val, union_type, variant_type);
+		// Unions are aggregates — return pointer.
+		fbValue result = temp.base;
+		result.type = dst_type;
+		return result;
+	}
 
 	fbType src_ft = fb_data_type(src_type);
 	fbType dst_ft = fb_data_type(dst_type);
@@ -1056,6 +1125,21 @@ gb_internal fbAddr fb_build_compound_lit(fbBuilder *b, Ast *expr) {
 	case Type_EnumeratedArray:
 		fb_build_compound_lit_enumerated_array(b, expr, bt, v.base);
 		break;
+
+	case Type_Union: {
+		// Union compound literal: Value{variant_value}
+		// The checker resolves the single element to the correct variant type.
+		GB_ASSERT(cl->elems.count == 1);
+		Ast *elem = cl->elems[0];
+		Ast *value_expr = elem;
+		if (elem->kind == Ast_FieldValue) {
+			value_expr = elem->FieldValue.value;
+		}
+		fbValue val = fb_build_expr(b, value_expr);
+		Type *variant_type = type_of_expr(value_expr);
+		fb_emit_store_union_variant(b, v.base, val, bt, variant_type);
+		break;
+	}
 
 	default:
 		GB_PANIC("fast backend: compound literal for type kind %d not yet supported (%s)",
@@ -1471,6 +1555,128 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 	case Ast_UnaryExpr: {
 		ast_node(ue, UnaryExpr, expr);
 		if (ue->op.kind == Token_And) {
+			Ast *ue_expr = unparen_expr(ue->expr);
+
+			if (ue_expr->kind == Ast_TypeAssertion) {
+				ast_node(ta, TypeAssertion, ue_expr);
+				Type *assert_type = type_of_expr(ue_expr);
+				i64 ptr_size = b->module->target.ptr_size;
+
+				// Build the union expression and get its address.
+				fbValue e = fb_build_expr(b, ta->expr);
+				Type *union_type = e.type;
+				// If the union value is already a pointer (aggregate convention), use it directly.
+				// Otherwise, spill to a local to get an address.
+				fbValue union_ptr;
+				if (is_type_pointer(union_type)) {
+					union_ptr = e;
+					union_type = type_deref(union_type);
+				} else {
+					// Aggregate: e is tagged as the union type but is really a pointer.
+					union_ptr = e;
+					union_ptr.type = alloc_type_pointer(union_type);
+				}
+				Type *src_type = base_type(union_type);
+				Type *dst_type = assert_type;
+
+				if (is_type_tuple(tv.type)) {
+					// ── Tuple return: x, ok := v.(T) → (^T, bool) ──
+					Type *tuple = tv.type;
+					Type *result_ptr_type = tuple->Tuple.variables[0]->type;
+					Type *ok_type = tuple->Tuple.variables[1]->type;
+
+					// Compare tag.
+					fbValue ok;
+					if (is_type_union_maybe_pointer(src_type)) {
+						fbValue data = fb_emit_load(b, union_ptr, alloc_type_pointer(dst_type));
+						fbValue nil_val = fb_emit_iconst(b, t_rawptr, 0);
+						// Cast loaded pointer to rawptr for comparison.
+						fbValue data_as_ptr = data;
+						data_as_ptr.type = t_rawptr;
+						ok = fb_emit_cmp(b, FB_CMP_NE, data_as_ptr, nil_val);
+					} else {
+						type_size_of(src_type); // ensure layout cached
+						i64 tag_offset = src_type->Union.variant_block_size.load(std::memory_order_relaxed);
+						Type *tag_type = union_tag_type(src_type);
+						fbValue tag_ptr = fb_emit_member(b, union_ptr, tag_offset);
+						fbValue src_tag = fb_emit_load(b, tag_ptr, tag_type);
+						fbValue dst_tag = fb_emit_iconst(b, tag_type, union_variant_index(src_type, dst_type));
+						ok = fb_emit_cmp(b, FB_CMP_EQ, src_tag, dst_tag);
+					}
+
+					// Result: allocate tuple, zero-init (nil ptr + false).
+					fbAddr res = fb_add_local(b, tuple, nullptr, true);
+
+					// Branch: ok → store ptr+true, else keep zero.
+					u32 ok_block  = fb_new_block(b);
+					u32 end_block = fb_new_block(b);
+					fb_emit_branch(b, ok, ok_block, end_block);
+
+					fb_set_block(b, ok_block);
+					// Store data pointer (union_ptr rebranded as ^variant_type).
+					fbValue data_ptr = union_ptr;
+					data_ptr.type = result_ptr_type;
+					fb_emit_store(b, res.base, data_ptr);
+					// Store true at tuple offset ptr_size.
+					fbValue ok_ptr = fb_emit_member(b, res.base, ptr_size);
+					fbValue true_val = fb_emit_iconst(b, ok_type, 1);
+					fb_emit_store(b, ok_ptr, true_val);
+					fb_emit_jump(b, end_block);
+
+					fb_set_block(b, end_block);
+					// Return pointer to tuple (aggregate).
+					fbValue result = res.base;
+					result.type = tuple;
+					return result;
+
+				} else {
+					// ── Direct return: x := v.(T) → ^T ──
+					GB_ASSERT(is_type_pointer(tv.type));
+
+					bool do_type_check = true;
+					if (build_context.no_type_assert) {
+						do_type_check = false;
+					}
+					// Check AST-level #no_type_assert flag.
+					if ((expr->state_flags & StateFlag_no_type_assert) != 0) {
+						do_type_check = false;
+					}
+
+					if (do_type_check) {
+						fbValue ok;
+						if (is_type_union_maybe_pointer(src_type)) {
+							fbValue data = fb_emit_load(b, union_ptr, alloc_type_pointer(dst_type));
+							fbValue nil_val = fb_emit_iconst(b, t_rawptr, 0);
+							fbValue data_as_ptr = data;
+							data_as_ptr.type = t_rawptr;
+							ok = fb_emit_cmp(b, FB_CMP_NE, data_as_ptr, nil_val);
+						} else {
+							type_size_of(src_type);
+							i64 tag_offset = src_type->Union.variant_block_size.load(std::memory_order_relaxed);
+							Type *tag_type = union_tag_type(src_type);
+							fbValue tag_ptr = fb_emit_member(b, union_ptr, tag_offset);
+							fbValue src_tag = fb_emit_load(b, tag_ptr, tag_type);
+							fbValue dst_tag = fb_emit_iconst(b, tag_type, union_variant_index(src_type, dst_type));
+							ok = fb_emit_cmp(b, FB_CMP_EQ, src_tag, dst_tag);
+						}
+
+						u32 ok_block   = fb_new_block(b);
+						u32 trap_block = fb_new_block(b);
+						fb_emit_branch(b, ok, ok_block, trap_block);
+
+						fb_set_block(b, trap_block);
+						fb_inst_emit(b->proc, FB_TRAP, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+						fb_inst_emit(b->proc, FB_UNREACHABLE, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+
+						fb_set_block(b, ok_block);
+					}
+
+					fbValue data_ptr = union_ptr;
+					data_ptr.type = tv.type;
+					return data_ptr;
+				}
+			}
+
 			fbAddr addr = fb_build_addr(b, ue->expr);
 			fbValue ptr = addr.base;
 			ptr.type = type;
@@ -1729,6 +1935,133 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 		return fb_build_expr(b, se->call);
 	}
 
+	case Ast_TypeAssertion: {
+		ast_node(ta, TypeAssertion, expr);
+
+		fbValue e = fb_build_expr(b, ta->expr);
+		Type *union_type = e.type;
+
+		// Get the union pointer. Aggregates (unions) are passed as pointers
+		// tagged with the aggregate type in the fast backend.
+		fbValue union_ptr = e;
+		union_ptr.type = alloc_type_pointer(union_type);
+		Type *src_type = base_type(union_type);
+
+		bool is_tuple = is_type_tuple(type);
+		Type *tuple = type;
+		if (!is_tuple) {
+			tuple = make_optional_ok_type(type);
+		}
+		Type *dst_type = tuple->Tuple.variables[0]->type;
+		Type *ok_type  = tuple->Tuple.variables[1]->type;
+
+		// Allocate result tuple, zero-init (zeroed value + false).
+		fbAddr res = fb_add_local(b, tuple, nullptr, true);
+
+		// Check no_type_assert for direct (non-tuple) assertions.
+		bool do_type_check = true;
+		if (!is_tuple) {
+			if (build_context.no_type_assert) {
+				do_type_check = false;
+			}
+			if ((expr->state_flags & StateFlag_no_type_assert) != 0) {
+				do_type_check = false;
+			}
+			if (!do_type_check) {
+				// No check: just load the data and return it.
+				fbValue data_ptr = union_ptr;
+				data_ptr.type = alloc_type_pointer(dst_type);
+				fbType dst_ft = fb_data_type(dst_type);
+				if (dst_ft.kind != FBT_VOID) {
+					return fb_emit_load(b, data_ptr, dst_type);
+				} else {
+					fbValue r = data_ptr;
+					r.type = dst_type;
+					return r;
+				}
+			}
+		}
+
+		// Compare tag to determine if the variant matches.
+		fbValue cond;
+		if (is_type_union_maybe_pointer(src_type)) {
+			// Maybe-pointer union: compare data against nil.
+			fbValue data = fb_emit_load(b, union_ptr, dst_type);
+			fbValue nil_val = fb_emit_iconst(b, t_rawptr, 0);
+			fbValue data_as_ptr = data;
+			data_as_ptr.type = t_rawptr;
+			cond = fb_emit_cmp(b, FB_CMP_NE, data_as_ptr, nil_val);
+		} else {
+			type_size_of(src_type); // ensure layout cached
+			i64 tag_offset = src_type->Union.variant_block_size.load(std::memory_order_relaxed);
+			Type *tag_type = union_tag_type(src_type);
+			fbValue tag_ptr = fb_emit_member(b, union_ptr, tag_offset);
+			fbValue src_tag = fb_emit_load(b, tag_ptr, tag_type);
+			fbValue dst_tag = fb_emit_iconst(b, tag_type, union_variant_index(src_type, dst_type));
+			cond = fb_emit_cmp(b, FB_CMP_EQ, src_tag, dst_tag);
+		}
+
+		u32 ok_block  = fb_new_block(b);
+		u32 end_block = fb_new_block(b);
+		fb_emit_branch(b, cond, ok_block, end_block);
+
+		fb_set_block(b, ok_block);
+		{
+			// Load variant data from the union and store into result tuple[0].
+			fbValue data_ptr = union_ptr;
+			data_ptr.type = alloc_type_pointer(dst_type);
+			fbType dst_ft = fb_data_type(dst_type);
+			if (dst_ft.kind != FBT_VOID) {
+				fbValue data = fb_emit_load(b, data_ptr, dst_type);
+				fb_emit_store(b, res.base, data);
+			} else {
+				i64 data_size = type_size_of(dst_type);
+				if (data_size > 0) {
+					fbValue sz = fb_emit_iconst(b, t_int, data_size);
+					fb_emit_memcpy(b, res.base, data_ptr, sz, type_align_of(dst_type));
+				}
+			}
+			// Store true into ok field.
+			i64 ok_offset = type_offset_of(tuple, 1);
+			fbValue ok_ptr = fb_emit_member(b, res.base, ok_offset);
+			fb_emit_store(b, ok_ptr, fb_emit_iconst(b, ok_type, 1));
+		}
+		fb_emit_jump(b, end_block);
+
+		fb_set_block(b, end_block);
+
+		if (!is_tuple) {
+			// Direct assertion: check ok, trap on failure, return value.
+			i64 ok_offset = type_offset_of(tuple, 1);
+			fbValue ok_ptr = fb_emit_member(b, res.base, ok_offset);
+			fbValue ok_val = fb_emit_load(b, ok_ptr, ok_type);
+
+			u32 pass_block = fb_new_block(b);
+			u32 trap_block = fb_new_block(b);
+			fb_emit_branch(b, ok_val, pass_block, trap_block);
+
+			fb_set_block(b, trap_block);
+			fb_inst_emit(b->proc, FB_TRAP, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+			fb_inst_emit(b->proc, FB_UNREACHABLE, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+
+			fb_set_block(b, pass_block);
+			// Load and return the value.
+			fbType dst_ft = fb_data_type(dst_type);
+			if (dst_ft.kind != FBT_VOID) {
+				return fb_emit_load(b, res.base, dst_type);
+			} else {
+				fbValue r = res.base;
+				r.type = dst_type;
+				return r;
+			}
+		}
+
+		// Tuple: return as aggregate pointer.
+		fbValue result = res.base;
+		result.type = tuple;
+		return result;
+	}
+
 	default:
 		GB_PANIC("TODO fb_build_expr %.*s", LIT(ast_strings[expr->kind]));
 		break;
@@ -1826,12 +2159,25 @@ gb_internal void fb_build_mutable_value_decl(fbBuilder *b, Ast *node) {
 	if (value_count == 1 && name_count > 1) {
 		Type *rhs_type = type_of_expr(vd->values[0]);
 		if (rhs_type != nullptr && rhs_type->kind == Type_Tuple) {
-			// Build the call (sets up split return temps internally)
 			fbValue last_val = fb_build_expr(b, vd->values[0]);
 
-			// Unpack all return values
 			auto vals = array_make<fbValue>(heap_allocator(), name_count, name_count);
-			fb_unpack_multi_return(b, last_val, vals.data, name_count);
+
+			// Determine unpack method: if split return temps were set up
+			// (procedure call), use them. Otherwise the result is an
+			// aggregate tuple pointer — load fields directly.
+			if (b->last_call_split_count > 0 || b->last_call_split_temps != nullptr) {
+				fb_unpack_multi_return(b, last_val, vals.data, name_count);
+			} else {
+				// Aggregate tuple: last_val is a pointer to the tuple memory.
+				fbValue tuple_ptr = last_val;
+				tuple_ptr.type = alloc_type_pointer(rhs_type);
+				for (i32 i = 0; i < name_count; i++) {
+					Type *field_type = rhs_type->Tuple.variables[i]->type;
+					i64 offset = type_offset_of(rhs_type, i);
+					vals[i] = fb_load_field(b, tuple_ptr, offset, field_type);
+				}
+			}
 
 			// Create locals and assign
 			for_array(i, vd->names) {
@@ -1842,12 +2188,12 @@ gb_internal void fb_build_mutable_value_decl(fbBuilder *b, Ast *node) {
 
 				fbAddr local = fb_add_local(b, e->type, e, true);
 				if (i < vals.count) {
+					fbValue val = fb_emit_conv(b, vals[i], e->type);
 					fbType ft = fb_data_type(e->type);
 					if (ft.kind != FBT_VOID) {
-						fbValue val = fb_emit_conv(b, vals[i], e->type);
 						fb_addr_store(b, local, val);
 					} else {
-						fb_emit_copy_value(b, local.base, vals[i], e->type);
+						fb_emit_copy_value(b, local.base, val, e->type);
 					}
 				}
 			}
@@ -1876,10 +2222,10 @@ gb_internal void fb_build_mutable_value_decl(fbBuilder *b, Ast *node) {
 
 		if (i < inits.count) {
 			fbValue init = inits[i];
+			init = fb_emit_conv(b, init, e->type);
 			fbType local_ft = fb_data_type(e->type);
 			if (local_ft.kind != FBT_VOID) {
-				// Scalar: convert and store
-				init = fb_emit_conv(b, init, e->type);
+				// Scalar: store
 				fb_addr_store(b, local, init);
 			} else {
 				// Aggregate: init is a pointer to data, memcpy
@@ -1973,7 +2319,18 @@ gb_internal void fb_build_assign_stmt(fbBuilder *b, AstAssignStmt *as) {
 			if (rhs_type != nullptr && rhs_type->kind == Type_Tuple) {
 				fbValue last_val = fb_build_expr(b, as->rhs[0]);
 				auto vals = array_make<fbValue>(heap_allocator(), lhs_count, lhs_count);
-				fb_unpack_multi_return(b, last_val, vals.data, lhs_count);
+
+				if (b->last_call_split_count > 0 || b->last_call_split_temps != nullptr) {
+					fb_unpack_multi_return(b, last_val, vals.data, lhs_count);
+				} else {
+					fbValue tuple_ptr = last_val;
+					tuple_ptr.type = alloc_type_pointer(rhs_type);
+					for (i32 i = 0; i < lhs_count; i++) {
+						Type *field_type = rhs_type->Tuple.variables[i]->type;
+						i64 offset = type_offset_of(rhs_type, i);
+						vals[i] = fb_load_field(b, tuple_ptr, offset, field_type);
+					}
+				}
 
 				for_array(i, as->lhs) {
 					Ast *lhs_expr = as->lhs[i];
@@ -1981,12 +2338,12 @@ gb_internal void fb_build_assign_stmt(fbBuilder *b, AstAssignStmt *as) {
 					if (i >= vals.count) break;
 
 					fbAddr addr = fb_build_addr(b, lhs_expr);
+					fbValue val = fb_emit_conv(b, vals[i], addr.type);
 					fbType addr_ft = fb_data_type(addr.type);
 					if (addr_ft.kind != FBT_VOID) {
-						fbValue val = fb_emit_conv(b, vals[i], addr.type);
 						fb_addr_store(b, addr, val);
 					} else {
-						fb_emit_copy_value(b, addr.base, vals[i], addr.type);
+						fb_emit_copy_value(b, addr.base, val, addr.type);
 					}
 				}
 				array_free(&vals);
@@ -2007,14 +2364,14 @@ gb_internal void fb_build_assign_stmt(fbBuilder *b, AstAssignStmt *as) {
 			if (i >= rhs_vals.count) break;
 
 			fbAddr addr = fb_build_addr(b, lhs_expr);
+			fbValue val = fb_emit_conv(b, rhs_vals[i], addr.type);
 			fbType addr_ft = fb_data_type(addr.type);
 			if (addr_ft.kind != FBT_VOID) {
-				// Scalar: convert and store
-				fbValue val = fb_emit_conv(b, rhs_vals[i], addr.type);
+				// Scalar: store
 				fb_addr_store(b, addr, val);
 			} else {
 				// Aggregate: memcpy
-				fb_emit_copy_value(b, addr.base, rhs_vals[i], addr.type);
+				fb_emit_copy_value(b, addr.base, val, addr.type);
 			}
 		}
 
@@ -2932,6 +3289,14 @@ gb_internal void fb_procedure_begin(fbBuilder *b) {
 				fbStackSlot *slot = &b->proc->slots[slot_idx];
 				if (slot->entity == param_e) {
 					fbValue ptr = fb_emit_alloca_from_slot(b, slot_idx);
+
+					// For MEMORY class params (unions, large structs), the slot
+					// holds a pointer to the caller's data. Load the pointer and
+					// use it as the base so accesses go through to the actual data.
+					fbABIParamInfo abi = fb_abi_classify_type_sysv(param_e->type);
+					if (abi.classes[0] == FB_ABI_MEMORY) {
+						ptr = fb_emit_load(b, ptr, alloc_type_pointer(param_e->type));
+					}
 
 					fbAddr addr = {};
 					addr.kind = fbAddr_Default;

@@ -331,6 +331,8 @@ struct fbBuilder {
 //   fb_emit_branch(b, cond, true_blk, false_blk)
 //   fb_emit_ret(b, val)
 //   fb_emit_select(b, cond, t, f, type)        → fbValue
+//   fb_emit_copy_value(b, dst_ptr, val, type)    (scalar STORE or aggregate MEMCPY)
+//   fb_emit_store_union_variant(b, union_ptr, val, union_type, variant_type)
 //   fb_new_block(b) / fb_set_block(b, id)
 //   fb_add_local(b, type, entity, zero_init)   → fbAddr
 //   fb_addr_load(b, addr) / fb_addr_store(b, addr, val)
