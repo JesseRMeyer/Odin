@@ -1739,6 +1739,29 @@ Full SysV AMD64 ABI compliance for C interop: XMM float parameter passing/receiv
 - `UI2FP` handles values ≥ 2^63 correctly (halving trick)
 - `FP2UI` handles values ≥ 2^63 correctly (conditional subtraction)
 
+**Phase 6q: Type Switch Statements (DONE)**
+
+Union type switches (`switch v in union_val { case T: ... }`), the primary pattern for dispatching on union variants in Odin. Builds on the regular switch infrastructure (block allocation, comparison chain, scope/defer management, label handling) and the type assertion code (tag reading, variant index computation, data extraction).
+
+**Files modified:**
+- `src/fb_build.cpp` — `fb_build_type_switch_stmt()` implements the full type switch: scope setup, union pointer extraction, tag preloading (regular tag load, maybe-pointer nil comparison, zero-sized union), comparison chain dispatch (one CMP+BRANCH per case type), implicit entity binding (by-value: local copy, by-reference: retyped pointer), case body emission with target list for break. Dispatched from `fb_build_stmt` via `Ast_TypeSwitchStmt` case.
+
+**What works:**
+- Basic variant dispatch (int, f64, bool, struct variants)
+- Default case (unmatched variant or nil union)
+- Maybe-pointer unions (nil vs non-nil dispatch)
+- By-value binding (copy to local, immune to union mutation)
+- By-reference binding (pointer to union data, mutations visible)
+- `#partial` switch (subset of variants)
+- Labeled break
+- Struct variant field access (read and write through by-ref)
+- Type switch in functions (passing unions as parameters)
+- Type switch in loops
+- Return from within type switch case
+
+**Deferred:**
+- `any` type switches — requires runtime type info generation (Phase 7); asserts with clear message
+
 ### Phase 7: Remaining Odin Features (TODO)
 
 - Map operations (runtime calls)
@@ -1746,7 +1769,7 @@ Full SysV AMD64 ABI compliance for C interop: XMM float parameter passing/receiv
 - Slice operations (`append`, `delete`, `make`, `new`)
 - Dynamic array operations
 - Bit fields, swizzle
-- Type switches
+- `any` type switches (requires runtime type info)
 - Runtime type info generation
 - SIMD builtins, atomic builtins
 

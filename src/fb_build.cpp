@@ -3123,6 +3123,200 @@ gb_internal void fb_build_switch_stmt(fbBuilder *b, Ast *node) {
 	gb_free(heap_allocator(), body_scopes.data);
 }
 
+gb_internal void fb_build_type_switch_stmt(fbBuilder *b, Ast *node) {
+	ast_node(ss, TypeSwitchStmt, node);
+
+	fb_scope_open(b, ss->scope);
+
+	// Extract the tag assignment: "v in expr" or "&v in expr".
+	ast_node(as, AssignStmt, ss->tag);
+	Ast *rhs = as->rhs[0];
+
+	// Build the union expression and obtain a pointer to it.
+	fbValue parent = fb_build_expr(b, rhs);
+	Type *parent_type = parent.type;
+	bool is_parent_ptr = is_type_pointer(parent_type);
+	Type *ut = base_type(type_deref(parent_type));
+
+	TypeSwitchKind switch_kind = check_valid_type_switch_type(parent_type);
+	if (switch_kind == TypeSwitch_Any) {
+		GB_PANIC("fast backend: 'any' type switches not yet implemented (requires runtime type info)");
+	}
+	GB_ASSERT(switch_kind == TypeSwitch_Union);
+
+	// Get a pointer to the union data.
+	fbValue union_ptr = parent;
+	if (is_parent_ptr) {
+		union_ptr = fb_emit_load(b, parent, type_deref(parent_type));
+	}
+	union_ptr.type = alloc_type_pointer(ut);
+
+	// Preload the tag for dispatch.
+	type_size_of(ut); // ensure layout cached
+	bool is_maybe_ptr = is_type_union_maybe_pointer(ut);
+	bool is_zero_sized = (type_size_of(ut) == 0);
+	fbValue tag = {};
+
+	if (is_maybe_ptr) {
+		// Maybe-pointer union: load the data pointer (which IS the data).
+		Type *variant_type = ut->Union.variants[0];
+		fbValue data_ptr = union_ptr;
+		data_ptr.type = alloc_type_pointer(variant_type);
+		fbValue data = fb_emit_load(b, data_ptr, variant_type);
+		// Convert to rawptr for nil comparison.
+		data.type = t_rawptr;
+		tag = data;
+	} else if (!is_zero_sized) {
+		// Regular union: load tag from union_ptr + variant_block_size.
+		i64 tag_offset = ut->Union.variant_block_size.load(std::memory_order_relaxed);
+		Type *tag_type = union_tag_type(ut);
+		fbValue tag_ptr = fb_emit_member(b, union_ptr, tag_offset);
+		tag = fb_emit_load(b, tag_ptr, tag_type);
+	}
+
+	u32 done_block = fb_new_block(b);
+
+	ast_node(body, BlockStmt, ss->body);
+	isize case_count = body->stmts.count;
+
+	// Pre-allocate a body block and scope per case clause.
+	auto body_blocks = slice_make<u32>(heap_allocator(), case_count);
+	auto body_scopes = slice_make<Scope *>(heap_allocator(), case_count);
+	i32 default_idx = -1;
+	for_array(i, body->stmts) {
+		ast_node(cc, CaseClause, body->stmts[i]);
+		body_blocks[i] = fb_new_block(b);
+		body_scopes[i] = cc->scope;
+		if (cc->list.count == 0) {
+			default_idx = cast(i32)i;
+		}
+	}
+
+	u32 default_block = (default_idx >= 0) ? body_blocks[default_idx] : done_block;
+
+	// ── Dispatch: chain of comparisons ──
+	for_array(i, body->stmts) {
+		ast_node(cc, CaseClause, body->stmts[i]);
+		if (cc->list.count == 0) continue; // default handled at end
+
+		for (Ast *type_expr : cc->list) {
+			u32 next_cond = fb_new_block(b);
+			Type *case_type = type_of_expr(type_expr);
+			fbValue cond = {};
+
+			if (is_maybe_ptr) {
+				// Maybe-pointer: nil → compare data == 0, variant → compare data != 0.
+				fbValue nil_val = fb_emit_iconst(b, t_rawptr, 0);
+				if (is_type_untyped_nil(case_type)) {
+					cond = fb_emit_cmp(b, FB_CMP_EQ, tag, nil_val);
+				} else {
+					cond = fb_emit_cmp(b, FB_CMP_NE, tag, nil_val);
+				}
+			} else if (is_zero_sized) {
+				// Zero-sized union: never matches.
+				cond = fb_emit_iconst(b, t_bool, 0);
+			} else {
+				// Regular union: compare tag against variant index.
+				Type *tag_type = union_tag_type(ut);
+				fbValue case_tag;
+				if (is_type_untyped_nil(case_type)) {
+					case_tag = fb_emit_iconst(b, tag_type, 0);
+				} else {
+					case_tag = fb_emit_iconst(b, tag_type, union_variant_index(ut, case_type));
+				}
+				cond = fb_emit_cmp(b, FB_CMP_EQ, tag, case_tag);
+			}
+			fb_emit_branch(b, cond, body_blocks[i], next_cond);
+			fb_set_block(b, next_cond);
+		}
+	}
+	// Fall through to default.
+	fb_emit_jump(b, default_block);
+
+	// ── Emit case bodies ──
+
+	// Set up label if present.
+	if (ss->label != nullptr) {
+		fbBranchRegions br = {};
+		br.cond = ss->label;
+		br.false_block = done_block;  // break target
+		br.true_block = 0;            // no continue in switch
+		array_add(&b->branch_regions, br);
+	}
+
+	for_array(i, body->stmts) {
+		ast_node(cc, CaseClause, body->stmts[i]);
+
+		fb_set_block(b, body_blocks[i]);
+
+		fbTargetList tl = {};
+		tl.prev = b->target_list;
+		tl.break_block = done_block;
+		tl.continue_block = 0;
+		tl.fallthrough_block = 0;
+		tl.scope_index = b->scope_index;
+		tl.is_block = false;
+		b->target_list = &tl;
+
+		fb_scope_open(b, body_scopes[i]);
+
+		// Bind the implicit entity for this case.
+		Entity *case_entity = implicit_entity_of_node(body->stmts[i]);
+		if (case_entity != nullptr) {
+			Type *entity_type = case_entity->type;
+			bool by_value = (case_entity->flags & EntityFlag_Value) != 0;
+			bool is_single_variant = (cc->list.count == 1 && !is_type_untyped_nil(type_of_expr(cc->list[0])));
+
+			if (is_single_variant && !is_type_untyped_nil(entity_type)) {
+				// Single variant case: entity is typed as the variant.
+				if (by_value) {
+					// By-value: allocate local, copy variant data from union.
+					fbAddr local = fb_add_local(b, entity_type, case_entity, false);
+					fbValue src_ptr = union_ptr;
+					src_ptr.type = alloc_type_pointer(entity_type);
+					fb_emit_copy_value(b, local.base, fb_addr_load(b, fbAddr{fbAddr_Default, src_ptr, entity_type}), entity_type);
+				} else {
+					// By-reference: point directly at union data, retyped.
+					fbAddr addr = {};
+					addr.kind = fbAddr_Default;
+					addr.base = union_ptr;
+					addr.base.type = alloc_type_pointer(entity_type);
+					addr.type = entity_type;
+					map_set(&b->variable_map, case_entity, addr);
+				}
+			} else {
+				// Default, multi-case, or nil case: entity is the full union type.
+				if (by_value) {
+					fbAddr local = fb_add_local(b, entity_type, case_entity, false);
+					fb_emit_copy_value(b, local.base, fb_addr_load(b, fbAddr{fbAddr_Default, union_ptr, ut}), entity_type);
+				} else {
+					fbAddr addr = {};
+					addr.kind = fbAddr_Default;
+					addr.base = union_ptr;
+					addr.base.type = alloc_type_pointer(entity_type);
+					addr.type = entity_type;
+					map_set(&b->variable_map, case_entity, addr);
+				}
+			}
+		}
+
+		fb_build_stmt_list(b, cc->stmts);
+		fb_scope_close(b, fbDeferExit_Default, 0);
+
+		b->target_list = tl.prev;
+
+		if (!fb_block_is_terminated(b)) {
+			fb_emit_jump(b, done_block);
+		}
+	}
+
+	fb_set_block(b, done_block);
+	fb_scope_close(b, fbDeferExit_Default, 0);
+
+	gb_free(heap_allocator(), body_blocks.data);
+	gb_free(heap_allocator(), body_scopes.data);
+}
+
 gb_internal void fb_build_stmt(fbBuilder *b, Ast *node) {
 	if (node == nullptr) return;
 
@@ -3274,6 +3468,10 @@ gb_internal void fb_build_stmt(fbBuilder *b, Ast *node) {
 
 	case Ast_SwitchStmt:
 		fb_build_switch_stmt(b, node);
+		break;
+
+	case Ast_TypeSwitchStmt:
+		fb_build_type_switch_stmt(b, node);
 		break;
 
 	case Ast_DeferStmt: {

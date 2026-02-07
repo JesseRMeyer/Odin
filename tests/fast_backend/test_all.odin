@@ -17,6 +17,7 @@ package test_all
 //   900-905  or_else
 //   950-969  globals
 //   1000-1031 ternary if/when, implicit selectors, selector calls
+//   1100-1125 type switch (union dispatch, by-value, by-reference, structs)
 
 foreign import libc "system:c"
 foreign libc {
@@ -852,6 +853,210 @@ test_ternary_combined :: proc() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Type switch (1100-1125)
+// ═══════════════════════════════════════════════════════════════════════
+
+TSValue :: union { int, f64, bool }
+
+Circle :: struct { radius: f64 }
+Rect   :: struct { w: f64, h: f64 }
+Line   :: struct { len: f64 }
+Shape  :: union { Circle, Rect, Line }
+
+MaybePtr :: union { ^int }
+
+TSMultiVal :: union { int, f64, string, bool }
+
+ts_classify :: proc(v: TSValue) -> int {
+	switch x in v {
+	case int:  return 1
+	case f64:  return 2
+	case bool: return 3
+	}
+	return 0
+}
+
+ts_area_of :: proc(s: Shape) -> f64 {
+	switch v in s {
+	case Circle: return v.radius * v.radius * 3.14159
+	case Rect:   return v.w * v.h
+	case Line:   return 0.0
+	}
+	return -1.0
+}
+
+test_type_switch :: proc() {
+	// 1100: basic dispatch
+	v1: TSValue = 42
+	result := 0
+	switch x in v1 {
+	case int:  result = x
+	case f64:  result = -1
+	case bool: result = -2
+	}
+	check(result == 42, 1100)
+
+	v2: TSValue = 3.14
+	result = 0
+	switch x in v2 {
+	case int:  result = -1
+	case f64:  result = 1 if x > 3.0 else 0
+	case bool: result = -2
+	}
+	check(result == 1, 1101)
+
+	v3: TSValue = true
+	result = 0
+	switch x in v3 {
+	case int:  result = -1
+	case f64:  result = -2
+	case bool: result = 1 if x else 0
+	}
+	check(result == 1, 1102)
+
+	// 1103: default case
+	v4: TSValue = 42
+	result = 0
+	#partial switch x in v4 {
+	case f64:  result = -1
+	case bool: result = -2
+	case:      result = 99
+	}
+	check(result == 99, 1103)
+
+	// 1104: nil case (uninitialized union → default)
+	v5: TSValue
+	result = 0
+	switch x in v5 {
+	case int:  result = -1
+	case f64:  result = -2
+	case bool: result = -3
+	case:      result = 55
+	}
+	check(result == 55, 1104)
+
+	// 1105: maybe-pointer union
+	n := 10
+	mp: MaybePtr = &n
+	result = 0
+	switch p in mp {
+	case ^int: result = p^
+	case:      result = -1
+	}
+	check(result == 10, 1105)
+
+	mp2: MaybePtr
+	result = 0
+	switch p in mp2 {
+	case ^int: result = -1
+	case:      result = 33
+	}
+	check(result == 33, 1106)
+
+	// 1107: by-value binding (mutation to union doesn't affect case var)
+	v6: TSValue = 42
+	result = 0
+	switch x in v6 {
+	case int:
+		v6 = 999.0
+		result = x
+	case f64:
+		result = -1
+	case bool:
+		result = -2
+	}
+	check(result == 42, 1107)
+
+	// 1108: by-reference binding
+	v7: TSValue = 42
+	switch &x in v7 {
+	case int:
+		x = 100
+	case f64:
+	case bool:
+	}
+	val, ok := v7.(int)
+	check(ok, 1108)
+	check(val == 100, 1109)
+
+	// 1110: #partial switch
+	v8: TSMultiVal = 42
+	result = 0
+	#partial switch x in v8 {
+	case int: result = x
+	}
+	check(result == 42, 1110)
+
+	// 1111: return from type switch function
+	fv1: TSValue = 42
+	fv2: TSValue = 3.14
+	fv3: TSValue = true
+	check(ts_classify(fv1) == 1, 1111)
+	check(ts_classify(fv2) == 2, 1112)
+	check(ts_classify(fv3) == 3, 1113)
+
+	// 1114: struct variants
+	s1: Shape = Circle{5.0}
+	result = 0
+	switch v in s1 {
+	case Circle: result = 1 if v.radius == 5.0 else 0
+	case Rect:   result = -1
+	case Line:   result = -2
+	}
+	check(result == 1, 1114)
+
+	s2: Shape = Rect{3.0, 4.0}
+	result = 0
+	switch v in s2 {
+	case Circle: result = -1
+	case Rect:   result = 1 if v.w == 3.0 && v.h == 4.0 else 0
+	case Line:   result = -2
+	}
+	check(result == 1, 1115)
+
+	// 1116: struct by-reference
+	s3: Shape = Circle{5.0}
+	switch &v in s3 {
+	case Circle:
+		v.radius = 10.0
+	case Rect:
+	case Line:
+	}
+	result = 0
+	switch v in s3 {
+	case Circle: result = 1 if v.radius == 10.0 else 0
+	case Rect:   result = -1
+	case Line:   result = -2
+	}
+	check(result == 1, 1116)
+
+	// 1117: type switch in function with struct variants
+	c: Shape = Circle{1.0}
+	a := ts_area_of(c)
+	check(a > 3.14, 1117)
+	check(a < 3.15, 1118)
+
+	r: Shape = Rect{3.0, 4.0}
+	check(ts_area_of(r) == 12.0, 1119)
+
+	// 1120: type switch in loop
+	values := [3]TSValue{ 10, 3.14, true }
+	int_sum := 0
+	count := 0
+	for i := 0; i < 3; i += 1 {
+		switch x in values[i] {
+		case int:
+			int_sum += x
+		case f64:
+		case bool:
+		}
+		count += 1
+	}
+	check(int_sum == 10, 1120)
+	check(count == 3, 1121)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Main — run everything
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -912,6 +1117,8 @@ main :: proc() {
 	test_ternary_when()
 	print_msg("  ternary_combined...\n")
 	test_ternary_combined()
+	print_msg("  type_switch...\n")
+	test_type_switch()
 	print_msg("ALL PASS\n")
 	exit(0)
 }
