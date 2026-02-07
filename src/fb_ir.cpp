@@ -467,6 +467,8 @@ gb_internal fbModule *fb_module_create(Checker *c) {
 	array_init(&m->procs, heap_allocator());
 	array_init(&m->symbols, heap_allocator());
 	array_init(&m->rodata_entries, heap_allocator());
+	array_init(&m->global_entries, heap_allocator());
+	map_init(&m->global_entity_map);
 	array_init(&m->source_files, heap_allocator());
 
 	// Register source files
@@ -495,13 +497,21 @@ gb_internal void fb_module_destroy(fbModule *m) {
 		}
 	}
 
+	for_array(i, m->global_entries) {
+		if (m->global_entries[i].init_data) {
+			gb_free(heap_allocator(), m->global_entries[i].init_data);
+		}
+	}
+
 	string_map_destroy(&m->symbol_map);
 	string_map_destroy(&m->string_intern_map);
 	map_destroy(&m->file_id_to_idx);
+	map_destroy(&m->global_entity_map);
 
 	array_free(&m->procs);
 	array_free(&m->symbols);
 	array_free(&m->rodata_entries);
+	array_free(&m->global_entries);
 	array_free(&m->source_files);
 }
 

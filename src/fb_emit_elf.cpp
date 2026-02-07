@@ -37,9 +37,11 @@ enum : Elf64_Word {
 	SHT_SYMTAB   = 2,
 	SHT_STRTAB   = 3,
 	SHT_RELA     = 4,
+	SHT_NOBITS   = 8,
 };
 
 enum : Elf64_Xword {
+	SHF_WRITE     = 0x1,
 	SHF_ALLOC     = 0x2,
 	SHF_EXECINSTR = 0x4,
 };
@@ -194,18 +196,17 @@ gb_internal void fb_buf_align(fbBuf *b, u32 align) {
 // ELF emitter
 // ───────────────────────────────────────────────────────────────────────
 
-// Section indices — Phase 2 sections only.
-// Future phases add .data, .bss, .rodata using the existing fbSymbol fields
-// (init_data, is_read_only, etc.) to determine section placement.
 enum {
 	FB_ELF_SEC_NULL     = 0,
 	FB_ELF_SEC_TEXT     = 1,
 	FB_ELF_SEC_RODATA   = 2,
-	FB_ELF_SEC_SYMTAB   = 3,
-	FB_ELF_SEC_STRTAB   = 4,
-	FB_ELF_SEC_SHSTRTAB = 5,
-	FB_ELF_SEC_RELATEXT = 6,
-	FB_ELF_SEC_COUNT    = 7,
+	FB_ELF_SEC_DATA     = 3,
+	FB_ELF_SEC_BSS      = 4,
+	FB_ELF_SEC_SYMTAB   = 5,
+	FB_ELF_SEC_STRTAB   = 6,
+	FB_ELF_SEC_SHSTRTAB = 7,
+	FB_ELF_SEC_RELATEXT = 8,
+	FB_ELF_SEC_COUNT    = 9,
 };
 
 gb_internal void fb_file_write_padding(gbFile *f, u64 current, u64 target) {
@@ -220,12 +221,13 @@ gb_internal void fb_file_write_padding(gbFile *f, u64 current, u64 target) {
 gb_internal String fb_emit_elf(fbModule *m) {
 	u32 proc_count   = cast(u32)m->procs.count;
 	u32 rodata_count = cast(u32)m->rodata_entries.count;
+	u32 global_count = cast(u32)m->global_entries.count;
 
 	// 1. Build .text section: concatenate all proc machine code
 	fbBuf text_buf = {};
 	fb_buf_init(&text_buf, 4096);
 
-	u32 *proc_text_offsets = gb_alloc_array(heap_allocator(), u32, proc_count);
+	u32 *proc_text_offsets = gb_alloc_array(heap_allocator(), u32, proc_count > 0 ? proc_count : 1);
 
 	for_array(i, m->procs) {
 		fbProc *p = m->procs[i];
@@ -252,9 +254,51 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		}
 	}
 
+	// 2b. Build .data and .bss sections from global_entries
+	fbBuf data_buf = {};
+	fb_buf_init(&data_buf, global_count > 0 ? 1024 : 4);
+
+	u32 *global_data_offsets = nullptr;  // offset within .data for initialized globals
+	u32 *global_bss_offsets  = nullptr;  // offset within .bss for zero-init globals
+	bool *global_is_bss      = nullptr;  // true if this global goes to .bss
+	u32 bss_total_size = 0;
+	u32 data_max_align = 1;  // max alignment of any .data entry (for sh_addralign)
+	u32 bss_max_align  = 1;  // max alignment of any .bss entry (for sh_addralign)
+
+	if (global_count > 0) {
+		global_data_offsets = gb_alloc_array(heap_allocator(), u32, global_count);
+		global_bss_offsets  = gb_alloc_array(heap_allocator(), u32, global_count);
+		global_is_bss       = gb_alloc_array(heap_allocator(), bool, global_count);
+
+		for_array(i, m->global_entries) {
+			fbGlobalEntry *ge = &m->global_entries[i];
+			if (ge->is_foreign) {
+				// Foreign: SHN_UNDEF, offsets unused
+				continue;
+			}
+
+			if (ge->init_data != nullptr) {
+				// .data: constant-initialized
+				global_is_bss[i] = false;
+				fb_buf_align(&data_buf, ge->align);
+				global_data_offsets[i] = data_buf.count;
+				fb_buf_append(&data_buf, ge->init_data, ge->size);
+				if (ge->align > data_max_align) data_max_align = ge->align;
+			} else {
+				// .bss: zero-initialized
+				global_is_bss[i] = true;
+				u32 align = ge->align;
+				u32 rem = bss_total_size % align;
+				if (rem != 0) bss_total_size += align - rem;
+				global_bss_offsets[i] = bss_total_size;
+				if (align > bss_max_align) bss_max_align = align;
+				bss_total_size += ge->size;
+			}
+		}
+	}
+
 	// 3. Build .strtab and .symtab
 	// ELF requires STB_LOCAL before STB_GLOBAL.
-	// Symbols: null + file + local procs + local rodata + global procs
 	fbBuf strtab = {};
 	fb_buf_init(&strtab, 1024);
 	fb_buf_append_byte(&strtab, 0);
@@ -270,9 +314,21 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		}
 	}
 
+	// Count local vs global globals
+	u32 local_global_count  = 0;
+	u32 global_global_count = 0;
+	for_array(i, m->global_entries) {
+		fbGlobalEntry *ge = &m->global_entries[i];
+		if (ge->is_foreign || ge->is_export) {
+			global_global_count++;
+		} else {
+			local_global_count++;
+		}
+	}
+
 	// Rodata symbols are always local
-	u32 total_local  = local_proc_count + rodata_count;
-	u32 total_global = global_proc_count;
+	u32 total_local  = local_proc_count + rodata_count + local_global_count;
+	u32 total_global = global_proc_count + global_global_count;
 	u32 actual_sym_count = 2 + total_local + total_global;
 	Elf64_Sym *syms = gb_alloc_array(heap_allocator(), Elf64_Sym, actual_sym_count);
 	gb_zero_size(syms, sizeof(Elf64_Sym) * actual_sym_count);
@@ -300,7 +356,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	u32 local_idx  = 2;
 	u32 global_idx = 2 + total_local;
 
-	// Unified abstract-sym → ELF-sym mapping (indexed by abstract symbol index)
+	// Unified abstract-sym → ELF-sym mapping (proc + rodata only; globals use separate array)
 	u32 total_abstract = proc_count + rodata_count;
 	u32 *sym_elf_idx = gb_alloc_array(heap_allocator(), u32, total_abstract > 0 ? total_abstract : 1);
 
@@ -343,6 +399,48 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		sym_elf_idx[proc_count + i] = idx;
 	}
 
+	// Global variable symbols
+	// Uses a separate array indexed by global entry index, because global abstract
+	// symbol indices use FB_GLOBAL_SYM_BASE + gidx (not contiguous with proc/rodata).
+	u32 *global_sym_elf_idx = gb_alloc_array(heap_allocator(), u32, global_count > 0 ? global_count : 1);
+	for_array(i, m->global_entries) {
+		fbGlobalEntry *ge = &m->global_entries[i];
+		u32 idx;
+		if (ge->is_foreign || ge->is_export) {
+			idx = global_idx++;
+			syms[idx].st_name = fb_buf_append_odin_str(&strtab, ge->name);
+			if (ge->is_foreign) {
+				syms[idx].st_info  = ELF64_ST_INFO(STB_GLOBAL, STT_NOTYPE);
+				syms[idx].st_shndx = SHN_UNDEF;
+			} else if (global_is_bss && global_is_bss[i]) {
+				syms[idx].st_info  = ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT);
+				syms[idx].st_shndx = FB_ELF_SEC_BSS;
+				syms[idx].st_value = global_bss_offsets[i];
+				syms[idx].st_size  = ge->size;
+			} else {
+				syms[idx].st_info  = ELF64_ST_INFO(STB_GLOBAL, STT_OBJECT);
+				syms[idx].st_shndx = FB_ELF_SEC_DATA;
+				syms[idx].st_value = global_data_offsets[i];
+				syms[idx].st_size  = ge->size;
+			}
+		} else {
+			idx = local_idx++;
+			syms[idx].st_name = fb_buf_append_odin_str(&strtab, ge->name);
+			if (global_is_bss && global_is_bss[i]) {
+				syms[idx].st_info  = ELF64_ST_INFO(STB_LOCAL, STT_OBJECT);
+				syms[idx].st_shndx = FB_ELF_SEC_BSS;
+				syms[idx].st_value = global_bss_offsets[i];
+				syms[idx].st_size  = ge->size;
+			} else {
+				syms[idx].st_info  = ELF64_ST_INFO(STB_LOCAL, STT_OBJECT);
+				syms[idx].st_shndx = FB_ELF_SEC_DATA;
+				syms[idx].st_value = global_data_offsets[i];
+				syms[idx].st_size  = ge->size;
+			}
+		}
+		global_sym_elf_idx[i] = idx;
+	}
+
 	u32 local_sym_count = 2 + total_local;
 
 	// 4. Build .shstrtab
@@ -351,6 +449,8 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	fb_buf_append_byte(&shstrtab, 0);
 	u32 shname_text      = fb_buf_append_str(&shstrtab, ".text");
 	u32 shname_rodata    = fb_buf_append_str(&shstrtab, ".rodata");
+	u32 shname_data      = fb_buf_append_str(&shstrtab, ".data");
+	u32 shname_bss       = fb_buf_append_str(&shstrtab, ".bss");
 	u32 shname_symtab    = fb_buf_append_str(&shstrtab, ".symtab");
 	u32 shname_strtab    = fb_buf_append_str(&shstrtab, ".strtab");
 	u32 shname_shstrtab  = fb_buf_append_str(&shstrtab, ".shstrtab");
@@ -369,8 +469,18 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		rodata_offset += 8 - (rodata_offset % 8);
 	}
 
-	// .symtab
-	u64 symtab_offset = rodata_offset + rodata_size;
+	// .data follows .rodata
+	u64 data_offset = rodata_offset + rodata_size;
+	u64 data_size   = data_buf.count;
+	if (data_size > 0 && data_offset % 8 != 0) {
+		data_offset += 8 - (data_offset % 8);
+	}
+
+	// .bss is NOBITS — no file bytes, but needs sh_size
+	u64 bss_size = bss_total_size;
+
+	// .symtab follows .data
+	u64 symtab_offset = data_offset + data_size;
 	if (symtab_offset % 8 != 0) symtab_offset += 8 - (symtab_offset % 8);
 	u64 symtab_size = cast(u64)actual_sym_count * sizeof(Elf64_Sym);
 
@@ -391,7 +501,17 @@ gb_internal String fb_emit_elf(fbModule *m) {
 			Elf64_Rela rela = {};
 			rela.r_offset = proc_text_offsets[pi] + rel->code_offset;
 			Elf64_Word elf_type = (rel->reloc_type == FB_RELOC_PLT32) ? R_X86_64_PLT32 : R_X86_64_PC32;
-			rela.r_info   = ELF64_R_INFO(sym_elf_idx[rel->target_proc], elf_type);
+			// Map abstract symbol index to ELF symbol index.
+			// Global variables use FB_GLOBAL_SYM_BASE + gidx; everything else is in sym_elf_idx.
+			u32 elf_sym;
+			if (rel->target_sym >= FB_GLOBAL_SYM_BASE) {
+				u32 gidx = rel->target_sym - FB_GLOBAL_SYM_BASE;
+				GB_ASSERT(gidx < global_count);
+				elf_sym = global_sym_elf_idx[gidx];
+			} else {
+				elf_sym = sym_elf_idx[rel->target_sym];
+			}
+			rela.r_info   = ELF64_R_INFO(elf_sym, elf_type);
 			rela.r_addend = rel->addend;
 			fb_buf_append(&rela_buf, &rela, sizeof(Elf64_Rela));
 		}
@@ -422,6 +542,20 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	shdrs[FB_ELF_SEC_RODATA].sh_offset    = rodata_offset;
 	shdrs[FB_ELF_SEC_RODATA].sh_size      = rodata_size;
 	shdrs[FB_ELF_SEC_RODATA].sh_addralign = 8;
+
+	shdrs[FB_ELF_SEC_DATA].sh_name      = shname_data;
+	shdrs[FB_ELF_SEC_DATA].sh_type      = SHT_PROGBITS;
+	shdrs[FB_ELF_SEC_DATA].sh_flags     = SHF_ALLOC | SHF_WRITE;
+	shdrs[FB_ELF_SEC_DATA].sh_offset    = data_offset;
+	shdrs[FB_ELF_SEC_DATA].sh_size      = data_size;
+	shdrs[FB_ELF_SEC_DATA].sh_addralign = data_max_align > 8 ? data_max_align : 8;
+
+	shdrs[FB_ELF_SEC_BSS].sh_name      = shname_bss;
+	shdrs[FB_ELF_SEC_BSS].sh_type      = SHT_NOBITS;
+	shdrs[FB_ELF_SEC_BSS].sh_flags     = SHF_ALLOC | SHF_WRITE;
+	shdrs[FB_ELF_SEC_BSS].sh_offset    = data_offset + data_size; // same file offset (no bytes)
+	shdrs[FB_ELF_SEC_BSS].sh_size      = bss_size;
+	shdrs[FB_ELF_SEC_BSS].sh_addralign = bss_max_align > 8 ? bss_max_align : 8;
 
 	shdrs[FB_ELF_SEC_SYMTAB].sh_name      = shname_symtab;
 	shdrs[FB_ELF_SEC_SYMTAB].sh_type      = SHT_SYMTAB;
@@ -483,13 +617,18 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		gb_free(heap_allocator(), filepath_cstr);
 		fb_buf_free(&text_buf);
 		fb_buf_free(&rodata_buf);
+		fb_buf_free(&data_buf);
 		fb_buf_free(&strtab);
 		fb_buf_free(&shstrtab);
 		fb_buf_free(&rela_buf);
 		gb_free(heap_allocator(), syms);
 		gb_free(heap_allocator(), proc_text_offsets);
 		if (rodata_offsets) gb_free(heap_allocator(), rodata_offsets);
+		if (global_data_offsets) gb_free(heap_allocator(), global_data_offsets);
+		if (global_bss_offsets)  gb_free(heap_allocator(), global_bss_offsets);
+		if (global_is_bss)       gb_free(heap_allocator(), global_is_bss);
 		gb_free(heap_allocator(), sym_elf_idx);
+		gb_free(heap_allocator(), global_sym_elf_idx);
 		return {};
 	}
 
@@ -505,8 +644,16 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		gb_file_write(&f, rodata_buf.data, rodata_buf.count);
 	}
 
+	// .data
+	if (data_buf.count > 0) {
+		fb_file_write_padding(&f, rodata_offset + rodata_size, data_offset);
+		gb_file_write(&f, data_buf.data, data_buf.count);
+	}
+
+	// .bss: NOBITS — no file data written
+
 	// .symtab
-	fb_file_write_padding(&f, rodata_offset + rodata_size, symtab_offset);
+	fb_file_write_padding(&f, data_offset + data_size, symtab_offset);
 	gb_file_write(&f, syms, sizeof(Elf64_Sym) * actual_sym_count);
 
 	gb_file_write(&f, strtab.data, strtab.count);
@@ -525,13 +672,18 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	gb_free(heap_allocator(), filepath_cstr);
 	fb_buf_free(&text_buf);
 	fb_buf_free(&rodata_buf);
+	fb_buf_free(&data_buf);
 	fb_buf_free(&strtab);
 	fb_buf_free(&shstrtab);
 	fb_buf_free(&rela_buf);
 	gb_free(heap_allocator(), syms);
 	gb_free(heap_allocator(), proc_text_offsets);
 	if (rodata_offsets) gb_free(heap_allocator(), rodata_offsets);
+	if (global_data_offsets) gb_free(heap_allocator(), global_data_offsets);
+	if (global_bss_offsets)  gb_free(heap_allocator(), global_bss_offsets);
+	if (global_is_bss)       gb_free(heap_allocator(), global_is_bss);
 	gb_free(heap_allocator(), sym_elf_idx);
+	gb_free(heap_allocator(), global_sym_elf_idx);
 
 	return filepath;
 }

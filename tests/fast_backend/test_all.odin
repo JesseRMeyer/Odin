@@ -15,6 +15,7 @@ package test_all
 //   700-740  switch (advanced)
 //   800-850  slicing
 //   900-905  or_else
+//   950-969  globals
 
 foreign import libc "system:c"
 foreign libc {
@@ -651,6 +652,53 @@ test_or_else :: proc() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Global variables (950-969)
+// ═══════════════════════════════════════════════════════════════════════
+
+g_zero_int  : int
+g_const_int : int = 42
+g_const_f64 : f64 = 3.14
+g_const_bool: bool = true
+g_mut_int   : int = 100
+
+read_global :: proc() -> int {
+	return g_const_int
+}
+
+write_global :: proc(val: int) {
+	g_mut_int = val
+}
+
+test_globals :: proc() {
+	// Zero-init global
+	check(g_zero_int == 0, 950)
+
+	// Constant-init int
+	check(g_const_int == 42, 951)
+
+	// Constant-init float
+	check(g_const_f64 > 3.13, 952)
+	check(g_const_f64 < 3.15, 953)
+
+	// Constant-init bool
+	check(g_const_bool, 954)
+
+	// Global mutation
+	check(g_mut_int == 100, 955)
+	g_mut_int = 200
+	check(g_mut_int == 200, 956)
+
+	// Global across function calls
+	check(read_global() == 42, 957)
+	write_global(999)
+	check(g_mut_int == 999, 958)
+
+	// Zero-init global mutation
+	g_zero_int = 77
+	check(g_zero_int == 77, 959)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Main — run everything
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -699,6 +747,8 @@ main :: proc() {
 	test_slicing()
 	print_msg("  or_else...\n")
 	test_or_else()
+	print_msg("  globals...\n")
+	test_globals()
 	print_msg("ALL PASS\n")
 	exit(0)
 }

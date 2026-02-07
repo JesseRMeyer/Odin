@@ -238,6 +238,11 @@ enum : u8 {
 
 enum : u32 { FB_NOREG = 0xFFFFFFFF };
 
+// Abstract symbol index base for global variables.
+// Proc indices are [0, procs.count), rodata indices are [procs.count, procs.count + rodata.count),
+// global indices use this separate range to avoid dependency on rodata count (which grows during IR building).
+enum : u32 { FB_GLOBAL_SYM_BASE = 0x40000000 };
+
 struct fbInst {
 	u8     op;       // fbOp
 	u8     flags;    // per-opcode flags
@@ -276,7 +281,7 @@ enum fbRelocType : u32 {
 
 struct fbReloc {
 	u32         code_offset;   // byte offset in this proc's machine code
-	u32         target_proc;   // proc index in m->procs
+	u32         target_sym;    // abstract symbol index (proc, rodata, or FB_GLOBAL_SYM_BASE + gidx)
 	i64         addend;        // typically -4
 	fbRelocType reloc_type;
 };
@@ -458,6 +463,20 @@ struct fbRodataEntry {
 	String name;   // symbol name (e.g. ".L.str.0")
 };
 
+// Global variable entry (package-level variables).
+// Each entry becomes a symbol in .data (constant-initialized) or .bss (zero-initialized).
+// Abstract symbol index = FB_GLOBAL_SYM_BASE + global_entries index.
+struct fbGlobalEntry {
+	Entity *entity;
+	String  name;
+	Type   *odin_type;
+	u8     *init_data;   // NULL → zero-init (.bss)
+	u32     size;
+	u32     align;
+	bool    is_foreign;
+	bool    is_export;
+};
+
 struct fbModule {
 	Checker     *checker;
 	CheckerInfo *info;
@@ -475,6 +494,11 @@ struct fbModule {
 	// Abstract symbol index for rodata entry i = procs.count + i.
 	Array<fbRodataEntry>  rodata_entries;
 	StringMap<u32>        string_intern_map;  // string content → rodata entry index
+
+	// Global variables (package-level).
+	// Abstract symbol index for global entry i = FB_GLOBAL_SYM_BASE + i.
+	Array<fbGlobalEntry>      global_entries;
+	PtrMap<Entity *, u32>     global_entity_map;  // Entity* → global_entries index
 
 	Array<fbSourceFile>        source_files;
 	PtrMap<uintptr, u32>       file_id_to_idx;
@@ -727,7 +751,7 @@ struct fbLowCtx {
 	u32      reloc_count;
 	u32      reloc_cap;
 
-	// Symbol references: value_sym[vreg] = proc index when vreg is a SYMADDR.
+	// Symbol references: value_sym[vreg] = abstract symbol index when vreg is a SYMADDR.
 	// FB_NOREG means the vreg is not a symbol reference.
 	u32     *value_sym;
 
@@ -764,6 +788,7 @@ gb_internal String  fb_mangle_name(fbModule *m, Entity *e);
 gb_internal String  fb_filepath_obj(fbModule *m);
 
 gb_internal void    fb_generate_procedures(fbModule *m);
+gb_internal void    fb_generate_globals(fbModule *m);
 gb_internal void    fb_lower_proc_x64(fbLowCtx *ctx);
 gb_internal void    fb_lower_all(fbModule *m);
 gb_internal String  fb_emit_elf(fbModule *m);

@@ -275,8 +275,8 @@ gb_internal void fb_emit_memcpy(fbBuilder *b, fbValue dst, fbValue src, fbValue 
 	fb_inst_emit(b->proc, FB_MEMCPY, FB_VOID, dst.id, src.id, size.id, 0, align);
 }
 
-gb_internal fbValue fb_emit_symaddr(fbBuilder *b, u32 proc_idx) {
-	u32 r = fb_inst_emit(b->proc, FB_SYMADDR, FB_PTR, FB_NOREG, FB_NOREG, FB_NOREG, 0, cast(i64)proc_idx);
+gb_internal fbValue fb_emit_symaddr(fbBuilder *b, u32 sym_idx) {
+	u32 r = fb_inst_emit(b->proc, FB_SYMADDR, FB_PTR, FB_NOREG, FB_NOREG, FB_NOREG, 0, cast(i64)sym_idx);
 	return fb_make_value(r, nullptr);
 }
 
@@ -517,6 +517,17 @@ gb_internal fbValue fb_load_field(fbBuilder *b, fbValue base_ptr, i64 byte_offse
 	return fb_emit_load(b, ptr, field_type);
 }
 
+gb_internal fbAddr fb_make_global_addr(fbBuilder *b, Entity *e, u32 gidx) {
+	u32 abstract_sym = FB_GLOBAL_SYM_BASE + gidx;
+	fbValue ptr = fb_emit_symaddr(b, abstract_sym);
+	ptr.type = alloc_type_pointer(e->type);
+	fbAddr addr = {};
+	addr.kind = fbAddr_Default;
+	addr.base = ptr;
+	addr.type = e->type;
+	return addr;
+}
+
 gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 	expr = unparen_expr(expr);
 
@@ -528,6 +539,14 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 			fbAddr *found = map_get(&b->variable_map, e);
 			if (found != nullptr) {
 				return *found;
+			}
+
+			// Global variable reference
+			if (e->kind == Entity_Variable) {
+				u32 *gidx = map_get(&b->module->global_entity_map, e);
+				if (gidx != nullptr) {
+					return fb_make_global_addr(b, e, *gidx);
+				}
 			}
 		}
 		GB_PANIC("fb_build_addr Ident: entity not found for '%s'", expr_to_string(expr));
@@ -1430,6 +1449,14 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 				fbValue sym = fb_emit_symaddr(b, *idx);
 				sym.type = type;
 				return sym;
+			}
+		}
+
+		// Global variable reference
+		if (e->kind == Entity_Variable) {
+			u32 *gidx = map_get(&b->module->global_entity_map, e);
+			if (gidx != nullptr) {
+				return fb_addr_load(b, fb_make_global_addr(b, e, *gidx));
 			}
 		}
 
@@ -2964,6 +2991,10 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 		}
 	}
 
+	// Discover global variables before building procedure IR, so that
+	// entity references to globals can be resolved during expr building.
+	fb_generate_globals(m);
+
 	// Determine which package the entry point belongs to.
 	// Phase 6a only compiles procs in this package; all others get ret stubs.
 	AstPackage *user_pkg = info->entry_point ? info->entry_point->pkg : nullptr;
@@ -3028,5 +3059,114 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 		array_free(&b.branch_regions);
 		map_destroy(&b.variable_map);
 		map_destroy(&b.soa_values_map);
+	}
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Global variable support
+// ───────────────────────────────────────────────────────────────────────
+
+// Serialize a constant ExactValue into a byte buffer for .data.
+// Returns a heap-allocated buffer of `size` bytes, or NULL if unsupported.
+gb_internal u8 *fb_serialize_const_value(ExactValue value, u32 size) {
+	u8 *buf = gb_alloc_array(heap_allocator(), u8, size);
+	gb_zero_size(buf, size);
+
+	switch (value.kind) {
+	case ExactValue_Bool: {
+		buf[0] = value.value_bool ? 1 : 0;
+		return buf;
+	}
+	case ExactValue_Integer: {
+		u64 ival = exact_value_to_u64(value);
+		gb_memmove(buf, &ival, gb_min(size, 8));
+		return buf;
+	}
+	case ExactValue_Float: {
+		f64 fval = value.value_float;
+		if (size == 4) {
+			f32 f32val = cast(f32)fval;
+			gb_memmove(buf, &f32val, 4);
+		} else if (size == 8) {
+			gb_memmove(buf, &fval, 8);
+		} else if (size == 2) {
+			// f16: truncate from f64 via f32 → f16 bit pattern
+			// For now just store zero for f16
+			gb_zero_size(buf, 2);
+		} else {
+			gb_free(heap_allocator(), buf);
+			return nullptr;
+		}
+		return buf;
+	}
+	case ExactValue_Pointer: {
+		u64 pval = cast(u64)value.value_pointer;
+		gb_memmove(buf, &pval, gb_min(size, 8));
+		return buf;
+	}
+	default:
+		gb_free(heap_allocator(), buf);
+		return nullptr;
+	}
+}
+
+gb_internal void fb_generate_globals(fbModule *m) {
+	CheckerInfo *info = m->info;
+
+	for (DeclInfo *d : info->variable_init_order) {
+		Entity *e = d->entity;
+
+		if ((e->scope->flags & ScopeFlag_File) == 0) {
+			continue;
+		}
+		if (e->min_dep_count.load(std::memory_order_relaxed) == 0) {
+			continue;
+		}
+
+		GB_ASSERT(e->kind == Entity_Variable);
+
+		bool is_foreign = e->Variable.is_foreign;
+		bool is_export  = e->Variable.is_export;
+
+		String name = fb_get_entity_name(m, e);
+		u32 size  = cast(u32)type_size_of(e->type);
+		u32 align = cast(u32)type_align_of(e->type);
+		if (align == 0) align = 1;
+
+		fbGlobalEntry entry = {};
+		entry.entity     = e;
+		entry.name       = name;
+		entry.odin_type  = e->type;
+		entry.size       = size;
+		entry.align      = align;
+		entry.is_foreign = is_foreign;
+		entry.is_export  = is_export;
+		entry.init_data  = nullptr;
+
+		if (!is_foreign && d->init_expr != nullptr) {
+			TypeAndValue tav = type_and_value_of_expr(d->init_expr);
+			if (tav.mode != Addressing_Invalid &&
+			    tav.value.kind != ExactValue_Invalid &&
+			    !is_type_any(e->type)) {
+				entry.init_data = fb_serialize_const_value(tav.value, size);
+			}
+			// TODO: when init_data is NULL here, the global has a non-trivial initializer
+			// (e.g. string, compound literal) that fb_serialize_const_value cannot handle.
+			// It will stay zero until __$startup_runtime runs proper init code.
+		}
+
+		u32 global_idx = cast(u32)m->global_entries.count;
+		array_add(&m->global_entries, entry);
+		map_set(&m->global_entity_map, e, global_idx);
+
+		// Register foreign libraries
+		if (is_foreign && e->Variable.foreign_library != nullptr) {
+			Entity *lib = e->Variable.foreign_library;
+			if (lib->kind == Entity_LibraryName) {
+				if (!ptr_set_update(&m->linker_data->foreign_libraries_set, lib)) {
+					array_add(&m->linker_data->foreign_libraries, lib);
+				}
+			}
+		}
 	}
 }

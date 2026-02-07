@@ -209,7 +209,7 @@ gb_internal void fb_x64_xmm_to_gp(fbLowCtx *ctx, fbX64Reg gp, u8 xmm, fbTypeKind
 
 gb_internal void fb_x64_spill_reg(fbLowCtx *ctx, fbX64Reg reg);
 gb_internal i32  fb_x64_spill_offset(fbLowCtx *ctx, u32 vreg);
-gb_internal void fb_x64_record_reloc(fbLowCtx *ctx, u32 code_offset, u32 target_proc, i64 addend, fbRelocType reloc_type);
+gb_internal void fb_x64_record_reloc(fbLowCtx *ctx, u32 code_offset, u32 target_sym, i64 addend, fbRelocType reloc_type);
 
 // Emit RIP-relative LEA for a symbol: lea reg, [rip+disp32] + relocation record.
 // Used by both resolve_gp (which picks any free register) and move_value_to_reg
@@ -732,7 +732,7 @@ gb_internal void fb_x64_record_fixup(fbLowCtx *ctx, u32 code_offset, u32 target_
 // Call relocation recording
 // ───────────────────────────────────────────────────────────────────────
 
-gb_internal void fb_x64_record_reloc(fbLowCtx *ctx, u32 code_offset, u32 target_proc, i64 addend, fbRelocType reloc_type) {
+gb_internal void fb_x64_record_reloc(fbLowCtx *ctx, u32 code_offset, u32 target_sym, i64 addend, fbRelocType reloc_type) {
 	if (ctx->reloc_count >= ctx->reloc_cap) {
 		u32 new_cap = ctx->reloc_cap * 2;
 		if (new_cap < 16) new_cap = 16;
@@ -741,7 +741,7 @@ gb_internal void fb_x64_record_reloc(fbLowCtx *ctx, u32 code_offset, u32 target_
 	}
 	fbReloc *r = &ctx->relocs[ctx->reloc_count++];
 	r->code_offset = code_offset;
-	r->target_proc = target_proc;
+	r->target_sym  = target_sym;
 	r->addend      = addend;
 	r->reloc_type  = reloc_type;
 }
