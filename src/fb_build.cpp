@@ -46,7 +46,13 @@ gb_internal void fb_setup_params(fbProc *p) {
 		}
 
 		if (abi.classes[0] == FB_ABI_SSE) {
-			// SSE params: Phase 8
+			// At -O0, float params are passed in GP registers for intra-backend calls.
+			// Treat them as INTEGER for slot allocation.
+			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) continue;
+			u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+			locs[gp_idx].slot_idx   = slot;
+			locs[gp_idx].sub_offset = 0;
+			gp_idx++;
 			continue;
 		}
 
@@ -199,7 +205,16 @@ gb_internal fbValue fb_emit_arith(fbBuilder *b, fbOp op, fbValue lhs, fbValue rh
 }
 
 gb_internal fbValue fb_emit_cmp(fbBuilder *b, fbOp cmp_op, fbValue lhs, fbValue rhs) {
-	u32 r = fb_inst_emit(b->proc, cmp_op, FB_I1, lhs.id, rhs.id, FB_NOREG, 0, 0);
+	// For float comparisons, store the operand type in imm so the lowerer
+	// knows whether to emit ucomiss (F32) or ucomisd (F64).
+	i64 imm = 0;
+	if (cmp_op >= FB_CMP_FEQ && cmp_op <= FB_CMP_FGE) {
+		Type *operand_type = lhs.type ? lhs.type : rhs.type;
+		if (operand_type != nullptr) {
+			imm = cast(i64)fb_type_pack(fb_data_type(operand_type));
+		}
+	}
+	u32 r = fb_inst_emit(b->proc, cmp_op, FB_I1, lhs.id, rhs.id, FB_NOREG, 0, imm);
 	return fb_make_value(r, t_bool);
 }
 
