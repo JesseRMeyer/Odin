@@ -461,10 +461,12 @@ gb_internal fbModule *fb_module_create(Checker *c) {
 	m->target.features = 0; // populated in future phases
 
 	string_map_init(&m->symbol_map);
+	string_map_init(&m->string_intern_map);
 	map_init(&m->file_id_to_idx);
 
 	array_init(&m->procs, heap_allocator());
 	array_init(&m->symbols, heap_allocator());
+	array_init(&m->rodata_entries, heap_allocator());
 	array_init(&m->source_files, heap_allocator());
 
 	// Register source files
@@ -487,12 +489,55 @@ gb_internal void fb_module_destroy(fbModule *m) {
 		fb_proc_destroy(m->procs[i]);
 	}
 
+	for_array(i, m->rodata_entries) {
+		if (m->rodata_entries[i].data) {
+			gb_free(heap_allocator(), m->rodata_entries[i].data);
+		}
+	}
+
 	string_map_destroy(&m->symbol_map);
+	string_map_destroy(&m->string_intern_map);
 	map_destroy(&m->file_id_to_idx);
 
 	array_free(&m->procs);
 	array_free(&m->symbols);
+	array_free(&m->rodata_entries);
 	array_free(&m->source_files);
+}
+
+// Intern a string literal into the module's rodata section.
+// Returns the abstract symbol index (procs.count + rodata entry index).
+// Deduplicates identical strings.
+gb_internal u32 fb_module_intern_string_data(fbModule *m, String str) {
+	// Check for existing entry
+	u32 *existing = string_map_get(&m->string_intern_map, str);
+	if (existing != nullptr) {
+		return cast(u32)m->procs.count + *existing;
+	}
+
+	// Create new rodata entry with null-terminated copy
+	u32 rodata_idx = cast(u32)m->rodata_entries.count;
+
+	fbRodataEntry entry = {};
+	entry.size = cast(u32)str.len + 1; // +1 for null terminator (for cstring compat)
+	entry.data = gb_alloc_array(heap_allocator(), u8, entry.size);
+	if (str.len > 0) {
+		gb_memmove(entry.data, str.text, str.len);
+	}
+	entry.data[str.len] = 0; // null terminator
+
+	// Generate a unique symbol name
+	char name_buf[64];
+	gb_snprintf(name_buf, sizeof(name_buf), ".L.str.%u", rodata_idx);
+	isize name_len = gb_strlen(name_buf);
+	u8 *name_copy = gb_alloc_array(permanent_allocator(), u8, name_len);
+	gb_memmove(name_copy, name_buf, name_len);
+	entry.name = make_string(name_copy, name_len);
+
+	array_add(&m->rodata_entries, entry);
+	string_map_set(&m->string_intern_map, str, rodata_idx);
+
+	return cast(u32)m->procs.count + rodata_idx;
 }
 
 // ───────────────────────────────────────────────────────────────────────

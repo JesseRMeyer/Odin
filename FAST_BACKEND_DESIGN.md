@@ -913,6 +913,10 @@ for each block B in procedure:
 
 **Ownership invariant:** `resolve_gp` asserts that when `value_loc[vreg]` says a value is in register R, then `gp[R].vreg == vreg`. It also asserts that a value has either a valid location (register or spill slot) or a symbol reference — values with `FB_LOC_NONE` and no symbol are programming errors caught at lowering time rather than producing silent wrong code.
 
+**Dirty tracking:** A register is "dirty" when it holds a value that has not been written to its spill slot. `move_value_to_reg` marks values as dirty when moved from another register (`loc >= 0`) or freshly materialized (`loc == FB_LOC_NONE`, e.g. SYMADDR via RIP-relative LEA). Values reloaded from spill slots (`loc < 0 && loc != FB_LOC_NONE`) are clean since the spill slot already contains the correct value. Eviction only emits a store for dirty registers, so incorrect dirty tracking causes silent data loss.
+
+**Division protocol:** Integer division (`SDIV`/`UDIV`/`SMOD`/`UMOD`) requires the dividend in RAX and clobbers both RAX and RDX. The lowering: (1) spills RAX and RDX, (2) moves the dividend to RAX via `move_value_to_reg`, (3) flushes RAX to the dividend's spill slot if dirty, (4) detaches the dividend from RAX (`value_loc[a] = spill_offset, gp[RAX].vreg = FB_NOREG`) *before* the DIV instruction executes. Without step (3-4), DIV overwrites RAX and `value_loc` is left pointing at a register whose contents have been destroyed.
+
 **Scratch register reservation:** On x64, RSP and RBP are reserved (frame/stack). On arm64, SP and X29 (FP) are reserved. All other registers are available for allocation.
 
 **Callee-saved registers:** At -O0, avoid callee-saved registers entirely (no save/restore overhead). Use only caller-saved registers: x64: RAX, RCX, RDX, RSI, RDI, R8-R11 (9 GP). arm64: X0-X17 (18 GP), V0-V7 (8 FP).
@@ -1114,9 +1118,9 @@ Similar strategy. S_LOCAL records with `DefRangeFramePointerRelFullScope` (simpl
 
 ```
 src/
-├── fb_ir.h                 // IR types, opcode enum, instruction format, builder/lowering structs (~760 lines)
+├── fb_ir.h                 // IR types, opcode enum, instruction format, builder/lowering structs (~770 lines)
 ├── fb_ir.cpp               // Module lifecycle, type helpers, symbol management (~540 lines)
-├── fb_build.cpp            // AST → IR builder (~2100 lines, growing)
+├── fb_build.cpp            // AST → IR builder (~2600 lines, growing)
 │                           //   fb_build_expr(), fb_build_stmt(), fb_build_addr(),
 │                           //   fb_build_call(), fb_build_return(), fb_emit_conv(), etc.
 │                           //   Mirrors tilde_expr.cpp + tilde_stmt.cpp + tilde_proc.cpp
@@ -1368,10 +1372,8 @@ Core AST-to-IR translation with expression, statement, and address builders.
 
 **Remaining:**
 - Full struct/union field access patterns
-- Multi-return procedure calls
-- Complex address kinds: Map, SOA (full), RelativePtr/Slice, Swizzle, BitField
+- Complex address kinds: Map, SOA (full), RelativePtr, Swizzle, BitField
 - Constant folding in the builder
-- or_else, or_return expressions
 - Type assertions, type switches
 - Inline assembly
 
@@ -1386,7 +1388,7 @@ Built-in procedure dispatch and float opcode correction.
 - `src/fb_ir.h` — Forward declaration for `fb_build_builtin_proc()`
 
 **What works:**
-- Container builtins: `len`, `cap`, `raw_data` for slices, strings, dynamic arrays (correct field offsets: data@0, len@8, cap@16)
+- Container builtins: `len`, `cap`, `raw_data` for slices, strings, dynamic arrays (field offsets use `ptr_size`: data@0, len@ptr_size, cap@ptr_size+int_size)
 - Arithmetic builtins: `min` (variadic fold-left with CMP+SELECT), `max`, `abs` (NEG+CMP+SELECT), `clamp` (max then min)
 - Pointer builtins: `ptr_offset` (ARRAY opcode), `ptr_sub` (PTR2INT, SUB, SDIV)
 - Memory builtins: `mem_copy` (MEMCPY → rep movsb), `mem_zero` (MEMZERO → rep stosb)
@@ -1522,6 +1524,7 @@ The wrapping guard prevents infinite loops when upper equals the type's maximum 
 
 **Supported iteration types:**
 - Integer ranges: `..<` (exclusive), `..=` (inclusive), `..` (inclusive)
+- Float ranges: `..<`, `..=`, `..` (uses `FADD` with proper `FCONST 1.0` step)
 - Fixed-size arrays (`[N]T`)
 - Slices (`[]T`)
 - Dynamic arrays (`[dynamic]T`)
@@ -1545,14 +1548,90 @@ The wrapping guard prevents infinite loops when upper equals the type's maximum 
 - Complex loop bodies with multiple locals
 - Dot product via indexed range over slices
 
+**Phase 6g: Correctness Fixes — Division, Dirty Tracking, Container Offsets, Bool (DONE)**
+
+Bug fixes across lowering, builtins, and the builder discovered via test programs.
+
+**Files modified:**
+- `src/fb_lower_x64.cpp` — Division spill fix, dirty tracking fix in `move_value_to_reg`
+- `src/fb_build_builtin.cpp` — Container field offset fix (all `len`/`cap` loads)
+- `src/fb_build.cpp` — Float range step, bool signedness
+
+**Bug fixes:**
+- **Division spill:** `fb_x64_div` now flushes the dividend to its spill slot *before* DIV clobbers RAX, then detaches the value from RAX (`value_loc[a] = spill_offset, gp[RAX].vreg = FB_NOREG`). Previously, `move_value_to_reg` put the dividend in RAX but DIV overwrote it, leaving `value_loc` pointing at an unwritten spill slot — any later reload would read garbage
+- **Dirty tracking:** `fb_x64_move_value_to_reg` now marks values as dirty when `loc >= 0` (register) *or* `loc == FB_LOC_NONE` (freshly materialized, e.g. SYMADDR via LEA). Only spill-slot reloads (`loc < 0 && loc != FB_LOC_NONE`) are clean. Previously, SYMADDR-materialized values were marked clean, so eviction skipped the store and reloads read uninitialized stack memory
+- **Container offsets:** `len` field offset changed from `int_size` to `ptr_size` throughout `fb_builtin_len`, `fb_builtin_cap`, and `fb_build_range_indexed`. On 64-bit targets these are identical (both 8), but the correct semantic is that `len` follows the data pointer (`rawptr`), not a preceding integer. `cap` offset changed from `2 * int_size` to `ptr_size + int_size`
+- **Bool signedness:** `fb_type_is_signed` now returns `false` for `BasicFlag_Boolean` types before checking `BasicFlag_Unsigned`. Booleans are logically unsigned — without this, `bool` (which lacks `BasicFlag_Unsigned`) was treated as signed, causing SEXT instead of ZEXT in widening conversions
+- **Float range step:** `fb_build_range_interval` now uses `fb_emit_fconst(b, iter_type, 1.0)` instead of `fb_emit_iconst(b, iter_type, 1)` for float ranges. The integer bit pattern `0x1` is not `1.0` in IEEE 754 — the increment was producing a subnormal (~1.4e-45 for f32) instead of 1.0
+
+**Phase 6h: Block-boundary Register Spill Fix (DONE)**
+
+Fixed a critical register allocator bug: spill code was emitted at the start of each basic block, shaped for the *previous* block's register state. When control arrived from a different predecessor, the spill wrote physical registers to wrong spill slots, causing SIGSEGV.
+
+**Files modified:**
+- `src/fb_lower_x64.cpp` — Added `fb_x64_clear_reg_state()` (clears register bookkeeping without emitting code) and `fb_x64_is_terminator()`. Changed main lowering loop: `clear_reg_state` at block start (no code emission), `reset_regs` before each terminator (emits spill code on the correct control flow path).
+
+**Phase 6i: String Constants & .rodata (DONE)**
+
+String literal support: `.rodata` ELF section, string interning, ABI decomposition for 2-eightbyte types.
+
+**Files modified:**
+- `src/fb_ir.h` — Added `fbRodataEntry` struct, `rodata_entries` and `string_intern_map` on `fbModule`
+- `src/fb_ir.cpp` — Added `fb_module_intern_string_data()` for string deduplication; init/destroy for new fields
+- `src/fb_build.cpp` — `ExactValue_String` handler in `fb_const_value` (builds string struct on stack from rodata pointer + length); ABI decomposition in `fb_build_call_expr` for 2-eightbyte INTEGER types (string, slice, any); `fb_addr_load` returns pointer for aggregate types (FBT_VOID) instead of scalar load
+- `src/fb_emit_elf.cpp` — Added `.rodata` section (FB_ELF_SEC_RODATA=2), `STT_OBJECT` symbol type, unified `sym_elf_idx[]` array covering both proc and rodata symbols, rodata symbols emitted as `STB_LOCAL, STT_OBJECT`
+
+**What works:**
+- String literals: length, comparison, passing to functions
+- Automatic interning: identical string constants share one rodata entry
+- cstring support via `FB_SYMADDR` pointing directly at rodata
+- 2-eightbyte ABI: string/slice/any arguments decomposed into two register-sized values at call sites
+
+**Phase 6j: Switch Statements (DONE)**
+
+Full switch statement support with two dispatch strategies and fallthrough.
+
+**Files modified:**
+- `src/fb_build.cpp` — Added `fb_switch_can_be_trivial()` (checks for all-constant integer cases, no ranges) and `fb_build_switch_stmt()` (~120 lines); added `Ast_SwitchStmt` case in `fb_build_stmt`; added `Token_fallthrough` handling in `BranchStmt`
+
+**What works:**
+- **Trivial path** (FB_SWITCH IR instruction): constant integer/bool/enum cases → single SWITCH instruction → lowered to CMP+JE chain in x86-64
+- **Non-trivial path** (chain of CMP+BRANCH): tag-less boolean switches, range cases (`..`, `..=`, `..<`), non-constant case values
+- Multiple values per case (`case 1, 2, 3:`)
+- Default case (any position, not just last)
+- Tag-less switch (`switch { case x < 10: ... }` → implicit `switch true`)
+- Init statements (`switch x := 5; x { ... }`)
+- Fallthrough (`fallthrough` → jumps to next case body)
+- Fallthrough chains (multiple consecutive fallthroughs)
+- Labeled break out of switch
+- Nested switches, switches in loops
+- Return from within switch cases
+- Scope/defer management per case clause
+
+**Phase 6k: String Indexing, Slice Expressions, or_else (DONE)**
+
+Incremental feature additions that unlock more of the standard library.
+
+**Files modified:**
+- `src/fb_build.cpp` — Added string case to `IndexExpr` in `fb_build_addr` (loads `.data` pointer before indexing); added `Ast_SliceExpr` handler in `fb_build_addr` (array/slice/string/dynamic array → `{data+lo*stride, hi-lo}` local); moved `fb_load_field` from `fb_build_builtin.cpp` (shared helper); added `Ast_OrElseExpr` and `Ast_OrReturnExpr` in `fb_build_expr` (multi-return unpack → branch on ok → temp local merge)
+- `src/fb_build_builtin.cpp` — Removed `fb_load_field` definition (now in `fb_build.cpp`)
+
+**What works:**
+- String indexing (`s[i]` loads byte from string data pointer)
+- Array slicing (`arr[lo:hi]`, `arr[:]`, `arr[lo:]`, `arr[:hi]`)
+- Slice-of-slice (`s1[lo:hi]`)
+- String slicing (`s[lo:hi]`)
+- Dynamic array slicing
+- `or_else` with multi-return `(value, ok)` procedures
+- `or_return` with multi-return `(value, ok)` procedures
+- Chained `or_else`, `or_else` in loops, `or_else` with call fallbacks
+
 ### Phase 7: Remaining Odin Features (TODO)
 
 - Map operations (runtime calls)
 - SOA addressing
 - Slice operations (`append`, `delete`, `make`, `new`)
-- String operations
 - Dynamic array operations
-- `or_else`, `or_return`
 - Bit fields, swizzle
 - Type assertions, type switches
 - Runtime type info generation
@@ -1589,7 +1668,7 @@ The wrapping guard prevents infinite loops when upper equals the type's maximum 
 - PE/COFF emission for Windows (`fb_emit_pe.cpp`)
 - Mach-O emission for macOS (`fb_emit_macho.cpp`)
 - CodeView debug info for Windows
-- `.data`, `.bss`, `.rodata` sections (currently all code is in `.text`)
+- `.data`, `.bss` sections (`.rodata` done in Phase 6i)
 
 ### Phase 11: Threading & Performance (TODO)
 

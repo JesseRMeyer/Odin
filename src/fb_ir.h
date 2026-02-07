@@ -450,6 +450,14 @@ struct fbSymbol {
 // Module
 // ───────────────────────────────────────────────────────────────────────
 
+// Read-only data entry (string literals, constant arrays, etc.)
+// Each entry is a blob of bytes placed in .rodata with a unique symbol.
+struct fbRodataEntry {
+	u8    *data;
+	u32    size;
+	String name;   // symbol name (e.g. ".L.str.0")
+};
+
 struct fbModule {
 	Checker     *checker;
 	CheckerInfo *info;
@@ -462,6 +470,11 @@ struct fbModule {
 	Array<fbSymbol>   symbols;
 	StringMap<u32>    symbol_map;
 	BlockingMutex     symbols_mutex;
+
+	// Read-only data (string literals, etc.)
+	// Abstract symbol index for rodata entry i = procs.count + i.
+	Array<fbRodataEntry>  rodata_entries;
+	StringMap<u32>        string_intern_map;  // string content → rodata entry index
 
 	Array<fbSourceFile>        source_files;
 	PtrMap<uintptr, u32>       file_id_to_idx;

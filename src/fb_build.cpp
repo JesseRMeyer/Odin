@@ -7,6 +7,7 @@
 gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr);
 gb_internal void    fb_build_stmt(fbBuilder *b, Ast *node);
 gb_internal fbAddr  fb_build_compound_lit(fbBuilder *b, Ast *expr);
+gb_internal void    fb_emit_defer_stmts(fbBuilder *b, fbDeferExitKind kind, i32 target_scope_index);
 
 // ───────────────────────────────────────────────────────────────────────
 // Parameter setup: classify params via ABI, create stack slots, record param_locs
@@ -371,7 +372,41 @@ gb_internal fbValue fb_const_value(fbBuilder *b, Type *type, ExactValue value) {
 		return fb_emit_iconst(b, type, 0);
 	}
 
-	case ExactValue_String:
+	case ExactValue_String: {
+		String str = value.value_string;
+		type = default_type(type);
+
+		if (is_type_cstring(type)) {
+			// cstring: just a pointer to the bytes
+			u32 sym_idx = fb_module_intern_string_data(b->module, str);
+			return fb_emit_symaddr(b, sym_idx);
+		}
+
+		// Odin string: {data: rawptr, len: int} — build on the stack
+		i64 ptr_size = b->module->target.ptr_size;
+		fbAddr s = fb_add_local(b, type, nullptr, false);
+
+		if (str.len == 0) {
+			// Empty string: zero-initialize
+			fb_emit_memzero(b, s.base, type_size_of(type), type_align_of(type));
+		} else {
+			u32 sym_idx = fb_module_intern_string_data(b->module, str);
+			fbValue data_ptr = fb_emit_symaddr(b, sym_idx);
+			data_ptr.type = t_rawptr;
+
+			// Store data pointer at offset 0
+			fb_emit_store(b, s.base, data_ptr);
+			// Store length at offset ptr_size
+			fbValue len_val = fb_emit_iconst(b, t_int, str.len);
+			fbValue len_ptr = fb_emit_member(b, s.base, ptr_size);
+			fb_emit_store(b, len_ptr, len_val);
+		}
+
+		// Return pointer to the string struct (aggregate convention)
+		s.base.type = type;
+		return s.base;
+	}
+
 	case ExactValue_Complex:
 	case ExactValue_Quaternion:
 	case ExactValue_Typeid:
@@ -429,6 +464,15 @@ gb_internal fbAddr fb_add_local(fbBuilder *b, Type *type, Entity *entity, bool z
 
 gb_internal fbValue fb_addr_load(fbBuilder *b, fbAddr addr) {
 	if (addr.kind == fbAddr_Default) {
+		// Aggregates (strings, slices, structs): return the pointer.
+		// The caller is responsible for decomposing into scalar loads
+		// when needed (e.g., for ABI register passing).
+		fbType ft = fb_data_type(addr.type);
+		if (ft.kind == FBT_VOID) {
+			fbValue ptr = addr.base;
+			ptr.type = addr.type;
+			return ptr;
+		}
 		return fb_emit_load(b, addr.base, addr.type);
 	}
 	GB_PANIC("TODO fb_addr_load kind=%d", addr.kind);
@@ -461,6 +505,16 @@ gb_internal void fb_emit_copy_value(fbBuilder *b, fbValue dst_ptr, fbValue val, 
 			fb_emit_memcpy(b, dst_ptr, val, size_val, align);
 		}
 	}
+}
+
+// Load a field from an aggregate in memory.
+// base_ptr points to the start of the aggregate; field is at byte_offset.
+gb_internal fbValue fb_load_field(fbBuilder *b, fbValue base_ptr, i64 byte_offset, Type *field_type) {
+	fbValue ptr = base_ptr;
+	if (byte_offset != 0) {
+		ptr = fb_emit_member(b, base_ptr, byte_offset);
+	}
+	return fb_emit_load(b, ptr, field_type);
 }
 
 gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
@@ -565,6 +619,11 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 			elem_type = bt->DynamicArray.elem;
 			stride = type_size_of(elem_type);
 			data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+		} else if (is_type_string(bt)) {
+			// String: load .data pointer (field 0, offset 0), element is u8
+			elem_type = t_u8;
+			stride = 1;
+			data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
 		} else if (is_type_pointer(bt) || is_type_multi_pointer(bt)) {
 			elem_type = type_deref(base_addr.type);
 			stride = type_size_of(elem_type);
@@ -600,6 +659,76 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 
 	case Ast_CompoundLit:
 		return fb_build_compound_lit(b, expr);
+
+	case Ast_SliceExpr: {
+		ast_node(se, SliceExpr, expr);
+		i64 ptr_size = b->module->target.ptr_size;
+
+		fbValue low  = fb_emit_iconst(b, t_int, 0);
+		fbValue high = {};
+
+		if (se->low  != nullptr) low  = fb_build_expr(b, se->low);
+		if (se->high != nullptr) high = fb_build_expr(b, se->high);
+
+		fbAddr base_addr = fb_build_addr(b, se->expr);
+		Type *bt = base_type(base_addr.type);
+
+		// Pointer to container: dereference
+		if (is_type_pointer(bt)) {
+			base_addr.base = fb_emit_load(b, base_addr.base, base_addr.type);
+			base_addr.type = type_deref(base_addr.type);
+			bt = base_type(base_addr.type);
+		}
+
+		fbValue data_ptr = {};
+		i64 stride = 0;
+		Type *result_type = nullptr;
+
+		if (bt->kind == Type_Array) {
+			// Array: base is already data pointer, element type from array
+			data_ptr = base_addr.base;
+			stride = type_size_of(bt->Array.elem);
+			result_type = alloc_type_slice(bt->Array.elem);
+			if (high.type == nullptr) {
+				high = fb_emit_iconst(b, t_int, bt->Array.count);
+			}
+		} else if (bt->kind == Type_Slice) {
+			data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+			stride = type_size_of(bt->Slice.elem);
+			result_type = base_addr.type;
+			if (high.type == nullptr) {
+				high = fb_load_field(b, base_addr.base, ptr_size, t_int);
+			}
+		} else if (is_type_string(bt)) {
+			data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+			stride = 1; // u8
+			result_type = t_string;
+			if (high.type == nullptr) {
+				high = fb_load_field(b, base_addr.base, ptr_size, t_int);
+			}
+		} else if (bt->kind == Type_DynamicArray) {
+			data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+			stride = type_size_of(bt->DynamicArray.elem);
+			result_type = alloc_type_slice(bt->DynamicArray.elem);
+			if (high.type == nullptr) {
+				high = fb_load_field(b, base_addr.base, ptr_size, t_int);
+			}
+		} else {
+			GB_PANIC("fb_build_addr SliceExpr: unhandled base type %s", type_to_string(bt));
+		}
+
+		// elem = data_ptr + low * stride
+		fbValue elem = fb_emit_array_access(b, data_ptr, low, stride);
+		// new_len = high - low
+		fbValue new_len = fb_emit_arith(b, FB_SUB, high, low, t_int);
+
+		// Build result slice: {rawptr, int}
+		fbAddr result = fb_add_local(b, result_type, nullptr, false);
+		fb_emit_store(b, result.base, elem);
+		fbValue len_ptr = fb_emit_member(b, result.base, ptr_size);
+		fb_emit_store(b, len_ptr, new_len);
+		return result;
+	}
 
 	default:
 		break;
@@ -1152,10 +1281,30 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	// Build arguments into aux pool
 	u32 aux_start = b->proc->aux_count;
 
-	// Regular arguments
+	// Regular arguments — decompose 2-eightbyte types (string, slice, any)
+	// into two scalar values for SysV register passing.
 	for_array(i, ce->args) {
-		fbValue arg = fb_build_expr(b, ce->args[i]);
-		fb_aux_push(b->proc, arg.id);
+		Ast *arg_ast = ce->args[i];
+		Type *arg_type = type_of_expr(arg_ast);
+		fbValue arg = fb_build_expr(b, arg_ast);
+
+		fbABIParamInfo abi = {};
+		if (arg_type != nullptr) {
+			abi = fb_abi_classify_type_sysv(default_type(arg_type));
+		}
+
+		if (abi.num_classes == 2 && abi.classes[0] == FB_ABI_INTEGER && abi.classes[1] == FB_ABI_INTEGER) {
+			// Two-eightbyte type: arg is a pointer to the struct.
+			// Load each 8-byte half as a separate scalar value.
+			i64 ptr_size = b->module->target.ptr_size;
+			fbValue lo = fb_emit_load(b, arg, t_rawptr);
+			fbValue hi_ptr = fb_emit_member(b, arg, ptr_size);
+			fbValue hi = fb_emit_load(b, hi_ptr, t_int);
+			fb_aux_push(b->proc, lo.id);
+			fb_aux_push(b->proc, hi.id);
+		} else {
+			fb_aux_push(b->proc, arg.id);
+		}
 	}
 
 	// Split return output pointers (Odin CC multi-return, values 0..N-2)
@@ -1326,6 +1475,7 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 	case Ast_SelectorExpr:
 	case Ast_IndexExpr:
 	case Ast_DerefExpr:
+	case Ast_SliceExpr:
 		return fb_addr_load(b, fb_build_addr(b, expr));
 
 	case Ast_Implicit:
@@ -1350,6 +1500,76 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 		fbValue result = addr.base;
 		result.type = type;
 		return result;
+	}
+
+	case Ast_OrElseExpr: {
+		ast_node(oe, OrElseExpr, expr);
+
+		// Build the LHS: a multi-return (value, ok)
+		fbValue last_val = fb_build_expr(b, oe->x);
+
+		// Unpack: first return = value, last return = ok bool
+		fbValue vals[2];
+		fb_unpack_multi_return(b, last_val, vals, 2);
+		fbValue value = vals[0];
+		fbValue ok    = vals[1];
+
+		// Result temp
+		fbAddr result = fb_add_local(b, type, nullptr, false);
+
+		u32 then_block = fb_new_block(b);
+		u32 else_block = fb_new_block(b);
+		u32 done_block = fb_new_block(b);
+
+		fbValue ok_bool = fb_emit_conv(b, ok, t_bool);
+		fb_emit_branch(b, ok_bool, then_block, else_block);
+
+		// Then: ok == true, store value
+		fb_set_block(b, then_block);
+		fbValue conv_val = fb_emit_conv(b, value, type);
+		fb_addr_store(b, result, conv_val);
+		fb_emit_jump(b, done_block);
+
+		// Else: ok == false, evaluate fallback
+		fb_set_block(b, else_block);
+		fbValue else_val = fb_build_expr(b, oe->y);
+		fbValue else_conv = fb_emit_conv(b, else_val, type);
+		fb_addr_store(b, result, else_conv);
+		if (!fb_block_is_terminated(b)) {
+			fb_emit_jump(b, done_block);
+		}
+
+		fb_set_block(b, done_block);
+		return fb_addr_load(b, result);
+	}
+
+	case Ast_OrReturnExpr: {
+		ast_node(ore, OrReturnExpr, expr);
+
+		fbValue last_val = fb_build_expr(b, ore->expr);
+
+		fbValue vals[2];
+		fb_unpack_multi_return(b, last_val, vals, 2);
+		fbValue value = vals[0];
+		fbValue ok    = vals[1];
+
+		u32 ok_block     = fb_new_block(b);
+		u32 return_block = fb_new_block(b);
+
+		fbValue ok_bool = fb_emit_conv(b, ok, t_bool);
+		fb_emit_branch(b, ok_bool, ok_block, return_block);
+
+		// Return block: ok == false, return the error value
+		fb_set_block(b, return_block);
+		fb_emit_defer_stmts(b, fbDeferExit_Return, 0);
+		fb_emit_ret(b, ok);
+		// Note: for multi-return callers, this returns just the ok/error.
+		// Full or_return with error propagation would need the caller's
+		// return type, but the simple (value, bool) case is the common one.
+
+		// Ok block: return the value
+		fb_set_block(b, ok_block);
+		return fb_emit_conv(b, value, type);
 	}
 
 	default:
@@ -2151,6 +2371,184 @@ gb_internal void fb_build_when_stmt(fbBuilder *b, AstWhenStmt *ws) {
 	}
 }
 
+// ───── Switch statement ─────
+
+gb_internal bool fb_switch_can_be_trivial(AstSwitchStmt *ss) {
+	if (ss->tag == nullptr) return false;
+
+	TypeAndValue tv = type_and_value_of_expr(ss->tag);
+	if (!is_type_integer(core_type(tv.type)) && !is_type_enum(tv.type) && !is_type_boolean(tv.type)) {
+		return false;
+	}
+
+	ast_node(body, BlockStmt, ss->body);
+	for (Ast *clause : body->stmts) {
+		ast_node(cc, CaseClause, clause);
+		for (Ast *expr : cc->list) {
+			expr = unparen_expr(expr);
+			if (is_ast_range(expr)) return false;
+			TypeAndValue etv = type_and_value_of_expr(expr);
+			if (etv.mode != Addressing_Constant) return false;
+		}
+	}
+	return true;
+}
+
+gb_internal void fb_build_switch_stmt(fbBuilder *b, Ast *node) {
+	ast_node(ss, SwitchStmt, node);
+
+	fb_scope_open(b, ss->scope);
+
+	if (ss->init != nullptr) {
+		fb_build_stmt(b, ss->init);
+	}
+
+	// Evaluate tag expression, or constant true for tag-less switches.
+	fbValue tag = {};
+	Type *tag_type = nullptr;
+	if (ss->tag != nullptr) {
+		tag = fb_build_expr(b, ss->tag);
+		tag_type = type_of_expr(ss->tag);
+	} else {
+		tag = fb_emit_iconst(b, t_bool, 1);
+		tag_type = t_bool;
+	}
+
+	u32 done_block = fb_new_block(b);
+
+	ast_node(body, BlockStmt, ss->body);
+	isize case_count = body->stmts.count;
+
+	// Pre-allocate a body block per case clause.
+	auto body_blocks = slice_make<u32>(heap_allocator(), case_count);
+	auto body_scopes = slice_make<Scope *>(heap_allocator(), case_count);
+	i32 default_idx = -1;
+	for_array(i, body->stmts) {
+		ast_node(cc, CaseClause, body->stmts[i]);
+		body_blocks[i] = fb_new_block(b);
+		body_scopes[i] = cc->scope;
+		if (cc->list.count == 0) {
+			default_idx = cast(i32)i;
+		}
+	}
+
+	u32 default_block = (default_idx >= 0) ? body_blocks[default_idx] : done_block;
+
+	// ── Dispatch: trivial (FB_SWITCH) or chain-of-comparisons ──
+
+	bool is_trivial = fb_switch_can_be_trivial(ss);
+
+	if (is_trivial) {
+		// Emit FB_SWITCH instruction: key=tag, default_block, cases via aux.
+		u32 aux_start = b->proc->aux_count;
+		u32 total_cases = 0;
+		for_array(i, body->stmts) {
+			ast_node(cc, CaseClause, body->stmts[i]);
+			for (Ast *expr : cc->list) {
+				expr = unparen_expr(expr);
+				TypeAndValue etv = type_and_value_of_expr(expr);
+				i64 key = exact_value_to_i64(etv.value);
+				fb_aux_push(b->proc, cast(u32)cast(i32)key);
+				fb_aux_push(b->proc, body_blocks[i]);
+				total_cases++;
+			}
+		}
+		fb_inst_emit(b->proc, FB_SWITCH, FB_VOID, tag.id, default_block, aux_start, 0, cast(i64)total_cases);
+	} else {
+		// Chain of CMP + BRANCH per case value.
+		for_array(i, body->stmts) {
+			ast_node(cc, CaseClause, body->stmts[i]);
+			if (cc->list.count == 0) continue; // default handled at end
+
+			for (Ast *expr : cc->list) {
+				expr = unparen_expr(expr);
+				u32 next_cond = fb_new_block(b);
+
+				fbValue cond = {};
+				if (is_ast_range(expr)) {
+					ast_node(re, BinaryExpr, expr);
+					fbValue lhs = fb_build_expr(b, re->left);
+					fbValue rhs = fb_build_expr(b, re->right);
+
+					// lower <= tag
+					bool is_signed = fb_type_is_signed(tag_type);
+					bool is_float = is_type_float(tag_type);
+					fbOp ge_op, upper_op;
+					if (is_float) {
+						ge_op = FB_CMP_FGE;
+						upper_op = (re->op.kind == Token_RangeHalf) ? FB_CMP_FLT : FB_CMP_FLE;
+					} else {
+						ge_op = is_signed ? FB_CMP_SGE : FB_CMP_UGE;
+						upper_op = (re->op.kind == Token_RangeHalf)
+							? (is_signed ? FB_CMP_SLT : FB_CMP_ULT)
+							: (is_signed ? FB_CMP_SLE : FB_CMP_ULE);
+					}
+					fbValue cond_lo = fb_emit_cmp(b, ge_op, tag, lhs);
+					fbValue cond_hi = fb_emit_cmp(b, upper_op, tag, rhs);
+					// AND the two conditions
+					cond = fb_emit_arith(b, FB_AND, cond_lo, cond_hi, t_bool);
+				} else {
+					fbValue case_val = fb_build_expr(b, expr);
+					bool is_float = is_type_float(tag_type);
+					fbOp eq_op = is_float ? FB_CMP_FEQ : FB_CMP_EQ;
+					cond = fb_emit_cmp(b, eq_op, tag, case_val);
+				}
+				fb_emit_branch(b, cond, body_blocks[i], next_cond);
+				fb_set_block(b, next_cond);
+			}
+		}
+		// Fall through to default.
+		fb_emit_jump(b, default_block);
+	}
+
+	// ── Emit case bodies ──
+
+	// Set up label if present.
+	if (ss->label != nullptr) {
+		fbBranchRegions br = {};
+		br.cond = ss->label;
+		br.false_block = done_block;  // break target
+		br.true_block = 0;            // no continue in switch
+		array_add(&b->branch_regions, br);
+	}
+
+	for_array(i, body->stmts) {
+		ast_node(cc, CaseClause, body->stmts[i]);
+
+		u32 fall = done_block;
+		if (i + 1 < cast(isize)case_count) {
+			fall = body_blocks[i + 1];
+		}
+
+		fb_set_block(b, body_blocks[i]);
+
+		fbTargetList tl = {};
+		tl.prev = b->target_list;
+		tl.break_block = done_block;
+		tl.continue_block = 0;
+		tl.fallthrough_block = fall;
+		tl.scope_index = b->scope_index;
+		tl.is_block = false;
+		b->target_list = &tl;
+
+		fb_scope_open(b, body_scopes[i]);
+		fb_build_stmt_list(b, cc->stmts);
+		fb_scope_close(b, fbDeferExit_Default, 0);
+
+		b->target_list = tl.prev;
+
+		if (!fb_block_is_terminated(b)) {
+			fb_emit_jump(b, done_block);
+		}
+	}
+
+	fb_set_block(b, done_block);
+	fb_scope_close(b, fbDeferExit_Default, 0);
+
+	gb_free(heap_allocator(), body_blocks.data);
+	gb_free(heap_allocator(), body_scopes.data);
+}
+
 gb_internal void fb_build_stmt(fbBuilder *b, Ast *node) {
 	if (node == nullptr) return;
 
@@ -2281,8 +2679,9 @@ gb_internal void fb_build_stmt(fbBuilder *b, Ast *node) {
 				if (t->is_block) continue;
 
 				switch (bs->token.kind) {
-				case Token_break:    target_block = t->break_block;    break;
-				case Token_continue: target_block = t->continue_block; break;
+				case Token_break:       target_block = t->break_block;       break;
+				case Token_continue:    target_block = t->continue_block;    break;
+				case Token_fallthrough: target_block = t->fallthrough_block; break;
 				default: break;
 				}
 				if (target_block != 0) {
@@ -2298,6 +2697,10 @@ gb_internal void fb_build_stmt(fbBuilder *b, Ast *node) {
 		}
 		break;
 	}
+
+	case Ast_SwitchStmt:
+		fb_build_switch_stmt(b, node);
+		break;
 
 	case Ast_DeferStmt: {
 		ast_node(ds, DeferStmt, node);

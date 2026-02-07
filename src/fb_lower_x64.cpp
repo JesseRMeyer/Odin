@@ -223,9 +223,10 @@ gb_internal void fb_x64_emit_lea_sym(fbLowCtx *ctx, fbX64Reg reg, u32 sym_idx) {
 	fb_x64_record_reloc(ctx, disp_offset, sym_idx, -4, FB_RELOC_PC32);
 }
 
+// Spill all dirty registers and clear register state.
+// Emits store instructions for dirty values so they are on the stack
+// before control flow diverges. Call this BEFORE each terminator.
 gb_internal void fb_x64_reset_regs(fbLowCtx *ctx) {
-	// Spill dirty registers and update value_loc for all live registers
-	// before clearing — ensures value_loc is consistent at block boundaries.
 	for (u32 i = 0; i < FB_X64_GP_ALLOC_COUNT; i++) {
 		fbX64Reg r = fb_x64_gp_alloc_order[i];
 		u32 vreg = ctx->gp[r].vreg;
@@ -233,8 +234,6 @@ gb_internal void fb_x64_reset_regs(fbLowCtx *ctx) {
 		if (ctx->gp[r].dirty) {
 			fb_x64_spill_reg(ctx, r);
 		} else {
-			// Clean register: value_loc still says "in register r" but
-			// we're clearing all registers. Point it back to the spill slot.
 			ctx->value_loc[vreg] = fb_x64_spill_offset(ctx, vreg);
 			ctx->gp[r].vreg = FB_NOREG;
 		}
@@ -244,6 +243,34 @@ gb_internal void fb_x64_reset_regs(fbLowCtx *ctx) {
 		ctx->gp[i].last_use = 0;
 		ctx->gp[i].dirty    = false;
 	}
+}
+
+// Clear register bookkeeping at block entry WITHOUT emitting code.
+// All values must already be on the stack (spilled by reset_regs before
+// the previous block's terminator). This just resets the allocator state
+// for the new block.
+gb_internal void fb_x64_clear_reg_state(fbLowCtx *ctx) {
+	for (u32 i = 0; i < FB_X64_GP_ALLOC_COUNT; i++) {
+		fbX64Reg r = fb_x64_gp_alloc_order[i];
+		u32 vreg = ctx->gp[r].vreg;
+		if (vreg != FB_NOREG) {
+			// Value was loaded by the previous block's terminator
+			// (e.g. BRANCH condition). The spill slot is still valid
+			// because it was written before the terminator ran.
+			ctx->value_loc[vreg] = fb_x64_spill_offset(ctx, vreg);
+		}
+	}
+	for (int i = 0; i < 16; i++) {
+		ctx->gp[i].vreg     = FB_NOREG;
+		ctx->gp[i].last_use = 0;
+		ctx->gp[i].dirty    = false;
+	}
+}
+
+gb_internal bool fb_x64_is_terminator(u8 op) {
+	return op == FB_JUMP || op == FB_BRANCH || op == FB_RET ||
+	       op == FB_UNREACHABLE || op == FB_SWITCH ||
+	       op == FB_TRAP;
 }
 
 gb_internal void fb_x64_init_value_loc(fbLowCtx *ctx) {
@@ -801,13 +828,21 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 			ctx->block_offsets[bi] = ctx->code_count;
 		}
 
-		// Reset register state at block start
-		fb_x64_reset_regs(ctx);
+		// Clear register bookkeeping at block entry (no code emission).
+		// All values are already on the stack — spilled by reset_regs
+		// before the previous block's terminator.
+		fb_x64_clear_reg_state(ctx);
 
 		fbBlock *blk = &p->blocks[bi];
 		for (u32 ii = 0; ii < blk->inst_count; ii++) {
 			ctx->current_inst_idx = blk->first_inst + ii;
 			fbInst *inst = &p->insts[ctx->current_inst_idx];
+
+			// Before terminators: spill all dirty registers so
+			// values are on the stack before control flow diverges.
+			if (fb_x64_is_terminator(inst->op)) {
+				fb_x64_reset_regs(ctx);
+			}
 
 			switch (cast(fbOp)inst->op) {
 

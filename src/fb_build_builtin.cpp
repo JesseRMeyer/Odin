@@ -11,15 +11,7 @@
 // Container field helpers: len, cap, raw_data
 // ───────────────────────────────────────────────────────────────────────
 
-// Load a field from an aggregate in memory.
-// base_ptr points to the start of the aggregate; field is at byte_offset.
-gb_internal fbValue fb_load_field(fbBuilder *b, fbValue base_ptr, i64 byte_offset, Type *field_type) {
-	fbValue ptr = base_ptr;
-	if (byte_offset != 0) {
-		ptr = fb_emit_member(b, base_ptr, byte_offset);
-	}
-	return fb_emit_load(b, ptr, field_type);
-}
+// fb_load_field is defined in fb_build.cpp (shared with slice expression builder)
 
 gb_internal fbValue fb_builtin_len(fbBuilder *b, Ast *arg_expr) {
 	Type *t = base_type(type_of_expr(arg_expr));
