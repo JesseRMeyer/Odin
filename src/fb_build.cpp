@@ -1278,15 +1278,31 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 		}
 	}
 
-	// Build arguments into aux pool
+	// Phase 1: Evaluate all argument expressions. This must happen before
+	// capturing aux_start because argument expressions may contain nested
+	// calls (e.g. check(get_zero() == 0, 1)) which push their own aux
+	// entries. Building first ensures nested aux entries don't interleave
+	// with this call's argument list.
+	struct fbBuiltArg { fbValue val; Type *type; };
+	fbBuiltArg *built_args = nullptr;
+	isize arg_expr_count = ce->args.count;
+	if (arg_expr_count > 0) {
+		built_args = gb_alloc_array(heap_allocator(), fbBuiltArg, arg_expr_count);
+		for_array(i, ce->args) {
+			built_args[i].val  = fb_build_expr(b, ce->args[i]);
+			built_args[i].type = type_of_expr(ce->args[i]);
+		}
+	}
+
+	// Phase 2: Push arguments into aux pool. No nested calls occur here,
+	// so aux_start accurately marks the beginning of this call's args.
 	u32 aux_start = b->proc->aux_count;
 
 	// Regular arguments — decompose 2-eightbyte types (string, slice, any)
 	// into two scalar values for SysV register passing.
-	for_array(i, ce->args) {
-		Ast *arg_ast = ce->args[i];
-		Type *arg_type = type_of_expr(arg_ast);
-		fbValue arg = fb_build_expr(b, arg_ast);
+	for (isize i = 0; i < arg_expr_count; i++) {
+		fbValue arg = built_args[i].val;
+		Type *arg_type = built_args[i].type;
 
 		fbABIParamInfo abi = {};
 		if (arg_type != nullptr) {
@@ -1305,6 +1321,10 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 		} else {
 			fb_aux_push(b->proc, arg.id);
 		}
+	}
+
+	if (built_args != nullptr) {
+		gb_free(heap_allocator(), built_args);
 	}
 
 	// Split return output pointers (Odin CC multi-return, values 0..N-2)
