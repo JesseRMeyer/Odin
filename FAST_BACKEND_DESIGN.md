@@ -523,27 +523,24 @@ struct fbSourceFile {
     u32    id;         // matches AstFile::id for lookup
 };
 
-enum fbSymKind : u8 {
-    FB_SYM_PROC,       // function
-    FB_SYM_GLOBAL,     // global variable
-    FB_SYM_EXTERNAL,   // imported symbol (foreign)
+struct fbRodataEntry {
+    u8    *data;
+    u32    size;
+    String name;   // symbol name (e.g. ".L.str.0")
 };
 
-struct fbSymbol {
-    fbSymKind kind;
-    String    name;        // linker-visible name
-    Entity   *entity;      // Odin entity (for debug info)
-    Type     *odin_type;
+// Abstract symbol index = FB_GLOBAL_SYM_BASE + global_entries index.
+enum : u32 { FB_GLOBAL_SYM_BASE = 0x40000000 };
 
-    // For FB_SYM_GLOBAL: initializer data
-    u8       *init_data;   // NULL if zero-initialized (.bss)
-    u32       init_size;
-    u32       align;
-    bool      is_tls;      // thread-local storage
-    bool      is_read_only;
-
-    // For FB_SYM_PROC: pointer to lowered machine code
-    fbProc   *proc;        // set after IR generation
+struct fbGlobalEntry {
+    Entity *entity;
+    String  name;
+    Type   *odin_type;
+    u8     *init_data;   // NULL → zero-init (.bss)
+    u32     size;
+    u32     align;
+    bool    is_foreign;
+    bool    is_export;
 };
 
 struct fbModule {
@@ -553,21 +550,28 @@ struct fbModule {
     fbTarget     target;
 
     // All procedures (built in parallel, lowered in parallel)
+    // Abstract symbol index for proc i = i.
     Array<fbProc *>   procs;
     BlockingMutex     procs_mutex;
 
-    // Global symbols
+    // Legacy symbol table (being phased out)
     Array<fbSymbol>   symbols;
-    StringMap<u32>    symbol_map;       // name → symbol index
+    StringMap<u32>    symbol_map;
     BlockingMutex     symbols_mutex;
+
+    // Read-only data (string literals, etc.)
+    // Abstract symbol index for rodata entry i = procs.count + i.
+    Array<fbRodataEntry>  rodata_entries;
+    StringMap<u32>        string_intern_map;  // string content → rodata entry index
+
+    // Global variables (package-level).
+    // Abstract symbol index for global entry i = FB_GLOBAL_SYM_BASE + i.
+    Array<fbGlobalEntry>      global_entries;
+    PtrMap<Entity *, u32>     global_entity_map;  // Entity* → global_entries index
 
     // Source file registry
     Array<fbSourceFile>        source_files;
     PtrMap<uintptr, u32>       file_id_to_idx;  // AstFile::id → source_files index
-
-    // Type info globals (RTTI) — populated in a future phase
-    fbSymbol *type_info_data;
-    fbSymbol *type_info_types;
     fbSymbol *type_info_names;
     fbSymbol *type_info_offsets;
     fbSymbol *type_info_usings;
@@ -961,13 +965,13 @@ enum fbRelocType : u32 {
 
 struct fbReloc {
     u32         code_offset;   // byte offset in this proc's machine code
-    u32         target_proc;   // proc index in m->procs
+    u32         target_sym;    // abstract symbol index (proc, rodata, or FB_GLOBAL_SYM_BASE + gidx)
     i64         addend;        // typically -4
     fbRelocType reloc_type;
 };
 ```
 
-`SYMADDR` instructions are tracked via `value_sym[vreg] = proc_index` in the lowering context. When `resolve_gp` encounters a value with no location but a valid `value_sym` entry, it materializes it as a RIP-relative LEA. Direct calls (`FB_CALL` where the target has a `value_sym` entry) emit `CALL rel32` with a `PLT32` relocation instead of an indirect `CALL r/m64`.
+`SYMADDR` instructions are tracked via `value_sym[vreg] = abstract_sym_index` in the lowering context. When `resolve_gp` encounters a value with no location but a valid `value_sym` entry, it materializes it as a RIP-relative LEA. Direct calls (`FB_CALL` where the target has a `value_sym` entry) emit `CALL rel32` with a `PLT32` relocation instead of an indirect `CALL r/m64`.
 
 ### 11.5 Branch Patching
 
@@ -1128,9 +1132,10 @@ src/
 ├── fb_lower_x64.cpp        // x86-64 machine code lowering (~1950 lines)
 │                           //   GP register allocator, XMM scratch encoding helpers,
 │                           //   float/int/bitmanip lowering, NaN-safe float comparisons
-├── fb_emit_elf.cpp         // ELF object file emission (~530 lines)
+├── fb_emit_elf.cpp         // ELF object file emission (~700 lines)
 │                           //   Self-contained ELF64 types (no system elf.h dependency)
 │                           //   fbBuf growable byte buffer for section construction
+│                           //   .text, .rodata, .data, .bss, .rela.text sections
 │                           //   Single-pass symbol table with proper LOCAL/GLOBAL ordering
 ├── fb_build_builtin.cpp    // Built-in procedure handling (~480 lines)
 │                           //   len/cap/raw_data for slices, strings, dynamic arrays
@@ -1284,7 +1289,7 @@ Complete pipeline: iterate entities -> create fbProc with IR -> lower to x86-64 
 - `src/fb_build.cpp` (new) — Entity iteration using `min_dep_count`, creates fbProc per procedure, emits entry block with `FB_RET` for non-foreign procs, marks entry point as exported
 - `src/fb_abi.cpp` (new) — Stub for future ABI classification
 - `src/fb_lower_x64.cpp` (new) — x86-64 lowering: prologue (`push rbp; mov rbp,rsp`), `FB_RET` -> epilogue + ret, `FB_UNREACHABLE` -> ud2, `FB_TRAP`/`FB_DEBUGBREAK` -> int3, `fb_lower_all` orchestration
-- `src/fb_emit_elf.cpp` (new) — Self-contained ELF64 writer (no system elf.h dependency), 6 sections (null, .text, .symtab, .strtab, .shstrtab, .rela.text), proper LOCAL/GLOBAL symbol ordering, `fb_emit_object` dispatch
+- `src/fb_emit_elf.cpp` (new) — Self-contained ELF64 writer (no system elf.h dependency), 9 sections (null, .text, .rodata, .data, .bss, .symtab, .strtab, .shstrtab, .rela.text), proper LOCAL/GLOBAL symbol ordering, `fb_emit_object` dispatch
 - `src/main.cpp` — Added `#include` for all new files, added `linker_stage` dispatch in fast backend block
 
 **What works:** `./odin build test.odin -file -fast` produces a valid ELF .o file. `objdump -d` shows correct `push rbp; mov rbp,rsp; mov rsp,rbp; pop rbp; ret` for all procedures. `readelf -a` shows valid ELF structure with proper section headers, symbol table (FUNC types, LOCAL/GLOBAL binding), file symbol, and foreign symbols as UNDEF. Linking fails as expected (no runtime implementation). LLVM backend is unaffected.
@@ -1626,6 +1631,42 @@ Incremental feature additions that unlock more of the standard library.
 - `or_return` with multi-return `(value, ok)` procedures
 - Chained `or_else`, `or_else` in loops, `or_else` with call fallbacks
 
+**Phase 6l: Aux Pool Interleaving Fix (DONE)**
+
+Fixed a critical call codegen bug: when a call argument contains a nested call (e.g. `check(get_zero() == 0, 1)`), the inner call's aux entries were included in the outer call's argument range. This shifted all arguments by one — the inner call's context pointer became the outer call's first argument.
+
+**Root cause:** `aux_start` was captured before evaluating argument expressions. Nested `fb_build_call_expr` invocations pushed their own aux entries (context pointer, split return pointers) into the shared aux pool between `aux_start` and the outer call's actual arguments.
+
+**Fix:** Two-phase argument building in `fb_build_call_expr`: (1) evaluate all argument expressions first (may trigger nested calls), (2) capture `aux_start` and push this call's arguments. This ensures nested call aux entries live outside the outer call's `[aux_start, aux_start+arg_count)` range.
+
+**Files modified:**
+- `src/fb_build.cpp` — Restructured `fb_build_call_expr` argument building into evaluate-then-push phases
+- `tests/fast_backend/test_all.odin` — Unified test suite; reverted manual inline workarounds to use `check()` directly
+
+**Phase 6m: Global Variables (DONE)**
+
+Package-level variable support: discovery, constant serialization, and ELF `.data`/`.bss` emission.
+
+**Files modified:**
+- `src/fb_ir.h` — Added `FB_GLOBAL_SYM_BASE` constant (0x40000000), `fbGlobalEntry` struct, `global_entries`/`global_entity_map` fields to `fbModule`
+- `src/fb_ir.cpp` — Init/destroy for global_entries and global_entity_map in module lifecycle
+- `src/fb_build.cpp` — `fb_generate_globals()` discovers file-scope variables from `variable_init_order`, serializes constant initializers (bool, int, float, pointer) via `fb_serialize_const_value()`; `fb_make_global_addr()` helper for global address construction; global lookup in `fb_build_addr` and `fb_build_expr` via `FB_GLOBAL_SYM_BASE + gidx`
+- `src/fb_emit_elf.cpp` — `.data` section (SHT_PROGBITS, SHF_WRITE|SHF_ALLOC) for constant-initialized globals, `.bss` section (SHT_NOBITS) for zero-initialized globals; `sh_addralign` computed from max entry alignment; separate `global_sym_elf_idx` array for relocation dispatch; `FB_GLOBAL_SYM_BASE` check in relocation loop
+- `src/fb_lower_x64.cpp` — No changes needed (globals flow through existing SYMADDR/reloc path)
+- `tests/fast_backend/test_all.odin` — Tests 950-959: zero-init, const-init (int/f64/bool), mutation, cross-function read/write
+
+**What works:**
+- Zero-initialized globals (`.bss`)
+- Constant-initialized globals with bool, integer, float, pointer values (`.data`)
+- Reading and writing globals from any procedure in the package
+- Cross-function global mutation (write in one proc, read in another)
+- Proper ELF symbol types (`STT_OBJECT`, correct section/offset/size)
+- Foreign global variable declarations (`SHN_UNDEF`)
+
+**Known limitations:**
+- Non-trivial initializers (strings, compound literals) fall back to zero-init until `__$startup_runtime` runs proper init code
+- No `.rela.data` for globals whose initializers reference other symbols
+
 ### Phase 7: Remaining Odin Features (TODO)
 
 - Map operations (runtime calls)
@@ -1663,12 +1704,13 @@ Incremental feature additions that unlock more of the standard library.
 - `fb_buf_append_odin_str()` eliminates per-symbol C-string alloc/copy/free
 - `fb_buf_align()` uses single `memset` instead of loop
 - Self-contained ELF64 definitions with `static_assert` size checks
+- `.data` and `.bss` sections for global variables (dynamic `sh_addralign` from max entry alignment)
 
 **Remaining:**
 - PE/COFF emission for Windows (`fb_emit_pe.cpp`)
 - Mach-O emission for macOS (`fb_emit_macho.cpp`)
 - CodeView debug info for Windows
-- `.data`, `.bss` sections (`.rodata` done in Phase 6i)
+- `.rela.data` relocations (for globals with symbol-reference initializers)
 
 ### Phase 11: Threading & Performance (TODO)
 
