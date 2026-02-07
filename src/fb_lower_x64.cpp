@@ -950,7 +950,7 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				// rep stosb: RDI=dst, RCX=size, AL=0
 				// Encoding: a=dst, b=size_value, imm=alignment
 
-				// Spill RDI, RCX, RAX if occupied
+				// Spill whatever was in RDI, RCX, RAX
 				fb_x64_spill_reg(ctx, FB_RDI);
 				fb_x64_spill_reg(ctx, FB_RCX);
 				fb_x64_spill_reg(ctx, FB_RAX);
@@ -958,6 +958,12 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				// Load dst into RDI, size into RCX
 				fb_x64_move_value_to_reg(ctx, inst->a, FB_RDI);
 				fb_x64_move_value_to_reg(ctx, inst->b, FB_RCX);
+
+				// Spill operand values to stack so value_loc is consistent
+				// after the rep instruction clobbers these registers.
+				// Physical register contents are preserved for the rep.
+				fb_x64_spill_reg(ctx, FB_RDI);
+				fb_x64_spill_reg(ctx, FB_RCX);
 
 				// xor eax, eax (AL=0)
 				fb_x64_rex_if_needed(ctx, false, FB_RAX, 0, FB_RAX);
@@ -967,14 +973,6 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				// rep stosb: F3 AA
 				fb_low_emit_byte(ctx, 0xF3);
 				fb_low_emit_byte(ctx, 0xAA);
-
-				// Mark RDI, RCX, RAX as clobbered
-				ctx->gp[FB_RDI].vreg = FB_NOREG;
-				ctx->gp[FB_RDI].dirty = false;
-				ctx->gp[FB_RCX].vreg = FB_NOREG;
-				ctx->gp[FB_RCX].dirty = false;
-				ctx->gp[FB_RAX].vreg = FB_NOREG;
-				ctx->gp[FB_RAX].dirty = false;
 				break;
 			}
 
@@ -983,7 +981,7 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				// rep movsb: RDI=dst, RSI=src, RCX=size
 				// Encoding: a=dst, b=src, c=size_value, imm=alignment
 
-				// Spill RDI, RSI, RCX if occupied
+				// Spill whatever was in RDI, RSI, RCX
 				fb_x64_spill_reg(ctx, FB_RDI);
 				fb_x64_spill_reg(ctx, FB_RSI);
 				fb_x64_spill_reg(ctx, FB_RCX);
@@ -993,17 +991,16 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				fb_x64_move_value_to_reg(ctx, inst->b, FB_RSI);
 				fb_x64_move_value_to_reg(ctx, inst->c, FB_RCX);
 
+				// Spill operand values to stack so value_loc is consistent
+				// after the rep instruction clobbers these registers.
+				// Physical register contents are preserved for the rep.
+				fb_x64_spill_reg(ctx, FB_RDI);
+				fb_x64_spill_reg(ctx, FB_RSI);
+				fb_x64_spill_reg(ctx, FB_RCX);
+
 				// rep movsb: F3 A4
 				fb_low_emit_byte(ctx, 0xF3);
 				fb_low_emit_byte(ctx, 0xA4);
-
-				// Mark RDI, RSI, RCX as clobbered
-				ctx->gp[FB_RDI].vreg = FB_NOREG;
-				ctx->gp[FB_RDI].dirty = false;
-				ctx->gp[FB_RSI].vreg = FB_NOREG;
-				ctx->gp[FB_RSI].dirty = false;
-				ctx->gp[FB_RCX].vreg = FB_NOREG;
-				ctx->gp[FB_RCX].dirty = false;
 				break;
 			}
 

@@ -460,6 +460,10 @@ struct fbModule {
 	Array<fbSourceFile>        source_files;
 	PtrMap<uintptr, u32>       file_id_to_idx;
 
+	// Entry-point: proc indices for startup and user main (FB_NOREG if absent)
+	u32 startup_proc_idx;
+	u32 entry_proc_idx;
+
 	// Type info globals (RTTI) — populated in a future phase
 	fbSymbol *type_info_data;
 	fbSymbol *type_info_types;

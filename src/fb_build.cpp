@@ -3,6 +3,11 @@
 // Phase 6a: replaces synthetic test IR with real AST-driven code generation.
 // Mirrors the Tilde backend's cg_build_stmt / cg_build_expr pattern.
 
+// Forward declarations for mutually-referencing builder functions
+gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr);
+gb_internal void    fb_build_stmt(fbBuilder *b, Ast *node);
+gb_internal fbAddr  fb_build_compound_lit(fbBuilder *b, Ast *expr);
+
 // ───────────────────────────────────────────────────────────────────────
 // Parameter setup: classify params via ABI, create stack slots, record param_locs
 // ───────────────────────────────────────────────────────────────────────
@@ -409,6 +414,26 @@ gb_internal void fb_addr_store(fbBuilder *b, fbAddr addr, fbValue val) {
 	GB_PANIC("TODO fb_addr_store kind=%d", addr.kind);
 }
 
+// Store a value into a destination pointer. For scalar types, emits a STORE.
+// For aggregate types (structs, arrays, etc.), emits a MEMCPY from the source
+// pointer to the destination. The val parameter is a scalar value for scalar
+// types, or a pointer to the aggregate data for aggregate types.
+gb_internal void fb_emit_copy_value(fbBuilder *b, fbValue dst_ptr, fbValue val, Type *type) {
+	fbType ft = fb_data_type(type);
+	if (ft.kind != FBT_VOID) {
+		// Scalar: direct store
+		fb_emit_store(b, dst_ptr, val);
+	} else {
+		// Aggregate: val is a pointer to data, use memcpy
+		i64 size  = type_size_of(type);
+		i64 align = type_align_of(type);
+		if (size > 0) {
+			fbValue size_val = fb_emit_iconst(b, t_int, size);
+			fb_emit_memcpy(b, dst_ptr, val, size_val, align);
+		}
+	}
+}
+
 gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 	expr = unparen_expr(expr);
 
@@ -544,6 +569,9 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 		break;
 	}
 
+	case Ast_CompoundLit:
+		return fb_build_compound_lit(b, expr);
+
 	default:
 		break;
 	}
@@ -658,6 +686,199 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 	}
 
 	GB_PANIC("fb_emit_conv: unhandled conversion from %d to %d", src_ft.kind, dst_ft.kind);
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// Step 3b: Compound literal builder
+// ───────────────────────────────────────────────────────────────────────
+
+gb_internal void fb_build_compound_lit_struct(fbBuilder *b, Ast *expr, Type *bt, fbValue dst_ptr) {
+	ast_node(cl, CompoundLit, expr);
+	TypeStruct *st = &bt->Struct;
+
+	for_array(field_index, cl->elems) {
+		Ast *elem = cl->elems[field_index];
+		Ast *value_expr = nullptr;
+		isize index = field_index;
+
+		if (elem->kind == Ast_FieldValue) {
+			ast_node(fv, FieldValue, elem);
+			String name = fv->field->Ident.token.string;
+			Selection sel = lookup_field(bt, name, false);
+			GB_ASSERT_MSG(!sel.indirect,
+				"compound literal field '%.*s' requires indirect access", LIT(name));
+
+			value_expr = fv->value;
+
+			// Deep field path (e.g. using/embedded struct): walk the selection
+			if (sel.index.count > 1) {
+				fbValue ptr = dst_ptr;
+				Type *current_type = bt;
+				for_array(si, sel.index) {
+					i32 idx = sel.index[si];
+					Type *ct = base_type(current_type);
+					GB_ASSERT(ct->kind == Type_Struct);
+					i64 offset = ct->Struct.offsets[idx];
+					if (offset != 0) {
+						ptr = fb_emit_member(b, ptr, offset);
+					}
+					current_type = ct->Struct.fields[idx]->type;
+				}
+				fbValue val = fb_build_expr(b, value_expr);
+				val = fb_emit_conv(b, val, sel.entity->type);
+				fb_emit_copy_value(b, ptr, val, sel.entity->type);
+				continue;
+			}
+
+			index = sel.index[0];
+		} else {
+			// Positional field: use the entity's field_index to get the
+			// correct structural position (handles using/embedded fields).
+			Selection sel = lookup_field_from_index(bt, st->fields[field_index]->Variable.field_index);
+			GB_ASSERT(sel.index.count == 1);
+			GB_ASSERT(!sel.indirect);
+			index = sel.index[0];
+			value_expr = elem;
+		}
+
+		Entity *field = st->fields[index];
+		Type *field_type = field->type;
+
+		fbValue val = fb_build_expr(b, value_expr);
+		val = fb_emit_conv(b, val, field_type);
+
+		// Compute field pointer
+		fbValue field_ptr = dst_ptr;
+		i64 offset = st->offsets[index];
+		if (offset != 0) {
+			field_ptr = fb_emit_member(b, dst_ptr, offset);
+		}
+
+		fb_emit_copy_value(b, field_ptr, val, field_type);
+	}
+}
+
+gb_internal void fb_build_compound_lit_array(fbBuilder *b, Ast *expr, Type *bt, fbValue dst_ptr) {
+	ast_node(cl, CompoundLit, expr);
+	Type *elem_type = bt->Array.elem;
+	i64 stride = type_size_of(elem_type);
+
+	for_array(i, cl->elems) {
+		Ast *elem = cl->elems[i];
+		Ast *value_expr = nullptr;
+		i64 elem_index = cast(i64)i;
+
+		if (elem->kind == Ast_FieldValue) {
+			ast_node(fv, FieldValue, elem);
+
+			if (is_ast_range(fv->field)) {
+				// Range initialization: lo..hi = value  or  lo..<hi = value
+				ast_node(ie, BinaryExpr, fv->field);
+				TypeAndValue lo_tav = ie->left->tav;
+				TypeAndValue hi_tav = ie->right->tav;
+				GB_ASSERT(lo_tav.mode == Addressing_Constant);
+				GB_ASSERT(hi_tav.mode == Addressing_Constant);
+
+				i64 lo = exact_value_to_i64(lo_tav.value);
+				i64 hi = exact_value_to_i64(hi_tav.value);
+				if (ie->op.kind != Token_RangeHalf) {
+					hi += 1;
+				}
+
+				fbValue val = fb_build_expr(b, fv->value);
+				val = fb_emit_conv(b, val, elem_type);
+
+				for (i64 k = lo; k < hi; k++) {
+					i64 byte_offset = k * stride;
+					fbValue elem_ptr = (byte_offset == 0) ? dst_ptr : fb_emit_member(b, dst_ptr, byte_offset);
+					fb_emit_copy_value(b, elem_ptr, val, elem_type);
+				}
+				continue;
+			}
+
+			// Indexed initialization: [idx] = value
+			TypeAndValue idx_tav = fv->field->tav;
+			GB_ASSERT(idx_tav.mode == Addressing_Constant);
+			elem_index = exact_value_to_i64(idx_tav.value);
+			value_expr = fv->value;
+		} else {
+			value_expr = elem;
+		}
+
+		fbValue val = fb_build_expr(b, value_expr);
+		val = fb_emit_conv(b, val, elem_type);
+
+		i64 byte_offset = elem_index * stride;
+		fbValue elem_ptr = (byte_offset == 0) ? dst_ptr : fb_emit_member(b, dst_ptr, byte_offset);
+		fb_emit_copy_value(b, elem_ptr, val, elem_type);
+	}
+}
+
+gb_internal void fb_build_compound_lit_enumerated_array(fbBuilder *b, Ast *expr, Type *bt, fbValue dst_ptr) {
+	ast_node(cl, CompoundLit, expr);
+	Type *elem_type = bt->EnumeratedArray.elem;
+	i64 stride = type_size_of(elem_type);
+	i64 index_offset = exact_value_to_i64(*bt->EnumeratedArray.min_value);
+
+	for_array(i, cl->elems) {
+		Ast *elem = cl->elems[i];
+		Ast *value_expr = nullptr;
+		i64 elem_index = cast(i64)i;
+
+		if (elem->kind == Ast_FieldValue) {
+			ast_node(fv, FieldValue, elem);
+			TypeAndValue idx_tav = fv->field->tav;
+			GB_ASSERT(idx_tav.mode == Addressing_Constant);
+			elem_index = exact_value_to_i64(idx_tav.value) - index_offset;
+			value_expr = fv->value;
+		} else {
+			value_expr = elem;
+		}
+
+		fbValue val = fb_build_expr(b, value_expr);
+		val = fb_emit_conv(b, val, elem_type);
+
+		i64 byte_offset = elem_index * stride;
+		fbValue elem_ptr = (byte_offset == 0) ? dst_ptr : fb_emit_member(b, dst_ptr, byte_offset);
+		fb_emit_copy_value(b, elem_ptr, val, elem_type);
+	}
+}
+
+// Build a compound literal into a stack-allocated temporary.
+// Returns an fbAddr pointing to the filled-in aggregate.
+gb_internal fbAddr fb_build_compound_lit(fbBuilder *b, Ast *expr) {
+	Type *type = type_of_expr(expr);
+	Type *bt = base_type(type);
+
+	// Allocate and zero-initialize a temp for the compound literal
+	fbAddr v = fb_add_local(b, type, nullptr, true);
+
+	ast_node(cl, CompoundLit, expr);
+	if (cl->elems.count == 0) {
+		// Empty compound literal: zero-init is sufficient
+		return v;
+	}
+
+	switch (bt->kind) {
+	case Type_Struct:
+		fb_build_compound_lit_struct(b, expr, bt, v.base);
+		break;
+
+	case Type_Array:
+		fb_build_compound_lit_array(b, expr, bt, v.base);
+		break;
+
+	case Type_EnumeratedArray:
+		fb_build_compound_lit_enumerated_array(b, expr, bt, v.base);
+		break;
+
+	default:
+		GB_PANIC("fast backend: compound literal for type kind %d not yet supported (%s)",
+			bt->kind, type_to_string(type));
+		break;
+	}
+
+	return v;
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -1029,9 +1250,21 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 		return fb_make_value(r, type);
 	}
 
-	case Ast_CompoundLit:
-		GB_PANIC("fast backend: compound literals not yet supported");
-		break;
+	case Ast_CompoundLit: {
+		fbAddr addr = fb_build_compound_lit(b, expr);
+		// For aggregate types, return the pointer to the temp.
+		// Callers that assign to a variable will use memcpy.
+		// For scalar types (shouldn't normally happen), load the value.
+		fbType ft = fb_data_type(type);
+		if (ft.kind != FBT_VOID) {
+			return fb_addr_load(b, addr);
+		}
+		// Aggregate: return pointer, tagged with the aggregate type
+		// so callers can distinguish scalar values from aggregate pointers.
+		fbValue result = addr.base;
+		result.type = type;
+		return result;
+	}
 
 	default:
 		GB_PANIC("TODO fb_build_expr %.*s", LIT(ast_strings[expr->kind]));
@@ -1143,8 +1376,15 @@ gb_internal void fb_build_mutable_value_decl(fbBuilder *b, Ast *node) {
 
 		if (i < inits.count) {
 			fbValue init = inits[i];
-			init = fb_emit_conv(b, init, e->type);
-			fb_addr_store(b, local, init);
+			fbType local_ft = fb_data_type(e->type);
+			if (local_ft.kind != FBT_VOID) {
+				// Scalar: convert and store
+				init = fb_emit_conv(b, init, e->type);
+				fb_addr_store(b, local, init);
+			} else {
+				// Aggregate: init is a pointer to data, memcpy
+				fb_emit_copy_value(b, local.base, init, e->type);
+			}
 		}
 	}
 
@@ -1202,8 +1442,15 @@ gb_internal void fb_build_assign_stmt(fbBuilder *b, AstAssignStmt *as) {
 			if (i >= rhs_vals.count) break;
 
 			fbAddr addr = fb_build_addr(b, lhs_expr);
-			fbValue val = fb_emit_conv(b, rhs_vals[i], addr.type);
-			fb_addr_store(b, addr, val);
+			fbType addr_ft = fb_data_type(addr.type);
+			if (addr_ft.kind != FBT_VOID) {
+				// Scalar: convert and store
+				fbValue val = fb_emit_conv(b, rhs_vals[i], addr.type);
+				fb_addr_store(b, addr, val);
+			} else {
+				// Aggregate: memcpy
+				fb_emit_copy_value(b, addr.base, rhs_vals[i], addr.type);
+			}
 		}
 
 		array_free(&rhs_vals);
@@ -1668,6 +1915,13 @@ gb_internal void fb_procedure_end(fbBuilder *b) {
 gb_internal void fb_procedure_generate(fbBuilder *b) {
 	fb_procedure_begin(b);
 	if (b->body == nullptr) return;
+
+	// Entry point: inject __$startup_runtime call before the user body
+	if (b->is_entry_point && b->module->startup_proc_idx != FB_NOREG) {
+		fbValue sym = fb_emit_symaddr(b, b->module->startup_proc_idx);
+		fb_inst_emit(b->proc, FB_CALL, FB_VOID, sym.id, b->proc->aux_count, 0, 0, 0);
+	}
+
 	fb_build_stmt(b, b->body);
 	fb_procedure_end(b);
 }
@@ -1750,12 +2004,16 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 		fb_inst_emit(p, FB_RET, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
 	}
 
-	// Find __$startup_runtime proc index for entry point SYMADDR
-	u32 startup_proc_idx = FB_NOREG;
+	// Find key proc indices for entry point wiring
+	m->startup_proc_idx = FB_NOREG;
+	m->entry_proc_idx   = FB_NOREG;
 	for_array(i, m->procs) {
-		if (str_eq(m->procs[i]->name, str_lit("__$startup_runtime"))) {
-			startup_proc_idx = cast(u32)i;
-			break;
+		fbProc *p = m->procs[i];
+		if (str_eq(p->name, str_lit("__$startup_runtime"))) {
+			m->startup_proc_idx = cast(u32)i;
+		}
+		if (p->entity == info->entry_point) {
+			m->entry_proc_idx = cast(u32)i;
 		}
 	}
 
@@ -1772,21 +2030,22 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 		bool is_entry = (p->entity == info->entry_point);
 		bool is_user_pkg = (p->entity != nullptr && p->entity->pkg == user_pkg);
 
-		if (is_entry && startup_proc_idx != FB_NOREG) {
-			// Entry point: synthetic IR — SYMADDR + CALL startup_runtime + RET 0
-			// The runtime can't be compiled yet, so we keep synthetic IR for the entry
-			u32 bb0 = fb_block_create(p);
-			fb_block_start(p, bb0);
-			u32 sym = fb_inst_emit(p, FB_SYMADDR, FB_PTR, FB_NOREG, FB_NOREG, FB_NOREG, 0, cast(i64)startup_proc_idx);
-			fb_inst_emit(p, FB_CALL, FB_VOID, sym, p->aux_count, 0, 0, 0);
-			u32 zero = fb_inst_emit(p, FB_ICONST, FB_I64, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
-			fb_inst_emit(p, FB_RET, FB_VOID, zero, FB_NOREG, FB_NOREG, 0, 0);
-			continue;
-		}
-
 		// Phase 6a: only compile procs from the user's package.
 		// Runtime procs use builtins, slices, maps, etc. that aren't supported yet.
 		if (!is_user_pkg) {
+			// C main bridge: call the user's entry point, return 0
+			if (str_eq(p->name, str_lit("main")) && m->entry_proc_idx != FB_NOREG) {
+				u32 bb0 = fb_block_create(p);
+				fb_block_start(p, bb0);
+				u32 null_ctx = fb_inst_emit(p, FB_ICONST, FB_I64, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+				u32 entry_sym = fb_inst_emit(p, FB_SYMADDR, FB_PTR, FB_NOREG, FB_NOREG, FB_NOREG, 0, cast(i64)m->entry_proc_idx);
+				u32 aux_start = p->aux_count;
+				fb_aux_push(p, null_ctx);
+				fb_inst_emit(p, FB_CALL, FB_VOID, entry_sym, aux_start, 1, 0, 0);
+				u32 zero = fb_inst_emit(p, FB_ICONST, FB_I32, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+				fb_inst_emit(p, FB_RET, FB_VOID, zero, FB_NOREG, FB_NOREG, 0, 0);
+				continue;
+			}
 			u32 bb0 = fb_block_create(p);
 			fb_block_start(p, bb0);
 			fb_inst_emit(p, FB_RET, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);

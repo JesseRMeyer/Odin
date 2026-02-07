@@ -1313,7 +1313,7 @@ Core AST-to-IR translation with expression, statement, and address builders.
 - Context parameter handling (Odin CC appends context pointer)
 - Defer execution: LIFO deferred statement emission at scope close (Default), return (Return — all scopes), and break/continue (Branch — scopes above target). `fbTargetList` carries `scope_index` for cross-scope defer resolution
 - Multi-return explicitly guarded with `GB_ASSERT_MSG` (both Odin CC and non-Odin CC call paths)
-- Compound literals (`Ast_CompoundLit`) produce an explicit panic rather than falling through to generic TODO
+- Compound literals (`Ast_CompoundLit`) — struct (named/positional fields), fixed-size array, nested struct, enumerated array
 - CmpAnd/CmpOr lowered correctly using temp alloca (not cross-block SELECT)
 - Runtime stubs: `__$startup_runtime` and `__$cleanup_runtime` synthesized as `ret` stubs
 - `EntityFlag_CustomLinkage_Strong` respected for proper global symbol visibility
@@ -1351,6 +1351,38 @@ Built-in procedure dispatch and float opcode correction.
 - `fb_x64_resolve_gp` asserts when a value has no location and no symbol reference, catching dangling value references early
 
 **Not yet lowered in x64:** BSWAP, POPCNT, CLZ, CTZ opcodes (IR emitted, lowering TODO); float arithmetic/comparison/conversion (requires XMM register support, Phase 8)
+
+**Phase 6c: Compound Literals & Entry Point (DONE)**
+
+Struct, array, and nested struct compound literal initialization. Entry point now builds full user code from AST instead of synthetic stub IR.
+
+**Files created/modified:**
+- `src/fb_build.cpp` — `fb_build_compound_lit()` dispatch, `fb_build_compound_lit_struct()` (named and positional fields via `lookup_field`/`lookup_field_from_index`), `fb_build_compound_lit_array()` (positional, indexed, range init), `fb_build_compound_lit_enumerated_array()`, `fb_emit_copy_value()` helper (scalar STORE vs aggregate MEMCPY dispatch); entry point injects `__$startup_runtime` call before body; C `main` bridge calls user's entry point with null context
+- `src/fb_lower_x64.cpp` — Fixed MEMCPY/MEMZERO register tracking: `fb_x64_spill_reg()` after `move_value_to_reg()` but before `rep` instruction ensures `value_loc[]` consistency when physical registers are clobbered
+- `src/fb_ir.h` — `startup_proc_idx` and `entry_proc_idx` fields on `fbModule`
+
+**What works:**
+- Struct compound literals with named fields (`Vec2{x = 10, y = 20}`) — uses `lookup_field()` for deep selection path walking (embedded/using fields)
+- Struct compound literals with positional fields (`Vec2{3, 7}`) — uses `lookup_field_from_index()` via `st->fields[index]->Variable.field_index`
+- Empty struct literals (`Vec2{}`) — zero-initialized via MEMZERO
+- Partial initialization (`Vec2{x = 42}`) — MEMZERO + store only named fields, remaining fields stay zero
+- Fixed-size array literals (`[3]int{10, 20, 30}`) — MEMZERO + per-element STORE at computed offsets
+- Nested struct literals (`Rect{min = Vec2{1,2}, max = Vec2{3,4}}`) — recursive compound literal build, inner results MEMCPY'd into outer aggregate
+- Struct reassignment with compound literals — aggregate MEMCPY from temp to destination
+- Enumerated array literals — index offset from `bt->EnumeratedArray.min_value`
+- All aggregate initialization uses alloca + MEMZERO + per-field STORE + MEMCPY-to-destination pattern
+- Entry point builds full AST body (no longer synthetic stub), with startup call injected
+- C `main` (runtime bridge) properly calls user's entry point, returns 0
+- MEMCPY/MEMZERO register clobbering no longer causes stale `value_loc[]` entries
+
+**Pattern: Aggregate value flow at -O0.**
+- `fb_data_type(type).kind == FBT_VOID` identifies aggregates (structs, arrays, unions)
+- Compound literal → alloca temp, zero-init, fill fields, return pointer
+- `fb_build_expr(Ast_CompoundLit)` returns pointer tagged with aggregate type
+- Assignment/init: callers check `FBT_VOID` → use `fb_emit_copy_value()` (MEMCPY) instead of STORE
+- This convention avoids introducing aggregate types into the scalar IR
+
+**Not yet supported:** Slice literals (`[]int{1,2,3}` — requires runtime allocation), dynamic array literals, map literals, bit_set literals, union literals
 
 ### Phase 7: Remaining Odin Features (TODO)
 
