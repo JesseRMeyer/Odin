@@ -382,6 +382,16 @@ struct fbProc {
 	i32         split_returns_index;
 	i32         split_returns_count;
 
+	// XMM parameter ABI (non-Odin CC / foreign calls only).
+	// Maps incoming XMM register arguments to stack slots for SSE-classified params.
+	struct fbXmmParamLoc {
+		u32 slot_idx;
+		u8  xmm_idx;     // 0-7
+		u8  float_kind;   // FBT_F32 or FBT_F64
+	};
+	fbXmmParamLoc *xmm_param_locs;
+	u32             xmm_param_count;
+
 	// Machine code output (populated by lowering)
 	u8    *machine_code;
 	u32    machine_code_size;

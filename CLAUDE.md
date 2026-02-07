@@ -268,8 +268,9 @@ struct fbProc {
     u32 *aux;           u32 aux_count, aux_cap;       // call args, switch cases
     u32 next_value;                                    // SSA counter
     u32 current_block;                                 // insertion point
-    fbParamLoc *param_locs; u32 param_count;           // ABI param layout
+    fbParamLoc *param_locs; u32 param_count;           // ABI GP param layout
     i32 split_returns_index, split_returns_count;      // Odin CC multi-return
+    fbXmmParamLoc *xmm_param_locs; u32 xmm_param_count; // ABI XMM param layout (C calls)
     fbReloc *relocs;    u32 reloc_count, reloc_cap;
     u8 *machine_code;   u32 machine_code_size;         // lowering output
     bool is_foreign, is_export;
@@ -386,9 +387,11 @@ enum fbABIClass : u8 { FB_ABI_INTEGER, FB_ABI_SSE, FB_ABI_MEMORY, FB_ABI_IGNORE 
 struct fbABIParamInfo { fbABIClass classes[2]; u8 num_classes; Type *odin_type; };
 // fb_abi_classify_type_sysv(Type*) → fbABIParamInfo
 // INTEGER: all ints, ptrs, enums, bitsets; string/any/slice → INTEGER×2
-// SSE: f16, f32, f64 (currently routed through GP in intra-backend calls)
-// MEMORY: complex, quaternion, dynamic arrays, maps, aggregates (conservative)
-// SysV arg regs: RDI, RSI, RDX, RCX, R8, R9 (6 max GP args)
+//          small integer-only structs/arrays (≤8B → 1×INT, 9-16B → 2×INT)
+// SSE: f16, f32, f64 (Odin CC: GP regs; C/foreign CC: XMM0-7)
+// MEMORY: complex, quaternion, dynamic arrays, maps, large/mixed aggregates
+// SysV GP arg regs: RDI, RSI, RDX, RCX, R8, R9 (6 max)
+// SysV XMM arg regs: XMM0-XMM7 (8 max, C calls only)
 ```
 
 ## Naming conventions

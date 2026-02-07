@@ -34,12 +34,16 @@ gb_internal void fb_setup_params(fbProc *p) {
 	i32 split_count = (is_odin_cc && result_count > 1) ? (result_count - 1) : 0;
 
 	u32 max_gp_params = param_count + split_count + (is_odin_cc ? 1 : 0);
-	if (max_gp_params == 0) return;
+	if (max_gp_params == 0 && param_count == 0) return;
 
 	// Allocate for the hard upper bound on GP register params
 	auto *locs = gb_alloc_array(heap_allocator(), fbProc::fbParamLoc, FB_X64_SYSV_MAX_GP_ARGS);
 
+	// Allocate for XMM params (non-Odin CC only, max 8 XMM arg regs on SysV)
+	auto *xmm_locs = gb_alloc_array(heap_allocator(), fbProc::fbXmmParamLoc, 8);
+
 	u32 gp_idx = 0;
+	u32 xmm_idx = 0;
 
 	// Process declared parameters
 	TypeTuple *params = proc_type->params ? &proc_type->params->Tuple : nullptr;
@@ -67,16 +71,24 @@ gb_internal void fb_setup_params(fbProc *p) {
 		}
 
 		if (abi.classes[0] == FB_ABI_SSE) {
-			// NOTE: Float params are routed through GP registers (not XMM0-7) so
-			// that the simple GP-only register allocator can handle them.  This is
-			// correct for intra-backend (Odin-to-Odin) calls but violates the
-			// SysV ABI for calls to/from C.  External-call XMM routing is deferred
-			// until the register allocator gains XMM parameter support.
-			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) continue;
-			u32 slot = fb_slot_create(p, 8, 8, e, param_type);
-			locs[gp_idx].slot_idx   = slot;
-			locs[gp_idx].sub_offset = 0;
-			gp_idx++;
+			if (!is_odin_cc && xmm_idx < 8) {
+				// Non-Odin CC (C/foreign): SSE params arrive in XMM0-7.
+				// Create a stack slot and record XMM param location so
+				// the prologue stores XMMn to the slot.
+				fbType ft = fb_data_type(param_type);
+				u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+				xmm_locs[xmm_idx].slot_idx    = slot;
+				xmm_locs[xmm_idx].xmm_idx     = cast(u8)xmm_idx;
+				xmm_locs[xmm_idx].float_kind   = ft.kind;
+				xmm_idx++;
+			} else {
+				// Odin CC: route SSE through GP registers (internal convention)
+				if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) continue;
+				u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+				locs[gp_idx].slot_idx   = slot;
+				locs[gp_idx].sub_offset = 0;
+				gp_idx++;
+			}
 			continue;
 		}
 
@@ -132,6 +144,13 @@ gb_internal void fb_setup_params(fbProc *p) {
 		p->param_count = gp_idx;
 	} else {
 		gb_free(heap_allocator(), locs);
+	}
+
+	if (xmm_idx > 0) {
+		p->xmm_param_locs  = xmm_locs;
+		p->xmm_param_count = xmm_idx;
+	} else {
+		gb_free(heap_allocator(), xmm_locs);
 	}
 }
 
@@ -1401,6 +1420,13 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	// so aux_start accurately marks the beginning of this call's args.
 	u32 aux_start = b->proc->aux_count;
 
+	// Track SSE argument bitmasks for C-ABI calls.
+	// Bit N in sse_mask: aux entry N is an SSE (float) arg.
+	// Bit N in f64_mask: that SSE arg is f64 (vs f32).
+	u32 sse_mask = 0;
+	u32 f64_mask = 0;
+	u32 aux_idx = 0;
+
 	// Regular arguments — decompose 2-eightbyte types (string, slice, any)
 	// into two scalar values for SysV register passing.
 	for (isize i = 0; i < arg_expr_count; i++) {
@@ -1421,8 +1447,30 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 			fbValue hi = fb_emit_load(b, hi_ptr, t_int);
 			fb_aux_push(b->proc, lo.id);
 			fb_aux_push(b->proc, hi.id);
+			aux_idx += 2;
+		} else if (abi.num_classes == 1 && abi.classes[0] == FB_ABI_INTEGER &&
+		           arg_type != nullptr && fb_data_type(default_type(arg_type)).kind == FBT_VOID) {
+			// Small aggregate (struct/array <= 8 bytes) classified as 1xINTEGER.
+			// arg is a pointer to the aggregate; load as a scalar integer.
+			i64 agg_sz = type_size_of(core_type(default_type(arg_type)));
+			Type *load_type;
+			if (agg_sz <= 1) load_type = t_u8;
+			else if (agg_sz <= 2) load_type = t_u16;
+			else if (agg_sz <= 4) load_type = t_u32;
+			else load_type = t_u64;
+			fbValue val = fb_emit_load(b, arg, load_type);
+			fb_aux_push(b->proc, val.id);
+			aux_idx++;
 		} else {
+			if (!is_odin_cc && abi.num_classes >= 1 && abi.classes[0] == FB_ABI_SSE && aux_idx < 32) {
+				sse_mask |= (1u << aux_idx);
+				fbType ft = fb_data_type(default_type(arg_type));
+				if (ft.kind == FBT_F64) {
+					f64_mask |= (1u << aux_idx);
+				}
+			}
 			fb_aux_push(b->proc, arg.id);
+			aux_idx++;
 		}
 	}
 
@@ -1464,7 +1512,19 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 		ret_ft = fb_data_type(last_result_type);
 	}
 
+	// Encode calling convention and SSE bitmasks into the call instruction.
+	// flags = calling convention (0=Odin, 1=C, ...)
+	// imm = sse_mask (low 32) | f64_mask (high 32)
+	u8 cc_flag = is_odin_cc ? FBCC_ODIN : FBCC_C;
+	i64 call_imm = cast(i64)sse_mask | (cast(i64)f64_mask << 32);
+
 	u32 r = fb_inst_emit(b->proc, FB_CALL, ret_ft, target.id, aux_start, arg_count, 0, 0);
+	// Patch flags and imm after emit (fb_inst_emit sets them to 0)
+	{
+		fbInst *call_inst = &b->proc->insts[b->proc->inst_count - 1];
+		call_inst->flags = cc_flag;
+		call_inst->imm   = call_imm;
+	}
 	fbValue last_val = fb_make_value(r, last_result_type);
 
 	// Expose split return temps so the statement-level handler can unpack them
@@ -3307,8 +3367,22 @@ gb_internal void fb_procedure_begin(fbBuilder *b) {
 					break;
 				}
 			}
-			if (!found) {
-				// Parameter may be MEMORY class or ignored, skip for now
+			if (!found && b->proc->xmm_param_count > 0) {
+				// Search XMM param slots (non-Odin CC float params)
+				for (u32 xi = 0; xi < b->proc->xmm_param_count; xi++) {
+					u32 slot_idx = b->proc->xmm_param_locs[xi].slot_idx;
+					fbStackSlot *slot = &b->proc->slots[slot_idx];
+					if (slot->entity == param_e) {
+						fbValue ptr = fb_emit_alloca_from_slot(b, slot_idx);
+						fbAddr addr = {};
+						addr.kind = fbAddr_Default;
+						addr.base = ptr;
+						addr.type = param_e->type;
+						map_set(&b->variable_map, param_e, addr);
+						found = true;
+						break;
+					}
+				}
 			}
 		}
 	}

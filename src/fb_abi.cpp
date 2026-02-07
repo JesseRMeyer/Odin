@@ -1,7 +1,7 @@
 // Fast Backend ABI — SysV AMD64, Win64, AAPCS64 classification
 //
-// Phase 5: scalar classification for SysV AMD64.
-// Full struct decomposition deferred to Phase 6.
+// SysV AMD64 classification with struct/array decomposition for
+// small integer-only aggregates (<= 16 bytes).
 
 // ───────────────────────────────────────────────────────────────────────
 // ABI classification types
@@ -114,11 +114,57 @@ gb_internal fbABIParamInfo fb_abi_classify_type_sysv(Type *t) {
 		info.num_classes = 1;
 		return info;
 
+	case Type_Struct: {
+		// SysV AMD64: structs > 16 bytes → MEMORY
+		if (sz > 16) goto memory;
+		// Packed or raw_union → MEMORY (conservative)
+		if (t->Struct.is_packed || t->Struct.is_raw_union) goto memory;
+		// Classify each field: if all are INTEGER-class, decompose into eightbytes.
+		// Any SSE or MEMORY field → whole struct is MEMORY (conservative).
+		for_array(i, t->Struct.fields) {
+			Entity *f = t->Struct.fields[i];
+			if (f == nullptr || f->type == nullptr) goto memory;
+			fbABIParamInfo fi = fb_abi_classify_type_sysv(f->type);
+			if (fi.num_classes == 0) continue; // zero-sized
+			if (fi.classes[0] != FB_ABI_INTEGER) goto memory;
+			if (fi.num_classes == 2 && fi.classes[1] != FB_ABI_INTEGER) goto memory;
+		}
+		// All integer fields: classify by total size
+		if (sz <= 8) {
+			info.classes[0] = FB_ABI_INTEGER;
+			info.num_classes = 1;
+		} else {
+			info.classes[0] = FB_ABI_INTEGER;
+			info.classes[1] = FB_ABI_INTEGER;
+			info.num_classes = 2;
+		}
+		return info;
+	}
+
+	case Type_Array: {
+		// SysV AMD64: small arrays of integer types → register decomposition
+		if (sz > 16) goto memory;
+		if (sz == 0) {
+			info.classes[0] = FB_ABI_IGNORE;
+			info.num_classes = 0;
+			return info;
+		}
+		Type *elem = t->Array.elem;
+		fbABIParamInfo ei = fb_abi_classify_type_sysv(elem);
+		if (ei.num_classes == 0 || ei.classes[0] != FB_ABI_INTEGER) goto memory;
+		if (sz <= 8) {
+			info.classes[0] = FB_ABI_INTEGER;
+			info.num_classes = 1;
+		} else {
+			info.classes[0] = FB_ABI_INTEGER;
+			info.classes[1] = FB_ABI_INTEGER;
+			info.num_classes = 2;
+		}
+		return info;
+	}
+
 	default:
-		// Aggregates (structs, arrays, unions, tuples, vectors, matrices):
-		// MEMORY is always a safe classification. Proper field-by-field
-		// decomposition (which could classify small integer-only aggregates
-		// into register pairs) requires Phase 6 struct decomposition.
+	memory:
 		info.classes[0] = FB_ABI_MEMORY;
 		info.num_classes = 1;
 		return info;

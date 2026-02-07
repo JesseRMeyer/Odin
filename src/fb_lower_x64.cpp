@@ -517,6 +517,31 @@ gb_internal void fb_x64_emit_prologue(fbLowCtx *ctx) {
 		fb_low_emit_byte(ctx, 0x89);
 		fb_x64_modrm_rbp_disp32(ctx, fb_x64_sysv_arg_regs[i], s->frame_offset + sub_offset);
 	}
+
+	// Store incoming XMM register parameters (non-Odin CC / foreign procs).
+	for (u32 i = 0; i < p->xmm_param_count; i++) {
+		u32 slot_idx = p->xmm_param_locs[i].slot_idx;
+		u8  xmm     = p->xmm_param_locs[i].xmm_idx;
+		u8  fk      = p->xmm_param_locs[i].float_kind;
+		GB_ASSERT(slot_idx < p->slot_count);
+		fbStackSlot *s = &p->slots[slot_idx];
+		i32 disp = s->frame_offset;
+		if (fk == FBT_F32) {
+			// movss [rbp+disp], xmmN: F3 [REX] 0F 11 modrm
+			fb_low_emit_byte(ctx, 0xF3);
+			fb_x64_rex_if_needed(ctx, false, xmm, 0, FB_RBP);
+			fb_low_emit_byte(ctx, 0x0F);
+			fb_low_emit_byte(ctx, 0x11);
+			fb_x64_modrm_rbp_disp32(ctx, xmm, disp);
+		} else {
+			// movsd [rbp+disp], xmmN: F2 [REX] 0F 11 modrm
+			fb_low_emit_byte(ctx, 0xF2);
+			fb_x64_rex_if_needed(ctx, false, xmm, 0, FB_RBP);
+			fb_low_emit_byte(ctx, 0x0F);
+			fb_low_emit_byte(ctx, 0x11);
+			fb_x64_modrm_rbp_disp32(ctx, xmm, disp);
+		}
+	}
 }
 
 // Epilogue: mov rsp, rbp / pop rbp / ret
@@ -1310,10 +1335,15 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 
 			// ── Function calls ────────────────────────────────
 			case FB_CALL: {
-				// CALL: a = target_value_id, b = aux_start, c = arg_count, flags = calling_convention
+				// CALL: a = target_value_id, b = aux_start, c = arg_count
+				//   flags = calling convention (FBCC_ODIN=0, FBCC_C=1, ...)
+				//   imm = sse_mask (low 32) | f64_mask (high 32)
 				u32 target = inst->a;
 				u32 aux_start = inst->b;
 				u32 arg_count = inst->c;
+				u8  call_cc   = inst->flags;
+				u32 sse_mask  = cast(u32)(inst->imm & 0xFFFFFFFF);
+				u32 f64_mask  = cast(u32)((inst->imm >> 32) & 0xFFFFFFFF);
 
 				// 1. Spill all occupied caller-saved registers
 				for (u32 ri = 0; ri < FB_X64_GP_ALLOC_COUNT; ri++) {
@@ -1323,9 +1353,22 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 					}
 				}
 
-				// 2. Count stack args and compute alignment padding
-				u32 reg_args = arg_count < FB_X64_SYSV_ARG_COUNT ? arg_count : FB_X64_SYSV_ARG_COUNT;
-				u32 stack_arg_count = arg_count > FB_X64_SYSV_ARG_COUNT ? arg_count - FB_X64_SYSV_ARG_COUNT : 0;
+				// 2. Count GP and XMM register args, and stack args.
+				// SSE args go in XMM0-7 (separate from GP regs), GP args go
+				// in RDI/RSI/RDX/RCX/R8/R9. Both counters are independent.
+				u32 gp_used = 0;
+				u32 xmm_used = 0;
+				u32 stack_arg_count = 0;
+				for (u32 ai = 0; ai < arg_count; ai++) {
+					bool is_sse = (sse_mask >> ai) & 1;
+					if (is_sse) {
+						if (xmm_used < 8) { xmm_used++; }
+						else { stack_arg_count++; }
+					} else {
+						if (gp_used < FB_X64_SYSV_ARG_COUNT) { gp_used++; }
+						else { stack_arg_count++; }
+					}
+				}
 				u32 stack_padding = (stack_arg_count & 1) ? 8 : 0; // 16-byte alignment
 
 				// 3. Adjust stack for alignment padding
@@ -1337,48 +1380,94 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 					fb_x64_imm8(ctx, 8);
 				}
 
-				// 4. Push stack args in reverse order (from spill slots)
-				for (u32 ai = arg_count; ai > FB_X64_SYSV_ARG_COUNT; ai--) {
-					u32 arg_vreg = p->aux[aux_start + (ai - 1)];
-					i32 arg_loc = ctx->value_loc[arg_vreg];
-					if (arg_loc >= 0 && arg_loc < 16) {
-						// Value is in a register — push reg
-						fb_x64_rex_if_needed(ctx, false, 0, 0, cast(u8)arg_loc);
-						fb_low_emit_byte(ctx, cast(u8)(0x50 + (arg_loc & 7)));
-					} else {
-						// Value is on the stack — push qword [rbp+offset]
-						i32 offset = (arg_loc != FB_LOC_NONE) ? arg_loc : fb_x64_spill_offset(ctx, arg_vreg);
-						fb_x64_rex_if_needed(ctx, false, 6, 0, FB_RBP);
-						fb_low_emit_byte(ctx, 0xFF);
-						fb_x64_modrm_rbp_disp32(ctx, 6, offset); // /6 = PUSH
+				// 4. Push stack args in reverse order (from spill slots).
+				// Walk args backward, counting from the end to find which
+				// args exceeded the register limit.
+				{
+					u32 gp_seen = 0, xmm_seen = 0;
+					// First, compute total register capacity usage to know which args spill
+					u32 stack_indices[64]; // indices of stack-passed args (forward order)
+					u32 n_stack = 0;
+					for (u32 ai = 0; ai < arg_count; ai++) {
+						bool is_sse = (sse_mask >> ai) & 1;
+						if (is_sse) {
+							if (xmm_seen < 8) { xmm_seen++; }
+							else { if (n_stack < 64) stack_indices[n_stack++] = ai; }
+						} else {
+							if (gp_seen < FB_X64_SYSV_ARG_COUNT) { gp_seen++; }
+							else { if (n_stack < 64) stack_indices[n_stack++] = ai; }
+						}
+					}
+					// Push in reverse order
+					for (u32 si = n_stack; si > 0; si--) {
+						u32 ai = stack_indices[si - 1];
+						u32 arg_vreg = p->aux[aux_start + ai];
+						i32 arg_loc = ctx->value_loc[arg_vreg];
+						if (arg_loc >= 0 && arg_loc < 16) {
+							fb_x64_rex_if_needed(ctx, false, 0, 0, cast(u8)arg_loc);
+							fb_low_emit_byte(ctx, cast(u8)(0x50 + (arg_loc & 7)));
+						} else {
+							i32 offset = (arg_loc != FB_LOC_NONE) ? arg_loc : fb_x64_spill_offset(ctx, arg_vreg);
+							fb_x64_rex_if_needed(ctx, false, 6, 0, FB_RBP);
+							fb_low_emit_byte(ctx, 0xFF);
+							fb_x64_modrm_rbp_disp32(ctx, 6, offset);
+						}
 					}
 				}
 
-				// 5. Load register args into ABI-mandated registers.
-				//
-				// IMPORTANT: After spill-all (step 1), gp[] is cleared and all values
-				// reside in spill slots. This loop loads values from spill slots into
-				// fixed argument registers WITHOUT updating gp[] or value_loc[],
-				// because these registers are caller-saved and will be clobbered by
-				// the callee. No register allocation may occur between this loop
-				// and the call instruction emission in step 6.
-				for (u32 ai = 0; ai < reg_args; ai++) {
-					u32 arg_vreg = p->aux[aux_start + ai];
-					fbX64Reg dest = fb_x64_sysv_arg_regs[ai];
-					i32 arg_loc = ctx->value_loc[arg_vreg];
-					if (arg_loc >= 0 && arg_loc < 16 && cast(fbX64Reg)arg_loc == dest) {
-						// Already in the right register (unlikely after spill-all, but handle it)
-						continue;
+				// 5a. Load GP register args, skipping SSE entries.
+				{
+					u32 gp_ri = 0;
+					for (u32 ai = 0; ai < arg_count && gp_ri < FB_X64_SYSV_ARG_COUNT; ai++) {
+						if ((sse_mask >> ai) & 1) continue; // SSE arg, skip
+						u32 arg_vreg = p->aux[aux_start + ai];
+						fbX64Reg dest = fb_x64_sysv_arg_regs[gp_ri];
+						i32 arg_loc = ctx->value_loc[arg_vreg];
+						if (arg_loc >= 0 && arg_loc < 16 && cast(fbX64Reg)arg_loc == dest) {
+							gp_ri++;
+							continue;
+						}
+						if (arg_loc >= 0 && arg_loc < 16) {
+							fb_x64_mov_rr(ctx, dest, cast(fbX64Reg)arg_loc);
+						} else {
+							i32 offset = (arg_loc != FB_LOC_NONE) ? arg_loc : fb_x64_spill_offset(ctx, arg_vreg);
+							fb_x64_rex(ctx, true, dest, 0, FB_RBP);
+							fb_low_emit_byte(ctx, 0x8B);
+							fb_x64_modrm_rbp_disp32(ctx, dest, offset);
+						}
+						gp_ri++;
 					}
-					if (arg_loc >= 0 && arg_loc < 16) {
-						// In another register — mov
-						fb_x64_mov_rr(ctx, dest, cast(fbX64Reg)arg_loc);
-					} else {
-						// On stack — reload
-						i32 offset = (arg_loc != FB_LOC_NONE) ? arg_loc : fb_x64_spill_offset(ctx, arg_vreg);
-						fb_x64_rex(ctx, true, dest, 0, FB_RBP);
-						fb_low_emit_byte(ctx, 0x8B);
-						fb_x64_modrm_rbp_disp32(ctx, dest, offset);
+				}
+
+				// 5b. Load XMM register args from GP spill slots.
+				// Float values are stored in GP registers (bit-pattern) by the IR;
+				// move them to XMM registers via GP → XMM transfer.
+				if (sse_mask != 0) {
+					u32 xmm_ri = 0;
+					for (u32 ai = 0; ai < arg_count && xmm_ri < 8; ai++) {
+						if (!((sse_mask >> ai) & 1)) continue;
+						u32 arg_vreg = p->aux[aux_start + ai];
+						bool is_f64 = (f64_mask >> ai) & 1;
+						i32 arg_loc = ctx->value_loc[arg_vreg];
+
+						// Load the bit-pattern into a GP scratch register first
+						fbX64Reg tmp = FB_R11; // R11 is caller-saved scratch
+						if (arg_loc >= 0 && arg_loc < 16) {
+							tmp = cast(fbX64Reg)arg_loc;
+						} else {
+							i32 offset = (arg_loc != FB_LOC_NONE) ? arg_loc : fb_x64_spill_offset(ctx, arg_vreg);
+							fb_x64_rex(ctx, true, FB_R11, 0, FB_RBP);
+							fb_low_emit_byte(ctx, 0x8B);
+							fb_x64_modrm_rbp_disp32(ctx, FB_R11, offset);
+						}
+
+						// GP → XMM: movd (f32) or movq (f64)
+						if (is_f64) {
+							fb_x64_movq_gp_to_xmm(ctx, cast(u8)xmm_ri, tmp);
+						} else {
+							fb_x64_movd_gp_to_xmm(ctx, cast(u8)xmm_ri, tmp);
+						}
+						xmm_ri++;
 					}
 				}
 
@@ -1417,12 +1506,23 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 					}
 				}
 
-				// 8. Capture return value (if non-void, result is in RAX)
+				// 8. Capture return value.
+				// For non-Odin CC with SSE return type: result is in XMM0, move to GP.
+				// Otherwise: result is in RAX.
 				if (inst->r != FB_NOREG) {
-					ctx->gp[FB_RAX].vreg     = inst->r;
-					ctx->gp[FB_RAX].last_use = ctx->current_inst_idx;
-					ctx->gp[FB_RAX].dirty    = true;
-					ctx->value_loc[inst->r]  = cast(i32)FB_RAX;
+					fbTypeKind ret_tk = cast(fbTypeKind)(inst->type_raw & 0xFF);
+					bool ret_is_sse = (call_cc != FBCC_ODIN) &&
+					                  (ret_tk == FBT_F32 || ret_tk == FBT_F64);
+					if (ret_is_sse) {
+						// Result is in XMM0; move to a GP register for the IR
+						fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, 0);
+						fb_x64_xmm_to_gp(ctx, rd, FB_XMM0, ret_tk);
+					} else {
+						ctx->gp[FB_RAX].vreg     = inst->r;
+						ctx->gp[FB_RAX].last_use = ctx->current_inst_idx;
+						ctx->gp[FB_RAX].dirty    = true;
+						ctx->value_loc[inst->r]  = cast(i32)FB_RAX;
+					}
 				}
 				break;
 			}
@@ -1767,15 +1867,72 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 					fb_x64_modrm(ctx, 0x03, FB_XMM0, tmp);
 					ctx->gp[tmp].vreg = FB_NOREG;
 				} else {
-					// Full u64 range: test ra, ra; if negative, use halving trick
-					// For simplicity at -O0: use the same signed cvtsi2ss/sd with REX.W
-					// This is correct for values < 2^63; for values >= 2^63, it's a known
-					// limitation matching the plan's TODO note.
+					// Full u64 range: halving trick for values >= 2^63.
+					// Allocate both temps before branching so allocator state
+					// is consistent across both paths.
+					fbX64Reg tmp1 = fb_x64_alloc_gp(ctx, FB_NOREG, (1u << ra));
+					fbX64Reg tmp2 = fb_x64_alloc_gp(ctx, FB_NOREG, cast(u16)((1u << ra) | (1u << tmp1)));
+
+					// test ra, ra — check sign bit (negative means >= 2^63 as unsigned)
+					fb_x64_rex(ctx, true, ra, 0, ra);
+					fb_low_emit_byte(ctx, 0x85);
+					fb_x64_modrm(ctx, 0x03, ra, ra);
+
+					// jns .small (rel8) — jump if positive (signed conversion is safe)
+					fb_low_emit_byte(ctx, 0x79);
+					u32 jns_disp_offset = ctx->code_count;
+					fb_low_emit_byte(ctx, 0x00); // placeholder
+
+					// Large path: halve, convert, double.
+					// tmp1 = ra >> 1
+					fb_x64_mov_rr(ctx, tmp1, ra);
+					// shr tmp1, 1: REX.W D1 /5
+					fb_x64_rex(ctx, true, 5, 0, tmp1);
+					fb_low_emit_byte(ctx, 0xD1);
+					fb_x64_modrm(ctx, 0x03, 5, tmp1);
+					// tmp2 = ra & 1 (low bit for rounding, does NOT clobber ra)
+					fb_x64_mov_rr(ctx, tmp2, ra);
+					fb_x64_rex(ctx, true, 0, 0, tmp2);
+					fb_low_emit_byte(ctx, 0x83);
+					fb_x64_modrm(ctx, 0x03, 4, tmp2); // /4 = AND
+					fb_x64_imm8(ctx, 1);
+					// or tmp1, tmp2 — round-to-odd: (ra >> 1) | (ra & 1)
+					fb_x64_rex(ctx, true, tmp2, 0, tmp1);
+					fb_low_emit_byte(ctx, 0x09);
+					fb_x64_modrm(ctx, 0x03, tmp2, tmp1);
+					// cvtsi2ss/sd xmm0, tmp1 (REX.W, signed — value is < 2^63 now)
+					fb_low_emit_byte(ctx, prefix);
+					fb_x64_rex(ctx, true, FB_XMM0, 0, tmp1);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0x2A);
+					fb_x64_modrm(ctx, 0x03, FB_XMM0, tmp1);
+					// addss/sd xmm0, xmm0 — double the result
+					u8 add_prefix = (dst_tk == FBT_F32) ? 0xF3 : 0xF2;
+					fb_low_emit_byte(ctx, add_prefix);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0x58); // addss/sd
+					fb_x64_modrm(ctx, 0x03, FB_XMM0, FB_XMM0);
+
+					// jmp .done (rel8)
+					fb_low_emit_byte(ctx, 0xEB);
+					u32 jmp_disp_offset = ctx->code_count;
+					fb_low_emit_byte(ctx, 0x00); // placeholder
+
+					// .small: patch jns target
+					ctx->code[jns_disp_offset] = cast(u8)(ctx->code_count - (jns_disp_offset + 1));
+
+					// cvtsi2ss/sd xmm0, ra (REX.W, signed — correct for values < 2^63)
 					fb_low_emit_byte(ctx, prefix);
 					fb_x64_rex(ctx, true, FB_XMM0, 0, ra);
 					fb_low_emit_byte(ctx, 0x0F);
 					fb_low_emit_byte(ctx, 0x2A);
 					fb_x64_modrm(ctx, 0x03, FB_XMM0, ra);
+
+					// .done: patch jmp target
+					ctx->code[jmp_disp_offset] = cast(u8)(ctx->code_count - (jmp_disp_offset + 1));
+
+					ctx->gp[tmp1].vreg = FB_NOREG;
+					ctx->gp[tmp2].vreg = FB_NOREG;
 				}
 
 				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
@@ -1808,21 +1965,102 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 			}
 
 			case FB_FP2UI: {
-				// Float → unsigned integer: use signed cvttss2si/cvttsd2si with REX.W
-				// Correct for values < 2^63; full u64 range is a known limitation.
+				// Float → unsigned integer: conditional subtraction for values >= 2^63
 				fbTypeKind dst_tk = cast(fbTypeKind)(inst->type_raw & 0xFF);
 				fbTypeKind src_tk = cast(fbTypeKind)(inst->imm & 0xFF);
 				u8 prefix = (src_tk == FBT_F32) ? 0xF3 : 0xF2;
+				bool dst_u64 = (dst_tk == FBT_I64 || dst_tk == FBT_PTR);
 
 				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
 				fb_x64_gp_to_xmm(ctx, ra, FB_XMM0, src_tk);
 
-				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
-				fb_low_emit_byte(ctx, prefix);
-				fb_x64_rex(ctx, true, rd, 0, FB_XMM0);
-				fb_low_emit_byte(ctx, 0x0F);
-				fb_low_emit_byte(ctx, 0x2C);
-				fb_x64_modrm(ctx, 0x03, rd, FB_XMM0);
+				if (!dst_u64) {
+					// Destination is u32 or smaller: signed cvtt is sufficient
+					// (max u32 = ~4.29e9 fits in signed i64)
+					fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
+					fb_low_emit_byte(ctx, prefix);
+					fb_x64_rex(ctx, true, rd, 0, FB_XMM0);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0x2C);
+					fb_x64_modrm(ctx, 0x03, rd, FB_XMM0);
+				} else {
+					// Full u64 range: check if value >= 2^63 as float.
+					// Allocate rd and tmp before branching so allocator state
+					// is consistent across both paths.
+					fbX64Reg tmp = fb_x64_alloc_gp(ctx, FB_NOREG, (1u << ra));
+					fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, cast(u16)((1u << ra) | (1u << tmp)));
+
+					// Load 2^63 as float into XMM1
+					if (src_tk == FBT_F32) {
+						// 2^63 as f32 = 0x5f000000
+						fb_x64_mov_ri32(ctx, tmp, 0x5f000000);
+						fb_x64_movd_gp_to_xmm(ctx, FB_XMM1, tmp);
+					} else {
+						// 2^63 as f64 = 0x43e0000000000000
+						fb_x64_mov_ri64(ctx, tmp, 0x43e0000000000000LL);
+						fb_x64_movq_gp_to_xmm(ctx, FB_XMM1, tmp);
+					}
+					ctx->gp[tmp].vreg = FB_NOREG;
+
+					// comisd/comiss xmm0, xmm1 — compare value with 2^63
+					if (src_tk == FBT_F32) {
+						// comiss: 0F 2F /r
+						fb_low_emit_byte(ctx, 0x0F);
+						fb_low_emit_byte(ctx, 0x2F);
+						fb_x64_modrm(ctx, 0x03, FB_XMM0, FB_XMM1);
+					} else {
+						// comisd: 66 0F 2F /r
+						fb_low_emit_byte(ctx, 0x66);
+						fb_low_emit_byte(ctx, 0x0F);
+						fb_low_emit_byte(ctx, 0x2F);
+						fb_x64_modrm(ctx, 0x03, FB_XMM0, FB_XMM1);
+					}
+
+					// jb .small (rel8) — if below, direct signed conversion is fine
+					fb_low_emit_byte(ctx, 0x72);
+					u32 jb_disp_offset = ctx->code_count;
+					fb_low_emit_byte(ctx, 0x00); // placeholder
+
+					// Large path: subtract 2^63, convert, add back via btc
+					// subss/sd xmm0, xmm1
+					fb_low_emit_byte(ctx, prefix);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0x5C); // subss/sd
+					fb_x64_modrm(ctx, 0x03, FB_XMM0, FB_XMM1);
+
+					// cvttss/sd2si rd, xmm0 (REX.W)
+					fb_low_emit_byte(ctx, prefix);
+					fb_x64_rex(ctx, true, rd, 0, FB_XMM0);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0x2C);
+					fb_x64_modrm(ctx, 0x03, rd, FB_XMM0);
+
+					// btc rd, 63 — toggle bit 63 (add 2^63 as integer)
+					// REX.W 0F BA /7 imm8
+					fb_x64_rex(ctx, true, 7, 0, rd);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xBA);
+					fb_x64_modrm(ctx, 0x03, 7, rd);
+					fb_x64_imm8(ctx, 63);
+
+					// jmp .done (rel8)
+					fb_low_emit_byte(ctx, 0xEB);
+					u32 jmp_disp_offset = ctx->code_count;
+					fb_low_emit_byte(ctx, 0x00); // placeholder
+
+					// .small: patch jb target
+					ctx->code[jb_disp_offset] = cast(u8)(ctx->code_count - (jb_disp_offset + 1));
+
+					// cvttss/sd2si rd, xmm0 (REX.W) — signed conversion, correct for < 2^63
+					fb_low_emit_byte(ctx, prefix);
+					fb_x64_rex(ctx, true, rd, 0, FB_XMM0);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0x2C);
+					fb_x64_modrm(ctx, 0x03, rd, FB_XMM0);
+
+					// .done: patch jmp target
+					ctx->code[jmp_disp_offset] = cast(u8)(ctx->code_count - (jmp_disp_offset + 1));
+				}
 				break;
 			}
 
