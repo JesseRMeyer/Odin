@@ -51,8 +51,11 @@ gb_internal void fb_setup_params(fbProc *p) {
 		}
 
 		if (abi.classes[0] == FB_ABI_SSE) {
-			// At -O0, float params are passed in GP registers for intra-backend calls.
-			// Treat them as INTEGER for slot allocation.
+			// NOTE: Float params are routed through GP registers (not XMM0-7) so
+			// that the simple GP-only register allocator can handle them.  This is
+			// correct for intra-backend (Odin-to-Odin) calls but violates the
+			// SysV ABI for calls to/from C.  External-call XMM routing is deferred
+			// until the register allocator gains XMM parameter support.
 			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) continue;
 			u32 slot = fb_slot_create(p, 8, 8, e, param_type);
 			locs[gp_idx].slot_idx   = slot;
@@ -598,7 +601,39 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 	i32 src_size = fb_type_size(src_ft);
 	i32 dst_size = fb_type_size(dst_ft);
 
-	// Integer → Integer conversions
+	// ── Bool conversions ─────────────────────────────────────────
+	// FBT_I1 is included in fb_type_is_integer(), so bool-specific
+	// paths must precede the general integer/float paths to get the
+	// correct semantics: ZEXT (not SEXT), and compare (not truncate).
+
+	// Bool → Integer: always zero-extend (bool is inherently unsigned)
+	if (src_ft.kind == FBT_I1 && fb_type_is_integer(dst_ft)) {
+		u32 r = fb_inst_emit(b->proc, FB_ZEXT, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(src_ft));
+		return fb_make_value(r, dst_type);
+	}
+
+	// Integer → Bool: nonzero test (truncation would only check the low bit)
+	if (fb_type_is_integer(src_ft) && dst_ft.kind == FBT_I1) {
+		fbValue zero = fb_emit_iconst(b, src_type, 0);
+		return fb_emit_cmp(b, FB_CMP_NE, val, zero);
+	}
+
+	// Bool → Float: zero-extend to i32 first, then unsigned int-to-float
+	if (src_ft.kind == FBT_I1 && fb_type_is_float(dst_ft)) {
+		u32 ext = fb_inst_emit(b->proc, FB_ZEXT, FB_I32, val.id, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(src_ft));
+		u32 r = fb_inst_emit(b->proc, FB_UI2FP, dst_ft, ext, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(FB_I32));
+		return fb_make_value(r, dst_type);
+	}
+
+	// Float → Bool: nonzero test (FP2SI truncation loses fractional values)
+	if (fb_type_is_float(src_ft) && dst_ft.kind == FBT_I1) {
+		fbValue zero = fb_emit_fconst(b, src_type, 0.0);
+		return fb_emit_cmp(b, FB_CMP_FNE, val, zero);
+	}
+
+	// ── General conversions ──────────────────────────────────────
+
+	// Integer → Integer
 	if (fb_type_is_integer(src_ft) && fb_type_is_integer(dst_ft)) {
 		if (dst_size > src_size) {
 			// Extend
@@ -613,18 +648,6 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 		// Same size, just rebrand
 		val.type = dst_type;
 		return val;
-	}
-
-	// Bool → Integer
-	if (src_ft.kind == FBT_I1 && fb_type_is_integer(dst_ft)) {
-		u32 r = fb_inst_emit(b->proc, FB_ZEXT, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, 0);
-		return fb_make_value(r, dst_type);
-	}
-
-	// Integer → Bool
-	if (fb_type_is_integer(src_ft) && dst_ft.kind == FBT_I1) {
-		fbValue zero = fb_emit_iconst(b, src_type, 0);
-		return fb_emit_cmp(b, FB_CMP_NE, val, zero);
 	}
 
 	// Pointer → Pointer (no-op at IR level)
@@ -645,38 +668,25 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 		return fb_make_value(r, dst_type);
 	}
 
-	// Float → Float conversions
+	// Float → Float
 	if (fb_type_is_float(src_ft) && fb_type_is_float(dst_ft)) {
 		fbOp op = (dst_size > src_size) ? FB_FPEXT : FB_FPTRUNC;
 		u32 r = fb_inst_emit(b->proc, op, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(src_ft));
 		return fb_make_value(r, dst_type);
 	}
 
-	// Int → Float conversions
+	// Integer → Float
 	if (fb_type_is_integer(src_ft) && fb_type_is_float(dst_ft)) {
 		fbOp op = fb_type_is_signed(src_type) ? FB_SI2FP : FB_UI2FP;
 		u32 r = fb_inst_emit(b->proc, op, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(src_ft));
 		return fb_make_value(r, dst_type);
 	}
 
-	// Float → Int conversions
+	// Float → Integer
 	if (fb_type_is_float(src_ft) && fb_type_is_integer(dst_ft)) {
 		fbOp op = fb_type_is_signed(dst_type) ? FB_FP2SI : FB_FP2UI;
 		u32 r = fb_inst_emit(b->proc, op, dst_ft, val.id, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(src_ft));
 		return fb_make_value(r, dst_type);
-	}
-
-	// Bool → Float: zero-extend to i32 first, then UI2FP
-	if (src_ft.kind == FBT_I1 && fb_type_is_float(dst_ft)) {
-		u32 ext = fb_inst_emit(b->proc, FB_ZEXT, FB_I32, val.id, FB_NOREG, FB_NOREG, 0, 0);
-		u32 r = fb_inst_emit(b->proc, FB_UI2FP, dst_ft, ext, FB_NOREG, FB_NOREG, 0, cast(i64)fb_type_pack(FB_I32));
-		return fb_make_value(r, dst_type);
-	}
-
-	// Float → Bool: compare != 0.0
-	if (fb_type_is_float(src_ft) && dst_ft.kind == FBT_I1) {
-		fbValue zero = fb_emit_fconst(b, src_type, 0.0);
-		return fb_emit_cmp(b, FB_CMP_FNE, val, zero);
 	}
 
 	// Same-size bitcast
@@ -686,6 +696,7 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 	}
 
 	GB_PANIC("fb_emit_conv: unhandled conversion from %d to %d", src_ft.kind, dst_ft.kind);
+	return fb_value_nil();
 }
 
 // ───────────────────────────────────────────────────────────────────────

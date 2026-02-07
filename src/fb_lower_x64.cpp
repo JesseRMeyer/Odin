@@ -545,8 +545,10 @@ gb_internal void fb_x64_shift_cl(fbLowCtx *ctx, fbInst *inst, u8 ext) {
 	fb_low_emit_byte(ctx, 0xD3);
 	fb_x64_modrm(ctx, 0x03, ext, rd);
 
-	// Mark RCX as free (shift amount consumed)
-	ctx->gp[FB_RCX].vreg = FB_NOREG;
+	// Spill RCX so value_loc[inst->b] points to the spill slot, not
+	// the register we're about to free.  fb_x64_spill_reg writes the
+	// value back if dirty, and always updates value_loc + clears gp[].
+	fb_x64_spill_reg(ctx, FB_RCX);
 }
 
 // ───────────────────────────────────────────────────────────────────────

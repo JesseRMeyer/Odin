@@ -65,9 +65,10 @@ gb_internal fbABIParamInfo fb_abi_classify_type_sysv(Type *t) {
 			info.classes[0] = FB_ABI_MEMORY;
 			info.num_classes = 1;
 			return info;
-		// String types: {ptr, int} = 16 bytes → 2 × INTEGER
+		// String and any: {ptr, int/typeid} = 16 bytes → 2 × INTEGER
 		case Basic_string:
 		case Basic_string16:
+		case Basic_any:
 			info.classes[0] = FB_ABI_INTEGER;
 			info.classes[1] = FB_ABI_INTEGER;
 			info.num_classes = 2;
