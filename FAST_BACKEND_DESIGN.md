@@ -869,7 +869,7 @@ struct fbLowCtx {
     // Block-start code offsets (for branch patching)
     u32 *block_offsets;
 
-    // Machine register file (GP only — XMM scratch registers are not tracked)
+    // Machine register file (GP only — XMM registers are scratch, not tracked)
     fbRegState gp[16];    // x64: RAX-R15
 
     // Where is each value? (vreg → location)
@@ -940,7 +940,9 @@ for each block B in procedure:
 
 **Callee-saved registers:** At -O0, avoid callee-saved registers entirely (no save/restore overhead). Use only caller-saved registers: x64: RAX, RCX, RDX, RSI, RDI, R8-R11 (9 GP). arm64: X0-X17 (18 GP), V0-V7 (8 FP).
 
-**XMM scratch registers:** Float values are stored in GP registers at -O0 (as bit-punned i32/i64). XMM0 and XMM1 are used as **fixed scratch registers** for float computation — operands are moved GP→XMM before SSE instructions, results are moved XMM→GP after. No XMM register allocator or tracking is needed. This simplifies the design significantly at the cost of extra MOVD/MOVQ transfers per float operation, which is acceptable for -O0.
+**XMM scratch registers:** Float values are stored in GP registers at -O0 (as bit-punned i32/i64). XMM0 and XMM1 are used as **fixed scratch registers** for float computation — operands are moved GP→XMM before SSE instructions, results are moved XMM→GP after. XMM2 is additionally used as a third scratch for SIMD select (blend requires mask, true, and false simultaneously). No XMM register allocator or tracking is needed. This simplifies the design significantly at the cost of extra MOVD/MOVQ transfers per float operation, which is acceptable for -O0.
+
+**SIMD value storage:** SIMD vector values (lanes > 0) always live in **spill slots** (16 bytes each, regardless of vector width). All SIMD operations load operands from spill slots into XMM scratch registers, compute, and store results back. This avoids XMM register allocation entirely. For sub-128-bit vectors (`#simd[8]u8` = 64-bit), MOVQ is used instead of MOVDQU to avoid reading past allocated memory.
 
 ### 11.3 Code Emission
 
@@ -1138,29 +1140,34 @@ Similar strategy. S_LOCAL records with `DefRangeFramePointerRelFullScope` (simpl
 
 ```
 src/
-├── fb_ir.h                 // IR types, opcode enum, instruction format, builder/lowering structs (~820 lines)
-├── fb_ir.cpp               // Module lifecycle, type helpers, symbol management (~596 lines)
-├── fb_build.cpp            // AST → IR builder (~3720 lines, growing)
+├── fb_ir.h                 // IR types, opcode enum, instruction format, builder/lowering structs (~836 lines)
+├── fb_ir.cpp               // Module lifecycle, type helpers, symbol management (~601 lines)
+├── fb_build.cpp            // AST → IR builder (~4991 lines)
 │                           //   fb_build_expr(), fb_build_stmt(), fb_build_addr(),
 │                           //   fb_build_call(), fb_build_return(), fb_emit_conv(), etc.
+│                           //   Compound literals: struct, array, union, bitset, slice, SIMD
 │                           //   Mirrors tilde_expr.cpp + tilde_stmt.cpp + tilde_proc.cpp
 ├── fb_abi.cpp              // ABI classification for SysV AMD64 (~172 lines, struct/array decomposition)
-├── fb_lower_x64.cpp        // x86-64 machine code lowering (~2226 lines)
+├── fb_lower_x64.cpp        // x86-64 machine code lowering (~3477 lines)
 │                           //   GP register allocator, XMM scratch/ABI encoding helpers,
 │                           //   float/int/bitmanip lowering, NaN-safe float comparisons,
-│                           //   UI2FP halving trick, FP2UI conditional subtraction
-├── fb_emit_elf.cpp         // ELF object file emission (~700 lines)
+│                           //   UI2FP halving trick, FP2UI conditional subtraction,
+│                           //   SIMD: SSE2 packed ops, comparisons, reductions, select
+├── fb_emit_elf.cpp         // ELF object file emission (~712 lines)
 │                           //   Self-contained ELF64 types (no system elf.h dependency)
 │                           //   fbBuf growable byte buffer for section construction
 │                           //   .text, .rodata, .data, .bss, .rela.text sections
 │                           //   Single-pass symbol table with proper LOCAL/GLOBAL ordering
-├── fb_build_builtin.cpp    // Built-in procedure handling (~473 lines)
+├── fb_build_builtin.cpp    // Built-in procedure handling (~1277 lines)
 │                           //   len/cap/raw_data for slices, strings, dynamic arrays
 │                           //   min/max (variadic), abs, clamp
 │                           //   ptr_offset, ptr_sub, mem_copy, mem_zero
 │                           //   trap/debug_trap/unreachable, expect, bswap
 │                           //   count_ones/zeros, count_leading/trailing_zeros
 │                           //   read_cycle_counter, cpu_relax
+│                           //   overflow_add/sub, syscall, unaligned_load/store
+│                           //   17 SIMD builtins (arithmetic, bitwise, compare, reduce, select)
+│                           //   atomic load/store/exchange/add/sub/and/or/xor/cas, fence
 ├── fb_build_const.cpp      // (planned) Constant value IR generation
 ├── fb_build_type_info.cpp  // (planned) Runtime type info global generation
 ├── fb_lower_arm64.cpp      // (planned) ARM64 machine code lowering
@@ -1266,8 +1273,8 @@ TOTAL                            ~102
 ```
 
 ~100 opcodes. Each maps 1:1 to a fixed machine instruction template.
-The switch dispatch in the lowering loop handles all of them in ~2200 lines
-per target (x64 currently at ~2226 lines; arm64 not yet implemented).
+The switch dispatch in the lowering loop handles all of them in ~3500 lines
+per target (x64 currently at ~3477 lines; arm64 not yet implemented).
 
 ## 17. Design Invariants
 
@@ -1815,22 +1822,242 @@ Signed narrow-type ICONST fix (`fb_emit_iconst`):
 - ELF emitter updated with three-way dispatch: procs `[0, FB_RODATA_SYM_BASE)`,
   rodata `[FB_RODATA_SYM_BASE, FB_GLOBAL_SYM_BASE)`, globals `[FB_GLOBAL_SYM_BASE, ...)`.
 
-**Remaining:**
+**Phase 7d: Proc values and indirect calls (DONE):**
 
-- Map operations (runtime calls)
+- `fb_emit_symaddr` emits `FB_SYMADDR` to get the address of a procedure by symbol index.
+- Indirect calls via `FB_CALL` with a vreg operand (rather than immediate symbol index).
+- Procedure values stored as raw pointers; used for vtable-style dispatch (e.g., `Allocator.procedure`).
+
+**Phase 7e: Runtime procedure compilation (DONE):**
+
+- Two-pass procedure generation: first pass creates all `fbProc` entries with symbol indices, second pass builds IR bodies.
+- `fb_should_build_proc` controls which runtime procs are compiled vs stubbed.
+- Stubs emit a `FB_TRAP` instruction for unimplemented procs, allowing partial compilation with graceful failure.
+
+**Phase 7f: Stack-passed parameters (DONE):**
+
+- **Problem:** SysV ABI allows only 6 GP register args (RDI, RSI, RDX, RCX, R8, R9). Procs with >6 parameters (including hidden split-return pointers) had args silently dropped.
+- **`fbStackParamLoc`** struct in `fb_ir.h`: `{ u32 slot_idx; i32 stack_offset; }` — maps callee stack slots to caller's `[RBP+16+N]` locations.
+- **Prologue copy** in `fb_lower_x64.cpp`: after frame setup, copies each stack-passed param from its caller frame offset to its local stack slot via `MOV r, [RBP+offset]; MOV [RBP+slot_offset], r`.
+- **Call-site emission**: args beyond 6 GP regs are pushed to `[RSP+N]` in the caller's outgoing area instead of being placed in registers.
+- Handles both regular params and split-return output pointers that overflow to stack.
+
+**Phase 7g: Multi-return statement handling (DONE):**
+
+*Tuple flattening in `fb_build_return_stmt`:*
+- **Problem:** `return some_multi_return_call()` has 1 expression producing N values. The old loop assumed 1:1 mapping between expressions and return values, crashing with type mismatch (e.g., I8→VOID).
+- **Fix:** Two-phase approach. Phase 1 builds each result expression; if its type is `Type_Tuple`, unpacks via `fb_unpack_multi_return` into individual values. Phase 2 stores the first N-1 flat values through split-return output pointers, returns the last in a register. Aggregate values (FBT_VOID) skip `fb_emit_conv` and use `fb_emit_copy_value` directly.
+
+*nil→aggregate conversion in `fb_emit_conv`:*
+- **Problem:** `return nil, .Out_Of_Memory` — nil literal produces `rawptr` zero, but target type is `[]byte` (aggregate). No conversion path existed for scalar→aggregate.
+- **Fix:** When dst is aggregate (FBT_VOID) and src is scalar, allocate a zero-initialized local of the destination type. Correct for all nil-to-aggregate patterns since Odin doesn't allow implicit scalar-to-aggregate casts.
+
+*or_return split-return zeroing:*
+- **Problem:** `or_return` in a multi-return proc would `fb_emit_ret(b, error_val)` without initializing the split-return output pointers, leaving them with garbage data.
+- **Fix:** Before returning the error, zero all split-return output pointers via `fb_emit_memzero`. Uses `fb_load_split_return_ptr` helper that handles both GP param_locs and stack overflow cases.
+
+*`fb_load_split_return_ptr` helper:*
+- Loads the hidden output pointer for the i-th split return value.
+- First checks GP `param_locs` (when `split_returns_index + i < param_count`).
+- Falls back to `stack_param_locs` for overflow cases, scanning for slots with `entity == nullptr && odin_type != nullptr` (the signature of split-return stack entries).
+
+**Aggregate return sret expansion (DONE):**
+
+- **Problem:** `default_allocator()` returns `Allocator` (16-byte struct, ABI class INTEGER×2, IR type FBT_VOID). The sret check only triggered for `FB_ABI_MEMORY`, so small aggregate returns were emitted with FBT_VOID result type → `r = FB_NOREG` → propagated as invalid source to memcpy → lowering crash.
+- **Fix:** Expanded sret check in `fb_build_call_expr` from `FB_ABI_MEMORY` to any aggregate type (`FBT_VOID`). All aggregate returns now use a hidden output pointer (sret temp), regardless of ABI classification.
+- **Invariant:** The fast backend IR cannot represent multi-register aggregate returns. Any call returning FBT_VOID must go through sret.
+
+**Phase 7h: Contextless CC and Addressable Call Results (DONE):**
+
+Two semantic corrections that unblocked 8 runtime procedures.
+
+*Contextless calling convention fix:*
+- **Problem:** `is_odin_cc = (cc == ProcCC_Odin)` excluded `ProcCC_Contextless` procs from Odin-like ABI handling (split multi-return, GP-only parameter passing). Contextless procs like `stderr_write :: proc "contextless" (data: []byte) -> (int, _OS_Errno)` were routed through C CC, triggering assertion "multi-return not yet supported for non-Odin CC".
+- **Root cause:** The single boolean conflated two independent properties: "uses Odin ABI" and "passes implicit context".
+- **Fix:** Split into `is_odin_like = is_calling_convention_odin(cc)` (true for Odin + Contextless) and `has_context = (cc == ProcCC_Odin)` (true for Odin only). Applied in `fb_setup_params` (5 sites), `fb_build_call_expr` (5 sites), and `fb_build_return_stmt` (3 sites). `is_odin_like` governs split returns and GP-only routing; `has_context` governs the implicit context parameter slot.
+
+*Addressable call results:*
+- **Problem:** `fb_build_addr` had no `Ast_CallExpr` case. When a call result needed its address (e.g., `raw_data(data)[len(data):]` — slicing a builtin call result), the builder panicked.
+- **Fix:** Added `Ast_CallExpr` case: build the call, store result to a temp local, return the local's address. Matches the LLVM backend's approach (`llvm_backend_expr.cpp:6157`).
+
+*Files modified:* `src/fb_build.cpp`
+*Stub reduction:* 20 → 13
+
+**Phase 7i: Missing Builtins and Syscall Lowering (DONE):**
+
+Five builtin procedures and Linux syscall instruction lowering, unblocking 4 more runtime procedures.
+
+*New builtins in `fb_build_builtin.cpp`:*
+- `mem_copy_non_overlapping` — identical to existing `mem_copy` (both emit FB_MEMCPY)
+- `unaligned_load` — scalar types: regular LOAD (x86-64 handles unaligned naturally); aggregates: MEMCPY with align=1 to temp local
+- `unaligned_store` — `fb_emit_copy_value` (handles both scalar STORE and aggregate MEMCPY)
+- `overflow_add` — pure arithmetic overflow detection. Unsigned: `result < a`. Signed: `(a ^ result) & (b ^ result)` has sign bit set. Returns `(T, bool)` tuple via aggregate temp (same pattern as type assertions)
+- `syscall` — emits `FB_ASM` with `imm=1` discriminator. Args stored in aux pool (same encoding as FB_CALL). Returns `uintptr` in RAX
+
+*FB_ASM syscall lowering in `fb_lower_x64.cpp`:*
+- Linux x86-64 register mapping: `arg[0]→RAX` (syscall number), `arg[1]→RDI`, `arg[2]→RSI`, `arg[3]→RDX`, `arg[4]→R10`, `arg[5]→R8`, `arg[6]→R9`
+- Spills all caller-saved registers before loading syscall args from spill slots into target registers
+- Emits `0F 05` (syscall instruction), result in RAX
+- Clobbers RCX and R11 (handled implicitly by the pre-syscall spill-all)
+
+*`fb_op_has_result` fix in `fb_ir.cpp`:*
+- **Problem:** `FB_ASM` was in the no-result opcode list, so `fb_inst_emit` set `r = FB_NOREG` for syscall instructions. The void result propagated through type conversions and into STORE instructions, causing lowering crash (`fb_x64_resolve_gp` on vreg=FB_NOREG).
+- **Fix:** Removed `FB_ASM` from the no-result list. Now behaves like `FB_CALL`: gets a result vreg when return type is non-void, gets `FB_NOREG` when void.
+
+*Files modified:* `src/fb_build_builtin.cpp`, `src/fb_lower_x64.cpp`, `src/fb_ir.cpp`
+*Stub reduction:* 13 → 9
+
+**Phase 7j: Compound Literal Completions, Atomics, Bit Fields, Swizzle (DONE):**
+
+Eliminated 5 of the remaining 9 runtime stubs and filled major feature gaps.
+
+*Compound literals in `fb_build.cpp`:*
+- `Type_BitSet` — scalar integer type per `bit_set_to_int()`. Constant-folds all-constant cases (runtime's `{.Alloc, .Free, .Resize, ...}` → single ICONST). General case: OR each element's bit position into an accumulator.
+- `Type_Slice` — allocates backing array on stack, populates elements, builds `{data_ptr, len}` struct. Backing array lifetime is function-scoped (correct for runtime's `print_byte` where the slice is immediately consumed).
+- `ExactValue_Compound` in `fb_const_value` — delegates to `fb_build_compound_lit` for compile-time compound values used as constant initializers.
+
+*Conversion fixes in `fb_build.cpp`:*
+- Aggregate→scalar (`FBT_VOID→FBTscalar`): loads the scalar from the aggregate's stack memory.
+- Aggregate→aggregate (`FBT_VOID→FBT_VOID`): rebrands the pointer type.
+
+*`#caller_expression` in `fb_build.cpp`:*
+- Bare form (`#caller_expression`): converts call site to string at compile time.
+- Parametrized form (`#caller_expression(param_name)`): looks up the named parameter in the call's split args, converts the argument expression to a string. Used by `assert`.
+
+*Atomic builtins in `fb_build_builtin.cpp`:*
+- `atomic_load/store/exchange` + `_explicit` variants → `FB_ATOMIC_LOAD/STORE/XCHG`
+- `atomic_compare_exchange_strong/weak` + `_explicit` → `FB_ATOMIC_CAS` (returns `(old, bool)` tuple)
+- `atomic_add/sub/and/or/xor` + `_explicit` → `FB_ATOMIC_ADD/SUB/AND/OR/XOR`
+- `atomic_thread_fence/signal_fence` → `FB_FENCE`
+- Memory ordering stored in `inst->flags` bits.
+
+*Atomic lowering in `fb_lower_x64.cpp`:*
+- `ATOMIC_LOAD` → `MOV` (+ `MFENCE` for seq_cst); aligned MOV is atomic on x86-64.
+- `ATOMIC_STORE` → `XCHG [mem], reg` (implicit LOCK) for seq_cst, `MOV` otherwise.
+- `ATOMIC_XCHG` → `XCHG [mem], reg`.
+- `ATOMIC_ADD/SUB` → `LOCK XADD [mem], reg` (SUB via `NEG` + `XADD`).
+- `ATOMIC_AND/OR/XOR` → CAS loop: load old, compute `old OP val`, `LOCK CMPXCHG`, retry on failure. Returns old value.
+- `ATOMIC_CAS` → `LOCK CMPXCHG [mem], new` with expected in RAX. Returns `(old, success)` via PROJ.
+- `FENCE` → `MFENCE`/`SFENCE`/`LFENCE` based on ordering.
+
+*Additional builtins:*
+- `overflow_sub` — same pattern as `overflow_add` with subtraction.
+- `overflow_mul` — widening multiply via `FB_MULPAIR`, overflow = high word nonzero (unsigned) or high word not all sign bits (signed).
+- `fused_mul_add` — `FMUL` + `FADD` (no FMA instruction at -O0).
+- `sqrt` — `FB_SQRT` (already implemented in lowerer).
+- `type_info_of` → stub: `ICONST 0` (null pointer) until type info tables exist.
+- `typeid_of` → `type_hash_canonical_type()` at compile time → `ICONST`.
+
+*Bit field access in `fb_build.cpp`:*
+- `fbAddr_BitField` with `bit_offset` and `bit_count` from `bt->BitField.bit_offsets/bit_sizes`.
+- Load: read containing bytes, shift right, mask to bit count. Sign-extend for signed fields.
+- Store: read-modify-write — clear target bits, OR in new value shifted to position.
+
+*Swizzle in `fb_build.cpp`:*
+- `fbAddr_Swizzle` with up to 4 indices from `se->swizzle_count`/`se->swizzle_indices`.
+- Load: allocate temp array, copy elements by swizzle index. Single element → direct index.
+- Store: scatter-write each element to its swizzle destination.
+
+*Stub reduction:* 9 → 5
+
+### Phase 8: SIMD Infrastructure (DONE)
+
+Full SSE2 SIMD support, eliminating all remaining runtime stubs.
+
+**Phase 8a: SimdVector Type & Compound Literals (DONE):**
+
+- `fb_data_type(Type_SimdVector)` returns `{element_kind, lanes=count}` — e.g., `#simd[4]u32` → `{FBT_I32, 4}`, `#simd[16]u8` → `{FBT_I8, 16}`.
+- SimdVector compound literals store elements contiguously in memory at `i * elem_size` offsets.
+- Scalar-to-SIMD assignment (`: #simd[4]u32 = 42`) handled via the compound literal path.
+
+**Phase 8b: SIMD Builtins (DONE):**
+
+17 builtins in `fb_build_builtin.cpp`:
+
+| Builtin | IR mapping | Notes |
+|---------|-----------|-------|
+| `simd_add/sub/mul` | `FB_ADD/SUB/MUL` with SIMD type | Same opcodes, lanes>0 triggers SIMD lowering |
+| `simd_bit_and/or/xor` | `FB_AND/OR/XOR` with SIMD type | |
+| `simd_bit_and_not` | `FB_NOT` + `FB_AND` | |
+| `simd_bit_not` | `FB_NOT` with SIMD type | |
+| `simd_shl/shr` | Constant: `imm` field; variable: operand | Odin semantics (undefined on overflow) |
+| `simd_shl_masked/shr_masked` | Same as above | C semantics (masked shift count) |
+| `simd_extract` | `FB_VEXTRACT` with lane index | |
+| `simd_replace` | `FB_VINSERT` with lane index | |
+| `simd_lanes_eq/ne/lt/le/gt/ge` | `FB_CMP_*` with SIMD type | Result is vector mask (all-1s or all-0s per lane) |
+| `simd_reduce_or` | `FB_VEXTRACT` with `imm=-1` | Convention: lane -1 = horizontal OR reduction |
+| `simd_reduce_min` | `FB_VEXTRACT` with `imm=-2` | Convention: lane -2 = horizontal MIN reduction |
+| `simd_select` | `FB_SELECT` with SIMD type | Per-lane blend: `(mask & true) \| (~mask & false)` |
+| `simd_indices` | Builds iota vector `{0,1,...,N-1}` on stack | |
+| `simd_neg` | `FB_NEG/FB_FNEG` with SIMD type | |
+
+**Phase 8c: x86-64 SIMD Lowering (DONE):**
+
+*Spill slot enlargement:* All vreg spill slots enlarged from 8 to 16 bytes to accommodate 128-bit SIMD values. SIMD values always live in spill slots; XMM0/XMM1/XMM2 are scratch only.
+
+*Width-appropriate load/store:*
+- `#simd[16]u8` (128-bit) → `MOVDQU` (unaligned 128-bit transfer)
+- `#simd[8]u8` (64-bit) → `MOVQ` (64-bit, zeros upper 64 bits)
+- `#simd[4]u8` (32-bit) → `MOVD` (32-bit, zeros upper 96 bits)
+
+*Packed integer arithmetic (existing opcodes with `lanes>0`):*
+- `FB_ADD` → `PADDD` (0xFE, 32-bit) / `PADDQ` (0xD4, 64-bit)
+- `FB_SUB` → `PSUBD` (0xFA) / `PSUBQ` (0xFB)
+- `FB_AND/OR/XOR` → `PAND` (0xDB) / `POR` (0xEB) / `PXOR` (0xEF)
+- `FB_NOT` → `PCMPEQD xmm,xmm` (all ones) + `PXOR`
+- `FB_SHL` → constant: `PSLLD imm8` (0x72/6); variable: `PSLLD xmm` (0xF2)
+- `FB_LSHR` → constant: `PSRLD imm8` (0x72/2); variable: `PSRLD xmm` (0xD2)
+- `FB_ASHR` → constant: `PSRAD imm8` (0x72/4); variable: `PSRAD xmm` (0xE2)
+
+*Lane-wise comparisons (FB_CMP_* with `lanes>0`):*
+- `CMP_EQ` → `PCMPEQB/W/D` (0x74/0x75/0x76 by element size)
+- `CMP_NE` → `PCMPEQB/W/D` + `PXOR` with all-ones
+- `CMP_SGT` → `PCMPGTB/W/D` (0x64/0x65/0x66)
+- `CMP_SGE` → swap operands, `PCMPGT`, invert
+- `CMP_SLT` → swap operands, `PCMPGT`
+- `CMP_SLE` → `PCMPGT`, invert
+- `CMP_UGT/ULT/UGE/ULE` → XOR both operands with sign-bit bias (0x80808080 for bytes), then use signed PCMPGT. Bias constant built via `MOV r32, imm32` + `MOVD xmm, r32` + `PSHUFD xmm, xmm, 0x00`.
+
+*SIMD select (FB_SELECT with `lanes>0`):*
+- `PAND xmm1, xmm0` (true_val & mask)
+- `PANDN xmm0, xmm2` (~mask & false_val)
+- `POR xmm1, xmm0` (combine)
+
+*Vector operations:*
+- `FB_VEXTRACT` lane≥0: `PSRLDQ` to shift target lane to position 0, then `MOVD` to GP. Byte/word elements masked via `MOVZX`.
+- `FB_VEXTRACT` lane=-1 (reduce_or): `PMOVMSKB` to GP register (extracts MSB of each byte → bitmask; nonzero iff any lane set). `MOVZX r32,r8` for u8 result.
+- `FB_VEXTRACT` lane=-2 (reduce_min): `PMINUB`-fold cascade — copy vector, `PSRLDQ` by 8, `PMINUB`, repeat with shifts of 4, 2, 1. Extracts minimum unsigned byte via `MOVD` + `MOVZX`.
+- `FB_VINSERT`: Memory round-trip — copy vector to result spill slot, store scalar at correct byte offset within the slot.
+- `FB_VSPLAT`: Element-size-dependent broadcast:
+  - u32: `MOVD xmm, r32` + `PSHUFD xmm, xmm, 0x00`
+  - u64: `MOVQ xmm, r64` + `PSHUFD xmm, xmm, 0x44`
+  - u16: `MOVD` + `PSHUFLW 0x00` + `PSHUFD 0x00`
+  - u8: `MOVD` + `PUNPCKLBW` + `PUNPCKLWD` + `PSHUFD 0x00`
+
+*Helper functions added:*
+- `fb_x64_movq_load/store_indirect` (F3 0F 7E / 66 0F D6)
+- `fb_x64_pmovmskb` (66 0F D7)
+- `fb_x64_pslldq/psrldq` (byte shifts)
+- `fb_x64_pshufd` (dword shuffle)
+- `fb_x64_pandn`, `fb_x64_pminub`, `fb_x64_punpcklbw/wd`
+- `fb_x64_simd_load/store_mem` (width-appropriate dispatch)
+- `fb_simd_byte_size` (element bytes × lane count)
+
+*Stub reduction:* 5 → 0. **Runtime compiles with zero stubs.**
+
+*Runtime SIMD paths verified:*
+- `memcmp_bytes` — uses `simd_lanes_ne` + `simd_reduce_or` on `#simd[16]u8` for 16-byte-at-a-time byte comparison
+- `compare_bytes` — uses `simd_lanes_ne` + `simd_reduce_or` + `simd_select` + `simd_reduce_min` + `simd_indices` to find the first differing byte index
+- `simple_compare_bytes` — same SIMD mismatch-finding pattern
+- All three procs tested end-to-end with long strings triggering the SIMD code paths
+
+**Remaining features (not yet implemented):**
+
+- Runtime type info generation (blocks fmt, print_type)
+- Map operations (depends on type info)
 - SOA addressing
-- Slice operations (`append`, `delete`, `make`, `new`)
-- Dynamic array operations
-- Bit fields, swizzle
-- Runtime type info generation
-- SIMD builtins, atomic builtins
-
-### Phase 8: SIMD, Atomics (TODO)
-
-- SIMD vector operations (lane-wise arithmetic, shuffles, extracts/inserts)
-- Atomic operations lowering to `lock` prefix / `cmpxchg`
-- Memory fences
 - Complex/quaternion type support
+- FB_VSHUFFLE lowering (not needed by runtime)
 
 ### Phase 9: Debug Info (TODO)
 
