@@ -60,8 +60,15 @@ gb_internal void fb_setup_params(fbProc *p) {
 	// Allocate for XMM params (non-Odin CC only, max 8 XMM arg regs on SysV)
 	auto *xmm_locs = gb_alloc_array(heap_allocator(), fbProc::fbXmmParamLoc, 8);
 
+	// Allocate for stack-passed params (overflow beyond 6 GP registers).
+	// Upper bound: 2 entries per param (two-eightbyte types) + split_count + 1 (context).
+	u32 max_stack_params = cast(u32)(param_count * 2 + split_count + 1);
+	auto *stack_locs = gb_alloc_array(heap_allocator(), fbProc::fbStackParamLoc, max_stack_params);
+
 	u32 gp_idx = 0;
 	u32 xmm_idx = 0;
+	u32 stack_idx = 0;
+	i32 stack_offset = 0; // byte offset from [RBP + 16]
 
 	// Process declared parameters
 	TypeTuple *params = proc_type->params ? &proc_type->params->Tuple : nullptr;
@@ -77,10 +84,17 @@ gb_internal void fb_setup_params(fbProc *p) {
 		}
 
 		if (abi.classes[0] == FB_ABI_MEMORY) {
-			// MEMORY class: for Odin-to-Odin calls, pass as a hidden pointer
-			// in a GP register. The caller copies the value to a temp and
-			// passes the temp's address.
-			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) continue;
+			// MEMORY class: pass as a hidden pointer in a GP register.
+			// The caller copies the value to a temp and passes the temp's address.
+			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) {
+				u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+				stack_locs[stack_idx].slot_idx       = slot;
+				stack_locs[stack_idx].sub_offset      = 0;
+				stack_locs[stack_idx].caller_offset   = stack_offset;
+				stack_idx++;
+				stack_offset += 8;
+				continue;
+			}
 			u32 slot = fb_slot_create(p, 8, 8, e, param_type);
 			locs[gp_idx].slot_idx   = slot;
 			locs[gp_idx].sub_offset = 0;
@@ -101,11 +115,19 @@ gb_internal void fb_setup_params(fbProc *p) {
 				xmm_idx++;
 			} else {
 				// Odin CC: route SSE through GP registers (internal convention)
-				if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) continue;
-				u32 slot = fb_slot_create(p, 8, 8, e, param_type);
-				locs[gp_idx].slot_idx   = slot;
-				locs[gp_idx].sub_offset = 0;
-				gp_idx++;
+				if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) {
+					u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+					stack_locs[stack_idx].slot_idx       = slot;
+					stack_locs[stack_idx].sub_offset      = 0;
+					stack_locs[stack_idx].caller_offset   = stack_offset;
+					stack_idx++;
+					stack_offset += 8;
+				} else {
+					u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+					locs[gp_idx].slot_idx   = slot;
+					locs[gp_idx].sub_offset = 0;
+					gp_idx++;
+				}
 			}
 			continue;
 		}
@@ -114,21 +136,48 @@ gb_internal void fb_setup_params(fbProc *p) {
 		// Two-eightbyte params (string, slice) get a single 16-byte slot;
 		// single-eightbyte params get an 8-byte slot.
 		if (abi.num_classes == 2 && abi.classes[0] == FB_ABI_INTEGER && abi.classes[1] == FB_ABI_INTEGER) {
-			// SysV ABI: if both eightbytes can't fit in registers, pass on stack
-			if (gp_idx + 2 > FB_X64_SYSV_MAX_GP_ARGS) continue;
+			// The caller decomposes each eightbyte into a separate aux entry
+			// and assigns them independently to registers or stack. Match that:
+			// each eightbyte that doesn't fit in a register goes on the stack.
 			u32 slot = fb_slot_create(p, 16, 8, e, param_type);
-			locs[gp_idx].slot_idx   = slot;
-			locs[gp_idx].sub_offset = 0;
-			gp_idx++;
-			locs[gp_idx].slot_idx   = slot;
-			locs[gp_idx].sub_offset = 8;
-			gp_idx++;
+			// First eightbyte
+			if (gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
+				locs[gp_idx].slot_idx   = slot;
+				locs[gp_idx].sub_offset = 0;
+				gp_idx++;
+			} else {
+				stack_locs[stack_idx].slot_idx       = slot;
+				stack_locs[stack_idx].sub_offset      = 0;
+				stack_locs[stack_idx].caller_offset   = stack_offset;
+				stack_idx++;
+				stack_offset += 8;
+			}
+			// Second eightbyte
+			if (gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
+				locs[gp_idx].slot_idx   = slot;
+				locs[gp_idx].sub_offset = 8;
+				gp_idx++;
+			} else {
+				stack_locs[stack_idx].slot_idx       = slot;
+				stack_locs[stack_idx].sub_offset      = 8;
+				stack_locs[stack_idx].caller_offset   = stack_offset;
+				stack_idx++;
+				stack_offset += 8;
+			}
 		} else {
-			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) continue;
-			u32 slot = fb_slot_create(p, 8, 8, e, param_type);
-			locs[gp_idx].slot_idx   = slot;
-			locs[gp_idx].sub_offset = 0;
-			gp_idx++;
+			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) {
+				u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+				stack_locs[stack_idx].slot_idx       = slot;
+				stack_locs[stack_idx].sub_offset      = 0;
+				stack_locs[stack_idx].caller_offset   = stack_offset;
+				stack_idx++;
+				stack_offset += 8;
+			} else {
+				u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+				locs[gp_idx].slot_idx   = slot;
+				locs[gp_idx].sub_offset = 0;
+				gp_idx++;
+			}
 		}
 	}
 
@@ -139,7 +188,17 @@ gb_internal void fb_setup_params(fbProc *p) {
 		p->split_returns_index = cast(i32)gp_idx;
 		p->split_returns_count = 0;
 		for (i32 i = 0; i < split_count; i++) {
-			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) break;
+			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) {
+				// Split return pointers that overflow go on the stack
+				u32 slot = fb_slot_create(p, 8, 8, nullptr, results->variables[i]->type);
+				stack_locs[stack_idx].slot_idx       = slot;
+				stack_locs[stack_idx].sub_offset      = 0;
+				stack_locs[stack_idx].caller_offset   = stack_offset;
+				stack_idx++;
+				stack_offset += 8;
+				p->split_returns_count++;
+				continue;
+			}
 			// Each split return param is a pointer (8 bytes) to the caller's temp
 			u32 slot = fb_slot_create(p, 8, 8, nullptr, results->variables[i]->type);
 			locs[gp_idx].slot_idx   = slot;
@@ -150,11 +209,20 @@ gb_internal void fb_setup_params(fbProc *p) {
 	}
 
 	// Odin CC: append context pointer as the last GP parameter
-	if (is_odin_cc && gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
-		u32 slot = fb_slot_create(p, 8, 8, nullptr, nullptr);
-		locs[gp_idx].slot_idx   = slot;
-		locs[gp_idx].sub_offset = 0;
-		gp_idx++;
+	if (is_odin_cc) {
+		if (gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
+			u32 slot = fb_slot_create(p, 8, 8, nullptr, nullptr);
+			locs[gp_idx].slot_idx   = slot;
+			locs[gp_idx].sub_offset = 0;
+			gp_idx++;
+		} else {
+			u32 slot = fb_slot_create(p, 8, 8, nullptr, nullptr);
+			stack_locs[stack_idx].slot_idx       = slot;
+			stack_locs[stack_idx].sub_offset      = 0;
+			stack_locs[stack_idx].caller_offset   = stack_offset;
+			stack_idx++;
+			stack_offset += 8;
+		}
 	}
 
 	if (gp_idx > 0) {
@@ -169,6 +237,13 @@ gb_internal void fb_setup_params(fbProc *p) {
 		p->xmm_param_count = xmm_idx;
 	} else {
 		gb_free(heap_allocator(), xmm_locs);
+	}
+
+	if (stack_idx > 0) {
+		p->stack_param_locs  = stack_locs;
+		p->stack_param_count = stack_idx;
+	} else {
+		gb_free(heap_allocator(), stack_locs);
 	}
 }
 
@@ -985,6 +1060,17 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 
 	fbType src_ft = fb_data_type(src_type);
 	fbType dst_ft = fb_data_type(dst_type);
+
+	// ── Scalar → Aggregate (nil literal) ────────────────────────
+	// The only way to reach scalar→aggregate conversion is through nil
+	// literals (Odin doesn't allow implicit scalar-to-aggregate casts).
+	// Allocate a zero-initialized local of the destination type.
+	if (dst_ft.kind == FBT_VOID && src_ft.kind != FBT_VOID) {
+		fbAddr temp = fb_add_local(b, dst_type, nullptr, true);
+		fbValue result = temp.base;
+		result.type = dst_type;
+		return result;
+	}
 
 	if (fb_type_eq(src_ft, dst_ft)) {
 		// Same machine type, just rebrand
@@ -1945,6 +2031,37 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	return last_val;
 }
 
+// Load the hidden output pointer for the i-th split return value.
+// Split returns first fill GP param slots starting at split_returns_index;
+// any that overflow beyond FB_X64_SYSV_MAX_GP_ARGS go to stack_param_locs.
+gb_internal fbValue fb_load_split_return_ptr(fbBuilder *b, i32 i) {
+	i32 param_idx = b->proc->split_returns_index + i;
+	if (param_idx < cast(i32)b->proc->param_count) {
+		u32 slot_idx = b->proc->param_locs[param_idx].slot_idx;
+		fbValue slot_ptr = fb_emit_alloca_from_slot(b, slot_idx);
+		return fb_emit_load(b, slot_ptr, t_rawptr);
+	}
+	// Overflowed to stack — scan stack_param_locs for split return entries.
+	// Split return pointers have entity==NULL and odin_type!=NULL.
+	i32 gp_split_count = cast(i32)b->proc->param_count - b->proc->split_returns_index;
+	if (gp_split_count < 0) gp_split_count = 0;
+	i32 stack_split_idx = i - gp_split_count;
+	i32 found = 0;
+	for (u32 si = 0; si < b->proc->stack_param_count; si++) {
+		u32 slot_idx = b->proc->stack_param_locs[si].slot_idx;
+		fbStackSlot *slot = &b->proc->slots[slot_idx];
+		if (slot->entity == nullptr && slot->odin_type != nullptr) {
+			if (found == stack_split_idx) {
+				fbValue slot_ptr = fb_emit_alloca_from_slot(b, slot_idx);
+				return fb_emit_load(b, slot_ptr, t_rawptr);
+			}
+			found++;
+		}
+	}
+	GB_PANIC("fast backend: could not find stack slot for split return %d", i);
+	return {};
+}
+
 // Unpack a multi-return call into individual values.
 // out_values must have space for out_count elements.
 gb_internal void fb_unpack_multi_return(fbBuilder *b, fbValue last_val, fbValue *out_values, i32 out_count) {
@@ -2286,13 +2403,26 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 		fbValue ok_bool = fb_emit_conv(b, ok, t_bool);
 		fb_emit_branch(b, ok_bool, ok_block, return_block);
 
-		// Return block: ok == false, return the error value
+		// Return block: ok == false, return the error value.
+		// If the enclosing proc has split returns (multi-return), zero
+		// the output pointers so callers see clean zero values.
 		fb_set_block(b, return_block);
+		if (b->proc->split_returns_index >= 0) {
+			i32 split_count = b->proc->split_returns_count;
+			Type *caller_pt = base_type(b->type);
+			TypeTuple *caller_res = (caller_pt->Proc.results != nullptr)
+				? &caller_pt->Proc.results->Tuple : nullptr;
+			for (i32 i = 0; i < split_count; i++) {
+				fbValue out_ptr = fb_load_split_return_ptr(b, i);
+				Type *ret_type = caller_res->variables[i]->type;
+				i64 size = type_size_of(ret_type);
+				if (size > 0) {
+					fb_emit_memzero(b, out_ptr, size, type_align_of(ret_type));
+				}
+			}
+		}
 		fb_emit_defer_stmts(b, fbDeferExit_Return, 0);
 		fb_emit_ret(b, ok);
-		// Note: for multi-return callers, this returns just the ok/error.
-		// Full or_return with error propagation would need the caller's
-		// return type, but the simple (value, bool) case is the common one.
 
 		// Ok block: return the value
 		fb_set_block(b, ok_block);
@@ -2765,23 +2895,55 @@ gb_internal void fb_build_return_stmt(fbBuilder *b, Slice<Ast *> const &results)
 	GB_ASSERT(is_odin_cc && res_count > 1);
 	GB_ASSERT(b->proc->split_returns_index >= 0);
 
-	for (i32 i = 0; i < res_count - 1 && i < cast(i32)results.count; i++) {
-		fbValue val = fb_build_expr(b, results[i]);
+	// Phase 1: Flatten — build each result expression. If a single
+	// expression produces a tuple (return-forwarding of a multi-return
+	// call), unpack it into individual values.
+	auto flat_vals = array_make<fbValue>(heap_allocator(), 0, res_count);
+	for (i32 i = 0; i < cast(i32)results.count; i++) {
+		Ast *rexpr = results[i];
+		Type *rtype = type_of_expr(rexpr);
+		fbValue val = fb_build_expr(b, rexpr);
+
+		if (rtype != nullptr && rtype->kind == Type_Tuple) {
+			i32 tuple_count = cast(i32)rtype->Tuple.variables.count;
+			auto unpacked = array_make<fbValue>(heap_allocator(), tuple_count, tuple_count);
+			fb_unpack_multi_return(b, val, unpacked.data, tuple_count);
+			for (i32 j = 0; j < tuple_count; j++) {
+				array_add(&flat_vals, unpacked[j]);
+			}
+			array_free(&unpacked);
+		} else {
+			array_add(&flat_vals, val);
+		}
+	}
+
+	// Phase 2: Store first N-1 values through split return output pointers,
+	// return the last value in a register.
+	for (i32 i = 0; i < res_count - 1 && i < cast(i32)flat_vals.count; i++) {
+		fbValue val = flat_vals[i];
 		Type *ret_type = res_tuple->variables[i]->type;
-		val = fb_emit_conv(b, val, ret_type);
+		fbType ret_ft = fb_data_type(ret_type);
+
+		// Convert value to the expected return type.
+		// Skip conversion for aggregates (FBT_VOID) — val is already a
+		// pointer to the data and fb_emit_conv can't handle that.
+		if (ret_ft.kind != FBT_VOID) {
+			val = fb_emit_conv(b, val, ret_type);
+		}
 
 		// Load the hidden output pointer from the split return param slot
-		i32 param_idx = b->proc->split_returns_index + i;
-		u32 slot_idx = b->proc->param_locs[param_idx].slot_idx;
-		fbValue slot_ptr = fb_emit_alloca_from_slot(b, slot_idx);
-		fbValue out_ptr = fb_emit_load(b, slot_ptr, t_rawptr);
+		fbValue out_ptr = fb_load_split_return_ptr(b, i);
 
 		// Store value through the output pointer
 		fb_emit_copy_value(b, out_ptr, val, ret_type);
 	}
 
 	// Build and return the last value
-	fbValue last_val = fb_build_expr(b, results[res_count - 1]);
+	fbValue last_val = (cast(i32)flat_vals.count >= res_count)
+		? flat_vals[res_count - 1]
+		: fb_build_expr(b, results[res_count - 1]);
+	array_free(&flat_vals);
+
 	Type *last_type = res_tuple->variables[res_count - 1]->type;
 	last_val = fb_emit_conv(b, last_val, last_type);
 
@@ -4069,16 +4231,62 @@ gb_internal void fb_procedure_begin(fbBuilder *b) {
 					}
 				}
 			}
+			if (!found && b->proc->stack_param_count > 0) {
+				// Search stack-passed param slots (overflow beyond 6 GP registers)
+				for (u32 si = 0; si < b->proc->stack_param_count; si++) {
+					u32 slot_idx = b->proc->stack_param_locs[si].slot_idx;
+					fbStackSlot *slot = &b->proc->slots[slot_idx];
+					if (slot->entity == param_e) {
+						fbValue ptr = fb_emit_alloca_from_slot(b, slot_idx);
+
+						// For MEMORY class params, the slot holds a pointer to
+						// the caller's data. Load the pointer to get the actual base.
+						fbABIParamInfo abi = fb_abi_classify_type_sysv(param_e->type);
+						if (abi.classes[0] == FB_ABI_MEMORY) {
+							ptr = fb_emit_load(b, ptr, alloc_type_pointer(param_e->type));
+						}
+
+						fbAddr addr = {};
+						addr.kind = fbAddr_Default;
+						addr.base = ptr;
+						addr.type = param_e->type;
+						map_set(&b->variable_map, param_e, addr);
+						found = true;
+						break;
+					}
+				}
+			}
 		}
 	}
 
-	// Odin CC: register context pointer
-	if (proc_type->calling_convention == ProcCC_Odin && b->proc->param_count > 0) {
-		// Context pointer is the last param slot
-		u32 ctx_slot = b->proc->param_locs[b->proc->param_count - 1].slot_idx;
-		fbStackSlot *slot = &b->proc->slots[ctx_slot];
-		if (slot->entity == nullptr) {
-			// This is the context pointer slot
+	// Odin CC: register context pointer.
+	// The context pointer is the last parameter slot — either in GP register
+	// params or in stack-passed params if registers overflowed.
+	if (proc_type->calling_convention == ProcCC_Odin) {
+		u32 ctx_slot = 0;
+		bool ctx_found = false;
+
+		// Check GP register params first (context is last when it fits)
+		if (b->proc->param_count > 0) {
+			u32 last_slot = b->proc->param_locs[b->proc->param_count - 1].slot_idx;
+			fbStackSlot *slot = &b->proc->slots[last_slot];
+			if (slot->entity == nullptr && slot->odin_type == nullptr) {
+				ctx_slot = last_slot;
+				ctx_found = true;
+			}
+		}
+
+		// Check stack-passed params (context overflowed to stack)
+		if (!ctx_found && b->proc->stack_param_count > 0) {
+			u32 last_slot = b->proc->stack_param_locs[b->proc->stack_param_count - 1].slot_idx;
+			fbStackSlot *slot = &b->proc->slots[last_slot];
+			if (slot->entity == nullptr && slot->odin_type == nullptr) {
+				ctx_slot = last_slot;
+				ctx_found = true;
+			}
+		}
+
+		if (ctx_found) {
 			fbValue ctx_ptr = fb_emit_alloca_from_slot(b, ctx_slot);
 			fbAddr ctx_addr = {};
 			ctx_addr.kind = fbAddr_Default;
@@ -4287,6 +4495,7 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 			p->next_value = 0;
 			p->param_count = 0;
 			p->xmm_param_count = 0;
+			p->stack_param_count = 0;
 
 			u32 bb0 = fb_block_create(p);
 			fb_block_start(p, bb0);

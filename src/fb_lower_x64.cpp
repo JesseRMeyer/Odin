@@ -544,6 +544,24 @@ gb_internal void fb_x64_emit_prologue(fbLowCtx *ctx) {
 			fb_x64_modrm_rbp_disp32(ctx, xmm, disp);
 		}
 	}
+
+	// Copy stack-passed parameters from caller's frame into local slots.
+	// After push rbp / mov rbp,rsp: [RBP+8] = return addr, [RBP+16] = first stack arg.
+	for (u32 i = 0; i < p->stack_param_count; i++) {
+		u32 slot_idx      = p->stack_param_locs[i].slot_idx;
+		i32 sub_offset    = p->stack_param_locs[i].sub_offset;
+		i32 caller_offset = p->stack_param_locs[i].caller_offset;
+		GB_ASSERT(slot_idx < p->slot_count);
+		fbStackSlot *s = &p->slots[slot_idx];
+		// mov r11, [rbp + 16 + caller_offset]
+		fb_x64_rex(ctx, true, FB_R11, 0, FB_RBP);
+		fb_low_emit_byte(ctx, 0x8B);
+		fb_x64_modrm_rbp_disp32(ctx, FB_R11, 16 + caller_offset);
+		// mov [rbp + slot_offset + sub_offset], r11
+		fb_x64_rex(ctx, true, FB_R11, 0, FB_RBP);
+		fb_low_emit_byte(ctx, 0x89);
+		fb_x64_modrm_rbp_disp32(ctx, FB_R11, s->frame_offset + sub_offset);
+	}
 }
 
 // Epilogue: mov rsp, rbp / pop rbp / ret

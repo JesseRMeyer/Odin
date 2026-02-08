@@ -271,6 +271,7 @@ struct fbProc {
     fbParamLoc *param_locs; u32 param_count;           // ABI GP param layout
     i32 split_returns_index, split_returns_count;      // Odin CC multi-return
     fbXmmParamLoc *xmm_param_locs; u32 xmm_param_count; // ABI XMM param layout (C calls)
+    fbStackParamLoc *stack_param_locs; u32 stack_param_count; // ABI stack overflow params
     fbReloc *relocs;    u32 reloc_count, reloc_cap;
     u8 *machine_code;   u32 machine_code_size;         // lowering output
     bool is_foreign, is_export;
@@ -395,6 +396,8 @@ struct fbABIParamInfo { fbABIClass classes[2]; u8 num_classes; Type *odin_type; 
 // MEMORY: complex, quaternion, dynamic arrays, maps, large/mixed aggregates
 // SysV GP arg regs: RDI, RSI, RDX, RCX, R8, R9 (6 max)
 // SysV XMM arg regs: XMM0-XMM7 (8 max, C calls only)
+// Stack overflow: params beyond 6 GP regs arrive at [RBP+16], [RBP+24], ...
+//   Callee copies them to local slots in prologue via fbStackParamLoc
 ```
 
 ## Naming conventions

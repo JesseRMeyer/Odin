@@ -397,6 +397,17 @@ struct fbProc {
 	fbXmmParamLoc *xmm_param_locs;
 	u32             xmm_param_count;
 
+	// Stack-passed parameter ABI (callee side).
+	// When GP registers overflow (>6 eightbytes), overflow params arrive on the
+	// caller's stack frame. Each entry maps a caller stack offset to a local slot.
+	struct fbStackParamLoc {
+		u32 slot_idx;
+		i32 sub_offset;       // 0 for first eightbyte, 8 for second
+		i32 caller_offset;    // byte offset from [RBP + 16]
+	};
+	fbStackParamLoc *stack_param_locs;
+	u32              stack_param_count;
+
 	// Machine code output (populated by lowering)
 	u8    *machine_code;
 	u32    machine_code_size;
