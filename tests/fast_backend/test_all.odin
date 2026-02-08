@@ -17,7 +17,7 @@ package test_all
 //   900-905  or_else
 //   950-969  globals
 //   1000-1031 ternary if/when, implicit selectors, selector calls
-//   1100-1125 type switch (union dispatch, by-value, by-reference, structs)
+//   1100-1127 type switch, struct type assertions, labeled break regression
 
 foreign import libc "system:c"
 foreign libc {
@@ -1014,7 +1014,7 @@ test_type_switch :: proc() {
 	}
 	check(result == 1, 1115)
 
-	// 1116: struct by-reference
+	// 1116: struct by-reference + struct type assertion
 	s3: Shape = Circle{5.0}
 	switch &v in s3 {
 	case Circle:
@@ -1022,24 +1022,27 @@ test_type_switch :: proc() {
 	case Rect:
 	case Line:
 	}
-	result = 0
-	switch v in s3 {
-	case Circle: result = 1 if v.radius == 10.0 else 0
-	case Rect:   result = -1
-	case Line:   result = -2
-	}
-	check(result == 1, 1116)
+	c3, ok3 := s3.(Circle)
+	check(ok3, 1116)
+	check(c3.radius == 10.0, 1117)
 
-	// 1117: type switch in function with struct variants
+	// 1118: struct type assertion (multi-field)
+	s4: Shape = Rect{3.0, 4.0}
+	r2, ok4 := s4.(Rect)
+	check(ok4, 1118)
+	check(r2.w == 3.0, 1119)
+	check(r2.h == 4.0, 1120)
+
+	// 1121: type switch in function with struct variants
 	c: Shape = Circle{1.0}
 	a := ts_area_of(c)
-	check(a > 3.14, 1117)
-	check(a < 3.15, 1118)
+	check(a > 3.14, 1121)
+	check(a < 3.15, 1122)
 
 	r: Shape = Rect{3.0, 4.0}
-	check(ts_area_of(r) == 12.0, 1119)
+	check(ts_area_of(r) == 12.0, 1123)
 
-	// 1120: type switch in loop
+	// 1124: type switch in loop
 	values := [3]TSValue{ 10, 3.14, true }
 	int_sum := 0
 	count := 0
@@ -1052,8 +1055,39 @@ test_type_switch :: proc() {
 		}
 		count += 1
 	}
-	check(int_sum == 10, 1120)
-	check(count == 3, 1121)
+	check(int_sum == 10, 1124)
+	check(count == 3, 1125)
+
+	// 1126: labeled break with nested if (regression test)
+	v9: TSValue = 42
+	result = 0
+	outer: switch x in v9 {
+	case int:
+		if x > 10 {
+			result = 1
+			break outer
+		}
+		result = -1
+	case f64:
+		result = -2
+	case bool:
+		result = -3
+	}
+	check(result == 1, 1126)
+
+	// 1127: labeled break with nested if in regular switch (regression test)
+	result = 0
+	outer2: switch {
+	case 42 > 0:
+		if 42 > 10 {
+			result = 1
+			break outer2
+		}
+		result = -1
+	case:
+		result = -2
+	}
+	check(result == 1, 1127)
 }
 
 // ═══════════════════════════════════════════════════════════════════════

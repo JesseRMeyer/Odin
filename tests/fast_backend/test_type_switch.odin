@@ -170,21 +170,23 @@ test_partial :: proc() {
 	check(result == 0, 1112)
 }
 
-// 1113: labeled break (direct, no nested if — nested-if + labeled break
-// is a known pre-existing fast backend limitation)
+// 1113: labeled break (including nested if)
 test_labeled_break :: proc() {
 	v: Value = 42
 	result := 0
 	outer: switch x in v {
 	case int:
-		result = x
-		break outer
+		if x > 10 {
+			result = 1
+			break outer
+		}
+		result = -1
 	case f64:
 		result = -2
 	case bool:
 		result = -3
 	}
-	check(result == 42, 1113)
+	check(result == 1, 1113)
 }
 
 // 1114: nested type switch inside loop with break
@@ -247,9 +249,7 @@ test_struct_variants :: proc() {
 	check(result == 1, 1120)
 }
 
-// 1121: by-reference with structs — mutate through ref, verify via second type switch
-// (Note: struct variant type assertion `s.(Circle)` is a known pre-existing limitation,
-//  so we verify the mutation through another type switch instead)
+// 1121: by-reference with structs — mutate through ref
 test_struct_by_ref :: proc() {
 	s: Shape = Circle{5.0}
 	switch &v in s {
@@ -258,14 +258,9 @@ test_struct_by_ref :: proc() {
 	case Rect:
 	case Line:
 	}
-	// Verify mutation took effect by switching again
-	result := 0
-	switch v in s {
-	case Circle: result = 1 if v.radius == 10.0 else 0
-	case Rect:   result = -1
-	case Line:   result = -2
-	}
-	check(result == 1, 1121)
+	c, ok := s.(Circle)
+	check(ok, 1121)
+	check(c.radius == 10.0, 1122)
 }
 
 // 1123: type switch in a function with struct return

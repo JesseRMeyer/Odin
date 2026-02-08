@@ -2235,7 +2235,21 @@ gb_internal void fb_build_mutable_value_decl(fbBuilder *b, Ast *node) {
 				for (i32 i = 0; i < name_count; i++) {
 					Type *field_type = rhs_type->Tuple.variables[i]->type;
 					i64 offset = type_offset_of(rhs_type, i);
-					vals[i] = fb_load_field(b, tuple_ptr, offset, field_type);
+					fbType ft = fb_data_type(field_type);
+					if (ft.kind != FBT_VOID) {
+						// Scalar: load the field value.
+						vals[i] = fb_load_field(b, tuple_ptr, offset, field_type);
+					} else {
+						// Aggregate: return pointer to field (don't load).
+						// Fast backend convention: aggregate values are pointers
+						// tagged with the aggregate type.
+						fbValue field_ptr = tuple_ptr;
+						if (offset != 0) {
+							field_ptr = fb_emit_member(b, tuple_ptr, offset);
+						}
+						field_ptr.type = field_type;
+						vals[i] = field_ptr;
+					}
 				}
 			}
 
@@ -3077,13 +3091,15 @@ gb_internal void fb_build_switch_stmt(fbBuilder *b, Ast *node) {
 
 	// ── Emit case bodies ──
 
-	// Set up label if present.
+	// Set up label if present — update the pre-populated entry from fb_procedure_begin.
 	if (ss->label != nullptr) {
-		fbBranchRegions br = {};
-		br.cond = ss->label;
-		br.false_block = done_block;  // break target
-		br.true_block = 0;            // no continue in switch
-		array_add(&b->branch_regions, br);
+		for_array(i, b->branch_regions) {
+			if (b->branch_regions[i].cond == ss->label) {
+				b->branch_regions[i].false_block = done_block;  // break target
+				b->branch_regions[i].true_block = 0;            // no continue in switch
+				break;
+			}
+		}
 	}
 
 	for_array(i, body->stmts) {
@@ -3235,13 +3251,15 @@ gb_internal void fb_build_type_switch_stmt(fbBuilder *b, Ast *node) {
 
 	// ── Emit case bodies ──
 
-	// Set up label if present.
+	// Set up label if present — update the pre-populated entry from fb_procedure_begin.
 	if (ss->label != nullptr) {
-		fbBranchRegions br = {};
-		br.cond = ss->label;
-		br.false_block = done_block;  // break target
-		br.true_block = 0;            // no continue in switch
-		array_add(&b->branch_regions, br);
+		for_array(i, b->branch_regions) {
+			if (b->branch_regions[i].cond == ss->label) {
+				b->branch_regions[i].false_block = done_block;  // break target
+				b->branch_regions[i].true_block = 0;            // no continue in switch
+				break;
+			}
+		}
 	}
 
 	for_array(i, body->stmts) {
