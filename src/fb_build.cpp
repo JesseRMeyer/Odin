@@ -605,6 +605,51 @@ gb_internal fbAddr fb_make_global_addr(fbBuilder *b, Entity *e, u32 gidx) {
 	return addr;
 }
 
+// ── Synthetic C library calls ─────────────────────────────────────────
+//
+// Some operations (string comparison, struct equality) need libc functions
+// like memcmp. These aren't declared in user code, so we lazily create
+// foreign proc entries that the ELF emitter writes as undefined symbols
+// for the linker to resolve.
+
+gb_internal u32 fb_ensure_c_proc(fbModule *m, String name) {
+	// Check if already added.
+	for_array(i, m->procs) {
+		if (str_eq(m->procs[i]->name, name)) {
+			return cast(u32)i;
+		}
+	}
+	// Create a minimal foreign proc.
+	fbProc *p = gb_alloc_item(permanent_allocator(), fbProc);
+	gb_zero_item(p);
+	p->name = name;
+	p->is_foreign = true;
+	p->current_block = FB_NOREG;
+	p->split_returns_index = -1;
+
+	u32 idx = cast(u32)m->procs.count;
+	array_add(&m->procs, p);
+	return idx;
+}
+
+// Emit a C calling convention call with pre-built argument values.
+// Arguments must already be scalar (GP or SSE), not aggregates.
+gb_internal fbValue fb_emit_call_c(fbBuilder *b, u32 proc_idx, fbValue *args, u32 arg_count, fbType ret_ft, Type *ret_type) {
+	fbValue target = fb_emit_symaddr(b, proc_idx);
+
+	u32 aux_start = b->proc->aux_count;
+	for (u32 i = 0; i < arg_count; i++) {
+		fb_aux_push(b->proc, args[i].id);
+	}
+
+	u32 r = fb_inst_emit(b->proc, FB_CALL, ret_ft, target.id, aux_start, arg_count, 0, 0);
+	// Patch CC to C.
+	fbInst *call_inst = &b->proc->insts[b->proc->inst_count - 1];
+	call_inst->flags = FBCC_C;
+
+	return fb_make_value(r, ret_type);
+}
+
 gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 	expr = unparen_expr(expr);
 
@@ -1292,6 +1337,111 @@ gb_internal fbValue fb_build_binary_expr(fbBuilder *b, Ast *expr) {
 		fbValue right = fb_build_expr(b, be->right);
 
 		Type *operand_type = left.type ? left.type : type;
+
+		// String comparison via memcmp.
+		// Strings are {data: rawptr, len: int}. For equality: compare
+		// lengths first, then byte content. For ordering: lexicographic
+		// comparison via memcmp with length tie-break.
+		if (is_type_string(operand_type) && !is_type_cstring(operand_type)) {
+			i64 ptr_size = b->module->target.ptr_size;
+			u32 memcmp_idx = fb_ensure_c_proc(b->module, str_lit("memcmp"));
+
+			fbValue a_data = fb_load_field(b, left,  0,        t_rawptr);
+			fbValue a_len  = fb_load_field(b, left,  ptr_size, t_int);
+			fbValue b_data = fb_load_field(b, right, 0,        t_rawptr);
+			fbValue b_len  = fb_load_field(b, right, ptr_size, t_int);
+
+			u32 tmp_slot = fb_slot_create(b->proc, 1, 1, nullptr, t_bool);
+			fbValue tmp_ptr = fb_emit_alloca_from_slot(b, tmp_slot);
+
+			bool is_eq  = (be->op.kind == Token_CmpEq);
+			bool is_neq = (be->op.kind == Token_NotEq);
+
+			if (is_eq || is_neq) {
+				//   entry:       branch len_eq -> check_zero, short_out
+				//   short_out:   store !eq, jump merge
+				//   check_zero:  branch len==0 -> trivial, do_cmp
+				//   trivial:     store eq, jump merge
+				//   do_cmp:      r=memcmp; store (r==0 for eq, r!=0 for neq); jump merge
+				//   merge:       load result
+				u32 short_out  = fb_new_block(b);
+				u32 check_zero = fb_new_block(b);
+				u32 trivial    = fb_new_block(b);
+				u32 do_cmp     = fb_new_block(b);
+				u32 merge      = fb_new_block(b);
+
+				fbValue len_eq = fb_emit_cmp(b, FB_CMP_EQ, a_len, b_len);
+				fb_emit_branch(b, len_eq, check_zero, short_out);
+
+				fb_set_block(b, short_out);
+				fb_emit_store(b, tmp_ptr, fb_emit_iconst(b, t_bool, is_neq ? 1 : 0));
+				fb_emit_jump(b, merge);
+
+				fb_set_block(b, check_zero);
+				fbValue len_zero = fb_emit_cmp(b, FB_CMP_EQ, a_len, fb_emit_iconst(b, t_int, 0));
+				fb_emit_branch(b, len_zero, trivial, do_cmp);
+
+				fb_set_block(b, trivial);
+				fb_emit_store(b, tmp_ptr, fb_emit_iconst(b, t_bool, is_eq ? 1 : 0));
+				fb_emit_jump(b, merge);
+
+				fb_set_block(b, do_cmp);
+				fbValue args[3] = {a_data, b_data, a_len};
+				fbValue r = fb_emit_call_c(b, memcmp_idx, args, 3, FB_I32, t_i32);
+				fbValue zero_i32 = fb_emit_iconst(b, t_i32, 0);
+				fbValue cmp = fb_emit_cmp(b, is_eq ? FB_CMP_EQ : FB_CMP_NE, r, zero_i32);
+				fb_emit_store(b, tmp_ptr, cmp);
+				fb_emit_jump(b, merge);
+
+				fb_set_block(b, merge);
+				return fb_emit_conv(b, fb_emit_load(b, tmp_ptr, t_bool), type);
+			}
+
+			// Ordering: <, <=, >, >=
+			//   entry:       min_len = select(a<b, a, b); branch min_len!=0 -> do_cmp, len_only
+			//   do_cmp:      r=memcmp; branch r!=0 -> byte_decide, len_only
+			//   byte_decide: store (r<0 for </<=, r>0 for >/>=); jump merge
+			//   len_only:    store (a_len <op> b_len); jump merge
+			//   merge:       load result
+			u32 do_cmp      = fb_new_block(b);
+			u32 byte_decide = fb_new_block(b);
+			u32 len_only    = fb_new_block(b);
+			u32 merge       = fb_new_block(b);
+
+			fbValue a_shorter = fb_emit_cmp(b, FB_CMP_ULT, a_len, b_len);
+			fbValue min_len = fb_emit_select(b, a_shorter, a_len, b_len, t_int);
+			fbValue min_nz = fb_emit_cmp(b, FB_CMP_NE, min_len, fb_emit_iconst(b, t_int, 0));
+			fb_emit_branch(b, min_nz, do_cmp, len_only);
+
+			fb_set_block(b, do_cmp);
+			fbValue args[3] = {a_data, b_data, min_len};
+			fbValue r = fb_emit_call_c(b, memcmp_idx, args, 3, FB_I32, t_i32);
+			fbValue r_nz = fb_emit_cmp(b, FB_CMP_NE, r, fb_emit_iconst(b, t_i32, 0));
+			fb_emit_branch(b, r_nz, byte_decide, len_only);
+
+			fb_set_block(b, byte_decide);
+			fbValue zero_i32 = fb_emit_iconst(b, t_i32, 0);
+			bool use_lt = (be->op.kind == Token_Lt || be->op.kind == Token_LtEq);
+			fbValue byte_cmp = fb_emit_cmp(b, use_lt ? FB_CMP_SLT : FB_CMP_SGT, r, zero_i32);
+			fb_emit_store(b, tmp_ptr, byte_cmp);
+			fb_emit_jump(b, merge);
+
+			fb_set_block(b, len_only);
+			fbOp len_op;
+			switch (be->op.kind) {
+			case Token_Lt:   len_op = FB_CMP_ULT; break;
+			case Token_LtEq: len_op = FB_CMP_ULE; break;
+			case Token_Gt:   len_op = FB_CMP_UGT; break;
+			default:         len_op = FB_CMP_UGE; break;
+			}
+			fbValue len_cmp = fb_emit_cmp(b, len_op, a_len, b_len);
+			fb_emit_store(b, tmp_ptr, len_cmp);
+			fb_emit_jump(b, merge);
+
+			fb_set_block(b, merge);
+			return fb_emit_conv(b, fb_emit_load(b, tmp_ptr, t_bool), type);
+		}
+
 		bool is_float = fb_type_is_float(fb_data_type(operand_type));
 		bool is_signed = fb_type_is_signed(operand_type);
 

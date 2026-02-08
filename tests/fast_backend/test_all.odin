@@ -18,6 +18,11 @@ package test_all
 //   950-969  globals
 //   1000-1031 ternary if/when, implicit selectors, selector calls
 //   1100-1127 type switch, struct type assertions, labeled break regression
+//   1200-1241 any boxing, selector expressions
+//   1300-1341 signed narrow types
+//   1400-1452 signed ordering comparisons
+//   1500-1541 any type switch
+//   1600-1649 string comparison
 
 foreign import libc "system:c"
 foreign libc {
@@ -1396,6 +1401,64 @@ test_any_type_switch :: proc() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// String comparison (1600-1649)
+// ═══════════════════════════════════════════════════════════════════════
+
+test_string_comparison :: proc() {
+	// Equality
+	a: string = "hello"
+	b: string = "hello"
+	c: string = "world"
+	d: string = "hell"
+	e: string = ""
+	f: string = ""
+
+	check(a == b, 1600)      // same content
+	check(!(a == c), 1601)   // different content, same length
+	check(!(a == d), 1602)   // different length
+	check(a != c, 1603)      // != different content
+	check(!(a != b), 1604)   // != same content
+	check(a != d, 1605)      // != different length
+	check(e == f, 1606)      // empty == empty
+	check(!(e == a), 1607)   // empty != non-empty
+	check(e != a, 1608)      // empty != non-empty via !=
+
+	// Ordering
+	check("abc" < "abd", 1610)     // differ at last byte
+	check(!("abd" < "abc"), 1611)
+	check("abc" < "abcd", 1612)    // prefix is less
+	check(!("abcd" < "abc"), 1613)
+	check(!("abc" < "abc"), 1614)  // equal is not less
+	check("" < "a", 1615)          // empty < non-empty
+	check(!("a" < ""), 1616)       // non-empty not < empty
+	check(!("" < ""), 1617)        // empty not < empty
+
+	check("abd" > "abc", 1620)
+	check(!("abc" > "abd"), 1621)
+	check("abcd" > "abc", 1622)
+	check(!("abc" > "abcd"), 1623)
+
+	check("abc" <= "abd", 1630)
+	check("abc" <= "abc", 1631)    // equal satisfies <=
+	check(!("abd" <= "abc"), 1632)
+	check("" <= "", 1633)          // empty <= empty
+	check("abc" <= "abcd", 1634)   // prefix <= longer
+
+	check("abd" >= "abc", 1640)
+	check("abc" >= "abc", 1641)    // equal satisfies >=
+	check(!("abc" >= "abd"), 1642)
+	check("" >= "", 1643)          // empty >= empty
+	check("abcd" >= "abc", 1644)   // longer >= prefix
+
+	// Comparison via variable (not just constants)
+	s1: string = "apple"
+	s2: string = "banana"
+	check(s1 < s2, 1645)
+	check(s2 > s1, 1646)
+	check(s1 != s2, 1647)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Main — run everything
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1466,6 +1529,8 @@ main :: proc() {
 	test_signed_ordering()
 	print_msg("  any_type_switch...\n")
 	test_any_type_switch()
+	print_msg("  string_comparison...\n")
+	test_string_comparison()
 	print_msg("ALL PASS\n")
 	exit(0)
 }

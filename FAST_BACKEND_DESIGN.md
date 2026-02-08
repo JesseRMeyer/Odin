@@ -1792,6 +1792,29 @@ Signed narrow-type ICONST fix (`fb_emit_iconst`):
 - Nil/default cases: compare `id == 0` for nil; default falls through as usual.
 - Reuses the same chain-of-comparisons dispatch, scope management, and label handling as union type switches.
 
+**Phase 7c: String comparison via memcmp (DONE):**
+
+- All 6 comparison operators (`==`, `!=`, `<`, `<=`, `>`, `>=`) for `string` types.
+- Calls libc `memcmp` via `fb_ensure_c_proc` / `fb_emit_call_c` infrastructure, avoiding
+  the Odin runtime's SIMD-based `string_eq` which the fast backend cannot yet compile.
+- Equality (`==`/`!=`): compare lengths first; if equal and non-zero, call `memcmp`.
+  Guards against `memcmp(NULL, NULL, 0)` UB when both strings are empty.
+- Ordering (`<`/`<=`/`>`/`>=`): `memcmp(a.data, b.data, min(a.len, b.len))`;
+  if bytes differ, decide from memcmp result (signed i32 comparison);
+  if bytes match, tiebreak by length (unsigned comparison).
+- Alloca-based merge pattern: each control-flow path stores its boolean result to a
+  stack slot; the merge block loads the final value.
+
+**Rodata symbol index stability fix:**
+
+- Introduced `FB_RODATA_SYM_BASE = 0x20000000` for stable abstract rodata symbol indices,
+  paralleling `FB_GLOBAL_SYM_BASE = 0x40000000` for globals.
+- Previously, rodata indices were `m->procs.count + rodata_idx`. Adding synthetic procs
+  (e.g., `memcmp` via `fb_ensure_c_proc`) during IR generation shifted the base, causing
+  the same interned string to resolve to different abstract symbols at different times.
+- ELF emitter updated with three-way dispatch: procs `[0, FB_RODATA_SYM_BASE)`,
+  rodata `[FB_RODATA_SYM_BASE, FB_GLOBAL_SYM_BASE)`, globals `[FB_GLOBAL_SYM_BASE, ...)`.
+
 **Remaining:**
 
 - Map operations (runtime calls)

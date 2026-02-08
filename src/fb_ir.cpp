@@ -522,7 +522,7 @@ gb_internal u32 fb_module_intern_string_data(fbModule *m, String str) {
 	// Check for existing entry
 	u32 *existing = string_map_get(&m->string_intern_map, str);
 	if (existing != nullptr) {
-		return cast(u32)m->procs.count + *existing;
+		return FB_RODATA_SYM_BASE + *existing;
 	}
 
 	// Create new rodata entry with null-terminated copy
@@ -547,7 +547,7 @@ gb_internal u32 fb_module_intern_string_data(fbModule *m, String str) {
 	array_add(&m->rodata_entries, entry);
 	string_map_set(&m->string_intern_map, str, rodata_idx);
 
-	return cast(u32)m->procs.count + rodata_idx;
+	return FB_RODATA_SYM_BASE + rodata_idx;
 }
 
 // ───────────────────────────────────────────────────────────────────────

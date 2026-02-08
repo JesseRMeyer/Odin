@@ -239,8 +239,13 @@ enum : u8 {
 enum : u32 { FB_NOREG = 0xFFFFFFFF };
 
 // Abstract symbol index base for global variables.
-// Proc indices are [0, procs.count), rodata indices are [procs.count, procs.count + rodata.count),
-// global indices use this separate range to avoid dependency on rodata count (which grows during IR building).
+// Abstract symbol index ranges:
+//   [0, procs.count)                         — procedure symbols
+//   [FB_RODATA_SYM_BASE, FB_RODATA_SYM_BASE + rodata.count) — rodata symbols
+//   [FB_GLOBAL_SYM_BASE, FB_GLOBAL_SYM_BASE + globals.count) — global variable symbols
+// Each range uses a stable base so that adding entries to one category
+// does not shift indices in another.
+enum : u32 { FB_RODATA_SYM_BASE = 0x20000000 };
 enum : u32 { FB_GLOBAL_SYM_BASE = 0x40000000 };
 
 struct fbInst {
@@ -281,7 +286,7 @@ enum fbRelocType : u32 {
 
 struct fbReloc {
 	u32         code_offset;   // byte offset in this proc's machine code
-	u32         target_sym;    // abstract symbol index (proc, rodata, or FB_GLOBAL_SYM_BASE + gidx)
+	u32         target_sym;    // abstract symbol index (proc, FB_RODATA_SYM_BASE+idx, or FB_GLOBAL_SYM_BASE+idx)
 	i64         addend;        // typically -4
 	fbRelocType reloc_type;
 };

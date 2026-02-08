@@ -356,9 +356,12 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	u32 local_idx  = 2;
 	u32 global_idx = 2 + total_local;
 
-	// Unified abstract-sym → ELF-sym mapping (proc + rodata only; globals use separate array)
-	u32 total_abstract = proc_count + rodata_count;
-	u32 *sym_elf_idx = gb_alloc_array(heap_allocator(), u32, total_abstract > 0 ? total_abstract : 1);
+	// Abstract-sym → ELF-sym mappings: separate arrays for each symbol category.
+	// Proc symbols indexed by proc array index [0, proc_count).
+	// Rodata symbols indexed by rodata entry index [0, rodata_count).
+	// Global symbols indexed by global entry index [0, global_count) — see below.
+	u32 *proc_elf_idx   = gb_alloc_array(heap_allocator(), u32, proc_count   > 0 ? proc_count   : 1);
+	u32 *rodata_elf_idx = gb_alloc_array(heap_allocator(), u32, rodata_count > 0 ? rodata_count : 1);
 
 	// Proc symbols
 	for_array(i, m->procs) {
@@ -384,7 +387,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 			syms[idx].st_value = proc_text_offsets[i];
 			syms[idx].st_size  = p->machine_code_size;
 		}
-		sym_elf_idx[i] = idx;
+		proc_elf_idx[i] = idx;
 	}
 
 	// Rodata symbols (all local)
@@ -396,7 +399,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		syms[idx].st_shndx = FB_ELF_SEC_RODATA;
 		syms[idx].st_value = rodata_offsets ? rodata_offsets[i] : 0;
 		syms[idx].st_size  = re->size;
-		sym_elf_idx[proc_count + i] = idx;
+		rodata_elf_idx[i] = idx;
 	}
 
 	// Global variable symbols
@@ -502,14 +505,21 @@ gb_internal String fb_emit_elf(fbModule *m) {
 			rela.r_offset = proc_text_offsets[pi] + rel->code_offset;
 			Elf64_Word elf_type = (rel->reloc_type == FB_RELOC_PLT32) ? R_X86_64_PLT32 : R_X86_64_PC32;
 			// Map abstract symbol index to ELF symbol index.
-			// Global variables use FB_GLOBAL_SYM_BASE + gidx; everything else is in sym_elf_idx.
+			// Ranges: [0, FB_RODATA_SYM_BASE) = procs,
+			//         [FB_RODATA_SYM_BASE, FB_GLOBAL_SYM_BASE) = rodata,
+			//         [FB_GLOBAL_SYM_BASE, ...) = globals.
 			u32 elf_sym;
 			if (rel->target_sym >= FB_GLOBAL_SYM_BASE) {
 				u32 gidx = rel->target_sym - FB_GLOBAL_SYM_BASE;
 				GB_ASSERT(gidx < global_count);
 				elf_sym = global_sym_elf_idx[gidx];
+			} else if (rel->target_sym >= FB_RODATA_SYM_BASE) {
+				u32 ridx = rel->target_sym - FB_RODATA_SYM_BASE;
+				GB_ASSERT(ridx < rodata_count);
+				elf_sym = rodata_elf_idx[ridx];
 			} else {
-				elf_sym = sym_elf_idx[rel->target_sym];
+				GB_ASSERT(rel->target_sym < proc_count);
+				elf_sym = proc_elf_idx[rel->target_sym];
 			}
 			rela.r_info   = ELF64_R_INFO(elf_sym, elf_type);
 			rela.r_addend = rel->addend;
@@ -627,7 +637,8 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		if (global_data_offsets) gb_free(heap_allocator(), global_data_offsets);
 		if (global_bss_offsets)  gb_free(heap_allocator(), global_bss_offsets);
 		if (global_is_bss)       gb_free(heap_allocator(), global_is_bss);
-		gb_free(heap_allocator(), sym_elf_idx);
+		gb_free(heap_allocator(), proc_elf_idx);
+		gb_free(heap_allocator(), rodata_elf_idx);
 		gb_free(heap_allocator(), global_sym_elf_idx);
 		return {};
 	}
@@ -682,7 +693,8 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	if (global_data_offsets) gb_free(heap_allocator(), global_data_offsets);
 	if (global_bss_offsets)  gb_free(heap_allocator(), global_bss_offsets);
 	if (global_is_bss)       gb_free(heap_allocator(), global_is_bss);
-	gb_free(heap_allocator(), sym_elf_idx);
+	gb_free(heap_allocator(), proc_elf_idx);
+	gb_free(heap_allocator(), rodata_elf_idx);
 	gb_free(heap_allocator(), global_sym_elf_idx);
 
 	return filepath;

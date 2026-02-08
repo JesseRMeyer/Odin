@@ -375,8 +375,11 @@ struct fbLowCtx {
 // fb_emit_elf(fbModule*) → String (output path)
 // Sections: NULL, .text, .rodata, .data, .bss, .symtab, .strtab, .shstrtab, .rela.text
 // Process: concat proc machine code → build .rodata/.data/.bss → build symbols → build relocations → write file
-// Abstract symbol index: [0,procs) procs, [procs,procs+rodata) rodata, [FB_GLOBAL_SYM_BASE,...) globals
-// FB_GLOBAL_SYM_BASE = 0x40000000 — separates global indices from rodata (avoids count dependency)
+// Abstract symbol index ranges:
+//   [0, procs.count)                                        — procedure symbols
+//   [FB_RODATA_SYM_BASE, FB_RODATA_SYM_BASE+rodata.count)  — rodata symbols
+//   [FB_GLOBAL_SYM_BASE, FB_GLOBAL_SYM_BASE+globals.count) — global variable symbols
+// FB_RODATA_SYM_BASE = 0x20000000, FB_GLOBAL_SYM_BASE = 0x40000000
 // Reloc types: FB_RELOC_PC32 (R_X86_64_PC32), FB_RELOC_PLT32 (R_X86_64_PLT32)
 // Helper: fbBuf { u8 *data; u32 count, cap; } with fb_buf_append/align/free
 ```
@@ -409,11 +412,13 @@ Concretely: write the test from the language semantics / expected behavior *befo
 
 ## Code generation rules
 
+**Solve before writing.** Work out the complete solution in your head (or in thinking), then write the final code once. Never write code as a way of thinking through the problem. Code is the output of problem-solving, not the medium.
+
 **No iterative drafts.** Never write code that builds, fails, tears down, rebuilds within the same function. Discard and rewrite cleanly. Final code = only the working solution.
 
 **Plan control flow before emitting.** For code with multiple basic blocks, phi nodes, or shared exits: work out full block structure and dataflow before writing any code.
 
-**Clean code only.** No dead code paths, abandoned attempts, or stream-of-consciousness comments in committed code.
+**Clean code only.** No dead code paths, abandoned attempts, stream-of-consciousness comments, or thinking-out-loud in committed code or in-progress edits. Every line written to a file must be intentional and correct.
 
 ## Workflow
 
