@@ -1437,6 +1437,11 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 						if (arg_loc >= 0 && arg_loc < 16) {
 							fb_x64_rex_if_needed(ctx, false, 0, 0, cast(u8)arg_loc);
 							fb_low_emit_byte(ctx, cast(u8)(0x50 + (arg_loc & 7)));
+						} else if (arg_loc == FB_LOC_NONE && ctx->value_sym && ctx->value_sym[arg_vreg] != FB_NOREG) {
+							// SYMADDR value — materialize to R11, then push R11
+							fb_x64_emit_lea_sym(ctx, FB_R11, ctx->value_sym[arg_vreg]);
+							fb_x64_rex_if_needed(ctx, false, 0, 0, FB_R11);
+							fb_low_emit_byte(ctx, cast(u8)(0x50 + (FB_R11 & 7)));
 						} else {
 							i32 offset = (arg_loc != FB_LOC_NONE) ? arg_loc : fb_x64_spill_offset(ctx, arg_vreg);
 							fb_x64_rex_if_needed(ctx, false, 6, 0, FB_RBP);
@@ -1460,6 +1465,9 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 						}
 						if (arg_loc >= 0 && arg_loc < 16) {
 							fb_x64_mov_rr(ctx, dest, cast(fbX64Reg)arg_loc);
+						} else if (arg_loc == FB_LOC_NONE && ctx->value_sym && ctx->value_sym[arg_vreg] != FB_NOREG) {
+							// SYMADDR value (proc reference passed as argument) — materialize via lea
+							fb_x64_emit_lea_sym(ctx, dest, ctx->value_sym[arg_vreg]);
 						} else {
 							i32 offset = (arg_loc != FB_LOC_NONE) ? arg_loc : fb_x64_spill_offset(ctx, arg_vreg);
 							fb_x64_rex(ctx, true, dest, 0, FB_RBP);

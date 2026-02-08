@@ -23,6 +23,7 @@ package test_all
 //   1400-1452 signed ordering comparisons
 //   1500-1541 any type switch
 //   1600-1649 string comparison
+//   1700-1730 procedure values and indirect calls
 
 foreign import libc "system:c"
 foreign libc {
@@ -1459,6 +1460,123 @@ test_string_comparison :: proc() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Procedure values and indirect calls (1700-1730)
+// ═══════════════════════════════════════════════════════════════════════
+
+// Helper procs for proc value tests (add/mul already defined above)
+apply :: proc(f: proc(int, int) -> int, a: int, b: int) -> int {
+	return f(a, b)
+}
+
+double_it :: proc(x: int) -> int { return x * 2 }
+triple_it :: proc(x: int) -> int { return x * 3 }
+
+BinOp :: struct {
+	op: proc(int, int) -> int,
+	tag: int,
+}
+
+Dispatcher :: struct {
+	handler: proc(int) -> int,
+	multiplier: int,
+}
+
+dispatch :: proc(d: Dispatcher, val: int) -> int {
+	return d.handler(val) * d.multiplier
+}
+
+test_proc_values :: proc() {
+	// 1700: basic indirect call — assign proc to variable, call through it
+	f := add
+	check(f(3, 4) == 7, 1700)
+
+	// 1701: different proc in same variable type
+	g := mul
+	check(g(3, 4) == 12, 1701)
+
+	// 1702: proc pointer equality
+	f2 := add
+	check(f == f2, 1702)
+
+	// 1703: proc pointer inequality
+	check(f != g, 1703)
+
+	// 1704: reassign proc variable and call through new value
+	h := add
+	check(h(2, 3) == 5, 1704)
+	h = mul
+	check(h(2, 3) == 6, 1705)
+	h = add
+	check(h(2, 3) == 5, 1706)
+
+	// 1707: proc as parameter — pass proc value to another function
+	check(apply(add, 10, 20) == 30, 1707)
+	check(apply(mul, 10, 20) == 200, 1708)
+
+	// 1709: nested call — result of indirect call used in another
+	r := apply(add, apply(mul, 3, 4), 5)
+	check(r == 17, 1709)  // mul(3,4)=12, add(12,5)=17
+
+	// 1710: proc value from conditional
+	op := add if true else mul
+	check(op(5, 6) == 11, 1710)
+
+	// 1711: struct with proc field — compound lit init
+	bo := BinOp{ op = add, tag = 1 }
+	check(bo.op(10, 20) == 30, 1711)
+	check(bo.tag == 1, 1712)
+
+	// 1713: struct proc field mutation
+	bo.op = mul
+	check(bo.op(10, 20) == 200, 1713)
+
+	// 1717: nil comparison — zero-init proc is nil
+	np: proc(int, int) -> int
+	check(np == nil, 1717)
+
+	// 1718: assign then compare non-nil
+	np = add
+	check(np != nil, 1718)
+
+	// 1719: compare against nil after assignment
+	check(!(np == nil), 1719)
+
+	// 1720: reset to nil
+	np = nil
+	check(np == nil, 1720)
+
+	// 1721: allocator-like pattern — struct with handler and data, dispatch
+	d1 := Dispatcher{ handler = double_it, multiplier = 3 }
+	check(dispatch(d1, 5) == 30, 1721)  // double_it(5)=10, 10*3=30
+
+	d2 := Dispatcher{ handler = triple_it, multiplier = 2 }
+	check(dispatch(d2, 5) == 30, 1722)  // triple_it(5)=15, 15*2=30
+
+	// 1723: different values yield different results
+	check(dispatch(d1, 10) == 60, 1723)  // double_it(10)=20, 20*3=60
+	check(dispatch(d2, 10) == 60, 1724)  // triple_it(10)=30, 30*2=60
+
+	// 1725: swap handler at runtime
+	d1.handler = triple_it
+	check(dispatch(d1, 5) == 45, 1725)  // triple_it(5)=15, 15*3=45
+
+	// 1726: pass struct by value — original unaffected
+	d3 := Dispatcher{ handler = double_it, multiplier = 1 }
+	check(dispatch(d3, 7) == 14, 1726)  // double_it(7)=14, 14*1=14
+
+	// 1730: loop with dynamic proc selection
+	sum := 0
+	for i := 0; i < 6; i += 1 {
+		op2 := add if i % 2 == 0 else mul
+		sum += op2(i, 2)
+	}
+	// i=0: add(0,2)=2; i=1: mul(1,2)=2; i=2: add(2,2)=4;
+	// i=3: mul(3,2)=6; i=4: add(4,2)=6; i=5: mul(5,2)=10
+	// sum = 2+2+4+6+6+10 = 30
+	check(sum == 30, 1730)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Main — run everything
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1531,6 +1649,8 @@ main :: proc() {
 	test_any_type_switch()
 	print_msg("  string_comparison...\n")
 	test_string_comparison()
+	print_msg("  proc_values...\n")
+	test_proc_values()
 	print_msg("ALL PASS\n")
 	exit(0)
 }

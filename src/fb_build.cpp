@@ -1783,7 +1783,10 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 		GB_ASSERT_MSG(e != nullptr, "%s in %.*s", expr_to_string(expr), LIT(b->entity->token.string));
 
 		if (e->kind == Entity_Nil) {
-			return fb_emit_iconst(b, type, 0);
+			// Nil may have untyped nil type — use rawptr as a safe
+			// pointer-sized zero regardless.
+			Type *nil_type = (type != nullptr && is_type_typed(type)) ? type : t_rawptr;
+			return fb_emit_iconst(b, nil_type, 0);
 		}
 
 		// Check variable map
