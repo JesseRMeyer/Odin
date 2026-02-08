@@ -1210,6 +1210,77 @@ test_signed_narrow :: proc() {
 	check(a32 != 0, 1315)
 }
 
+test_signed_ordering :: proc() {
+	// i8: negative < positive
+	a8: i8 = -1
+	b8: i8 = 1
+	check(a8 < b8, 1400)
+	check(a8 <= b8, 1401)
+	check(b8 > a8, 1402)
+	check(b8 >= a8, 1403)
+	check(!(a8 > b8), 1404)
+	check(!(a8 >= b8), 1405)
+
+	// i8: boundary values
+	lo8: i8 = -128
+	hi8: i8 = 127
+	check(lo8 < hi8, 1406)
+	check(hi8 > lo8, 1407)
+
+	// i16: negative < positive
+	a16: i16 = -100
+	b16: i16 = 100
+	check(a16 < b16, 1410)
+	check(a16 <= b16, 1411)
+	check(b16 > a16, 1412)
+	check(b16 >= a16, 1413)
+
+	// i16: boundary values
+	lo16: i16 = -32768
+	hi16: i16 = 32767
+	check(lo16 < hi16, 1414)
+	check(hi16 > lo16, 1415)
+
+	// i32: negative < positive
+	a32: i32 = -42
+	b32: i32 = 42
+	check(a32 < b32, 1420)
+	check(a32 <= b32, 1421)
+	check(b32 > a32, 1422)
+	check(b32 >= a32, 1423)
+
+	// i32: boundary values
+	lo32: i32 = -2147483648
+	hi32: i32 = 2147483647
+	check(lo32 < hi32, 1424)
+	check(hi32 > lo32, 1425)
+
+	// i64: negative < positive (should still work, was always 64-bit CMP)
+	a64: i64 = -999
+	b64: i64 = 999
+	check(a64 < b64, 1430)
+	check(b64 > a64, 1431)
+
+	// Negative ordering among negatives
+	x8: i8 = -10
+	y8: i8 = -1
+	check(x8 < y8, 1440)
+	check(y8 > x8, 1441)
+
+	x16: i16 = -1000
+	y16: i16 = -1
+	check(x16 < y16, 1442)
+	check(y16 > x16, 1443)
+
+	// Via pointer (tests LOAD + signed CMP consistency)
+	pa8 := &a8
+	check(pa8^ < b8, 1450)
+	pa16 := &a16
+	check(pa16^ < b16, 1451)
+	pa32 := &a32
+	check(pa32^ < b32, 1452)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Main — run everything
 // ═══════════════════════════════════════════════════════════════════════
@@ -1277,6 +1348,8 @@ main :: proc() {
 	test_any()
 	print_msg("  signed_narrow...\n")
 	test_signed_narrow()
+	print_msg("  signed_ordering...\n")
+	test_signed_ordering()
 	print_msg("ALL PASS\n")
 	exit(0)
 }

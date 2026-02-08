@@ -1779,7 +1779,12 @@ Selector expression fix (`fb_build_addr`, SelectorExpr):
 Signed narrow-type ICONST fix (`fb_emit_iconst`):
 - **Root cause:** LOAD uses MOVZX (zero-extension is canonical form for sub-64-bit values), but ICONST stored sign-extended 64-bit values. Negative i8/i16/i32 constants had different 64-bit representations than loaded values.
 - **Fix:** Mask ICONST immediates to type width via unsigned cast: `val = (i64)(u8/u16/u32)val`. Both LOADs and ICONSTs now produce identical zero-extended 64-bit representations.
-- **Invariant:** All sub-64-bit integer values in registers are zero-extended. SEXT/ZEXT/TRUNC/STORE all read only the low bits, so this is safe. Signed ordering comparisons (SLT/SGT) on narrow types remain a separate TODO (CMP always uses 64-bit operands).
+- **Invariant:** All sub-64-bit integer values in registers are zero-extended. SEXT/ZEXT/TRUNC/STORE all read only the low bits, so this is safe.
+
+**Narrow-type signed ordering comparisons (DONE):**
+- **Problem:** CMP always used REX.W (64-bit), but signed comparisons on zero-extended narrow values give wrong results. E.g., `i8(-1)` = 0xFF zero-extended = 255; 64-bit signed CMP says 255 > 1, but i8(-1) < i8(1).
+- **Fix:** `fb_emit_cmp` now stores packed operand type in `imm` for signed comparisons (FB_CMP_SLT through FB_CMP_SGE), same pattern already used for float comparisons. The x86-64 lowerer decodes the type and emits type-width CMP: 8-bit (`0x38`), 16-bit (`0x66 0x39`), 32-bit (`0x39`), 64-bit (`REX.W 0x39`).
+- **EQ/NE and unsigned comparisons remain 64-bit** — correct because zero-extended values have identical bit patterns for equality and unsigned ordering.
 
 **Remaining:**
 
@@ -1791,7 +1796,6 @@ Signed narrow-type ICONST fix (`fb_emit_iconst`):
 - `any` type switches (requires runtime type info)
 - Runtime type info generation
 - SIMD builtins, atomic builtins
-- Narrow-type signed ordering comparisons (CMP_SLT etc. need type-width CMP or pre-SEXT)
 
 ### Phase 8: SIMD, Atomics (TODO)
 

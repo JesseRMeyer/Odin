@@ -274,10 +274,14 @@ gb_internal fbValue fb_emit_arith(fbBuilder *b, fbOp op, fbValue lhs, fbValue rh
 }
 
 gb_internal fbValue fb_emit_cmp(fbBuilder *b, fbOp cmp_op, fbValue lhs, fbValue rhs) {
-	// For float comparisons, store the operand type in imm so the lowerer
-	// knows whether to emit ucomiss (F32) or ucomisd (F64).
+	// Store the operand type in imm so the lowerer can emit correctly-sized
+	// comparisons. Float CMP needs this for ucomiss vs ucomisd. Signed integer
+	// CMP needs this for type-width CMP encoding — without it, zero-extended
+	// narrow values (e.g. i8(-1) = 0xFF) compare incorrectly under 64-bit CMP.
 	i64 imm = 0;
-	if (cmp_op >= FB_CMP_FEQ && cmp_op <= FB_CMP_FGE) {
+	bool needs_operand_type = (cmp_op >= FB_CMP_FEQ && cmp_op <= FB_CMP_FGE)
+	                       || (cmp_op >= FB_CMP_SLT && cmp_op <= FB_CMP_SGE);
+	if (needs_operand_type) {
 		Type *operand_type = lhs.type ? lhs.type : rhs.type;
 		if (operand_type != nullptr) {
 			imm = cast(i64)fb_type_pack(fb_data_type(operand_type));

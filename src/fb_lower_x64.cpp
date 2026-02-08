@@ -1217,10 +1217,41 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 			case FB_CMP_UGT: case FB_CMP_UGE: {
 				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
 				fbX64Reg rb = fb_x64_resolve_gp(ctx, inst->b, (1u << ra));
-				// CMP ra, rb: REX.W 39 /r (sub without storing result)
-				fb_x64_rex(ctx, true, rb, 0, ra);
-				fb_low_emit_byte(ctx, 0x39);
-				fb_x64_modrm(ctx, 0x03, rb, ra);
+				// Signed ordering comparisons on sub-64-bit types need
+				// type-width CMP. Values in registers are zero-extended
+				// (canonical form), so 64-bit signed CMP gives wrong
+				// results for negative narrow values (e.g. i8(-1)=0xFF
+				// would compare as 255 > 1 instead of -1 < 1).
+				// EQ/NE and unsigned comparisons are fine with 64-bit CMP.
+				bool is_signed = (inst->op >= FB_CMP_SLT && inst->op <= FB_CMP_SGE);
+				fbTypeKind cmp_tk = is_signed ? cast(fbTypeKind)(inst->imm & 0xFF) : FBT_I64;
+				switch (cmp_tk) {
+				case FBT_I8:
+					// CMP r/m8, r8: REX 38 /r (always REX to avoid AH/BH/CH/DH trap)
+					fb_x64_rex(ctx, false, rb, 0, ra);
+					fb_low_emit_byte(ctx, 0x38);
+					fb_x64_modrm(ctx, 0x03, rb, ra);
+					break;
+				case FBT_I16:
+					// CMP r/m16, r16: 66 [REX] 39 /r
+					fb_low_emit_byte(ctx, 0x66);
+					fb_x64_rex_if_needed(ctx, false, rb, 0, ra);
+					fb_low_emit_byte(ctx, 0x39);
+					fb_x64_modrm(ctx, 0x03, rb, ra);
+					break;
+				case FBT_I32:
+					// CMP r/m32, r32: [REX] 39 /r (no REX.W)
+					fb_x64_rex_if_needed(ctx, false, rb, 0, ra);
+					fb_low_emit_byte(ctx, 0x39);
+					fb_x64_modrm(ctx, 0x03, rb, ra);
+					break;
+				default:
+					// CMP r/m64, r64: REX.W 39 /r
+					fb_x64_rex(ctx, true, rb, 0, ra);
+					fb_low_emit_byte(ctx, 0x39);
+					fb_x64_modrm(ctx, 0x03, rb, ra);
+					break;
+				}
 				// SETcc rd_low: 0F (90+cc) modrm(03, 0, rd)
 				// Allocate rd, then emit setcc + movzx.
 				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, cast(u16)((1u << ra) | (1u << rb)));
