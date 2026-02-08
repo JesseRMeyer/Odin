@@ -463,6 +463,32 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 	case BuiltinProc_align_of:
 		return fb_emit_iconst(b, t_int, type_align_of(tv.type));
 
+	case BuiltinProc___entry_point: {
+		// Call the user's entry point procedure (package main :: main)
+		if (b->module->info->entry_point) {
+			u32 *proc_idx_ptr = map_get(&fb_entity_proc_map, b->module->info->entry_point);
+			if (proc_idx_ptr != nullptr) {
+				u32 proc_idx = *proc_idx_ptr;
+				fbValue target = fb_emit_symaddr(b, proc_idx);
+
+				// Entry point is Odin CC: pass context as the only arg
+				u32 aux_start = b->proc->aux_count;
+				u32 arg_count = 0;
+				if (b->context_stack.count > 0) {
+					fbContextData *ctx = &b->context_stack[b->context_stack.count - 1];
+					fbValue ctx_ptr = fb_addr_load(b, ctx->ctx);
+					fb_aux_push(b->proc, ctx_ptr.id);
+					arg_count = 1;
+				}
+				u32 r = fb_inst_emit(b->proc, FB_CALL, FB_VOID, target.id, aux_start, arg_count, 0, 0);
+				// Mark as Odin CC
+				fbInst *call_inst = &b->proc->insts[b->proc->inst_count - 1];
+				call_inst->flags = FBCC_ODIN;
+			}
+		}
+		return fb_value_nil();
+	}
+
 	default:
 		break;
 	}

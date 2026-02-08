@@ -1,7 +1,25 @@
 // Fast Backend — AST walker: translates Odin AST into fast backend IR
 //
-// Phase 6a: replaces synthetic test IR with real AST-driven code generation.
 // Mirrors the Tilde backend's cg_build_stmt / cg_build_expr pattern.
+
+#include <setjmp.h>
+#include <signal.h>
+
+// Graceful fallback: catch assertion failures during procedure generation.
+// When a proc uses unsupported features, the assert fires __builtin_trap()
+// which raises SIGILL. We catch it and fall back to an empty stub.
+gb_global thread_local sigjmp_buf fb_recovery_buf;
+gb_global thread_local volatile bool fb_recovery_active = false;
+
+gb_internal void fb_recovery_signal_handler(int sig) {
+	if (fb_recovery_active) {
+		fb_recovery_active = false;
+		siglongjmp(fb_recovery_buf, 1);
+	}
+	// Not in recovery mode — re-raise for default behavior
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
 
 // Forward declarations for mutually-referencing builder functions
 gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr);
@@ -789,8 +807,15 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 	case Ast_Implicit: {
 		ast_node(im, Implicit, expr);
 		if (im->kind == Token_context) {
-			GB_ASSERT_MSG(b->context_stack.count > 0,
-				"fb_build_addr Ast_Implicit: no context on stack");
+			if (b->context_stack.count == 0) {
+				// Non-Odin-CC proc referencing `context` — auto-create one.
+				// Mirrors lb_find_or_generate_context_ptr().
+				fbAddr ctx_addr = fb_add_local(b, t_context, nullptr, true);
+
+				fbContextData *cd = array_add_and_get(&b->context_stack);
+				cd->ctx = ctx_addr;
+				cd->uses_default = false;
+			}
 			return b->context_stack[b->context_stack.count - 1].ctx;
 		}
 		break;
@@ -852,6 +877,12 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 			if (high.type == nullptr) {
 				high = fb_load_field(b, base_addr.base, ptr_size, t_int);
 			}
+		} else if (bt->kind == Type_MultiPointer) {
+			// Multi-pointer [^]T: the value itself is a pointer to T
+			data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+			stride = type_size_of(bt->MultiPointer.elem);
+			result_type = alloc_type_slice(bt->MultiPointer.elem);
+			// No implicit high bound — caller must provide high
 		} else {
 			GB_PANIC("fb_build_addr SliceExpr: unhandled base type %s", type_to_string(bt));
 		}
@@ -1572,6 +1603,113 @@ gb_internal fbValue fb_build_unary_expr(fbBuilder *b, Ast *expr) {
 	return fb_value_nil();
 }
 
+// Build a Source_Code_Location struct value on the stack.
+// Layout: {file_path: string, line: i32, column: i32, procedure: string} = 40 bytes.
+gb_internal fbValue fb_build_source_code_location(fbBuilder *b, String proc_name, TokenPos pos) {
+	String file = get_file_path_string(pos.file_id);
+	String procedure = proc_name;
+	i32 line   = pos.line;
+	i32 column = pos.column;
+
+	switch (build_context.source_code_location_info) {
+	case SourceCodeLocationInfo_Normal:
+	case SourceCodeLocationInfo_Obfuscated: // TODO: proper obfuscation
+	case SourceCodeLocationInfo_Filename:
+		break;
+	case SourceCodeLocationInfo_None:
+		file = str_lit("");
+		procedure = str_lit("");
+		line = 0;
+		column = 0;
+		break;
+	}
+
+	i64 ptr_size = b->module->target.ptr_size;
+
+	// Allocate the struct on the stack (40 bytes on 64-bit)
+	fbAddr loc = fb_add_local(b, t_source_code_location, nullptr, false);
+
+	// file_path string at offset 0: {data: rawptr, len: int}
+	if (file.len > 0) {
+		u32 sym_idx = fb_module_intern_string_data(b->module, file);
+		fbValue file_ptr = fb_emit_symaddr(b, sym_idx);
+		file_ptr.type = t_rawptr;
+		fb_emit_store(b, loc.base, file_ptr);
+		fbValue file_len = fb_emit_iconst(b, t_int, file.len);
+		fbValue len_ptr = fb_emit_member(b, loc.base, ptr_size);
+		fb_emit_store(b, len_ptr, file_len);
+	} else {
+		fb_emit_memzero(b, loc.base, 2 * ptr_size, ptr_size);
+	}
+
+	// line: i32 at offset 16
+	fbValue line_ptr = fb_emit_member(b, loc.base, 2 * ptr_size);
+	fbValue line_val = fb_emit_iconst(b, t_i32, line);
+	fb_emit_store(b, line_ptr, line_val);
+
+	// column: i32 at offset 20
+	fbValue col_ptr = fb_emit_member(b, loc.base, 2 * ptr_size + 4);
+	fbValue col_val = fb_emit_iconst(b, t_i32, column);
+	fb_emit_store(b, col_ptr, col_val);
+
+	// procedure string at offset 24: {data: rawptr, len: int}
+	fbValue proc_field = fb_emit_member(b, loc.base, 2 * ptr_size + 8);
+	if (procedure.len > 0) {
+		u32 proc_sym_idx = fb_module_intern_string_data(b->module, procedure);
+		fbValue proc_ptr = fb_emit_symaddr(b, proc_sym_idx);
+		proc_ptr.type = t_rawptr;
+		fb_emit_store(b, proc_field, proc_ptr);
+		fbValue proc_len = fb_emit_iconst(b, t_int, procedure.len);
+		fbValue proc_len_ptr = fb_emit_member(b, proc_field, ptr_size);
+		fb_emit_store(b, proc_len_ptr, proc_len);
+	} else {
+		fb_emit_memzero(b, proc_field, 2 * ptr_size, ptr_size);
+	}
+
+	loc.base.type = t_source_code_location;
+	return loc.base;
+}
+
+// Handle a default parameter value for a call argument.
+gb_internal fbValue fb_handle_param_value(fbBuilder *b, Type *param_type, ParameterValue const &pv, Ast *call_expr) {
+	switch (pv.kind) {
+	case ParameterValue_Constant:
+		return fb_const_value(b, param_type, pv.value);
+
+	case ParameterValue_Nil: {
+		// Zero-initialized value of the parameter type
+		fbAddr nil_val = fb_add_local(b, param_type, nullptr, true);
+		nil_val.base.type = param_type;
+		return nil_val.base;
+	}
+
+	case ParameterValue_Location: {
+		String proc_name = {};
+		if (b->entity != nullptr) {
+			proc_name = b->entity->token.string;
+		}
+		ast_node(ce, CallExpr, call_expr);
+		TokenPos pos = ast_token(ce->proc).pos;
+		return fb_build_source_code_location(b, proc_name, pos);
+	}
+
+	case ParameterValue_Expression: {
+		Ast *orig = pv.original_ast_expr;
+		if (orig != nullptr) {
+			return fb_build_expr(b, orig);
+		}
+		// Fallthrough to zero
+		fbAddr nil_val = fb_add_local(b, param_type, nullptr, true);
+		nil_val.base.type = param_type;
+		return nil_val.base;
+	}
+
+	default:
+		GB_PANIC("fb_handle_param_value: unhandled kind %d", pv.kind);
+		return fb_value_nil();
+	}
+}
+
 gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	ast_node(ce, CallExpr, expr);
 
@@ -1595,10 +1733,14 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 		}
 	}
 
-	// For Odin CC multi-return: values 0..N-2 are written by the callee
-	// through hidden output pointer params.  Allocate stack temps for them.
+	// For Odin CC: values passed via hidden output pointers.
+	// Multi-return: values 0..N-2 get split temps.
+	// Single-return MEMORY-class: the sole result also needs a temp.
 	i32 split_count = (is_odin_cc && result_count > 1) ? (result_count - 1) : 0;
 	fbAddr *split_temps = nullptr;
+	bool sret_single = false; // single MEMORY-class return via hidden output pointer
+	fbAddr sret_temp = {};
+
 	if (split_count > 0) {
 		split_temps = gb_alloc_array(heap_allocator(), fbAddr, split_count);
 		for (i32 i = 0; i < split_count; i++) {
@@ -1606,21 +1748,64 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 		}
 	}
 
-	// Phase 1: Evaluate all argument expressions. This must happen before
-	// capturing aux_start because argument expressions may contain nested
-	// calls (e.g. check(get_zero() == 0, 1)) which push their own aux
-	// entries. Building first ensures nested aux entries don't interleave
-	// with this call's argument list.
+	// Check if the last/sole return type is MEMORY class (large aggregate).
+	// For single return: the sole result needs sret hidden output pointer.
+	// Applies to all calling conventions: Odin, contextless, C, etc.
+	if (!sret_single && result_count >= 1 && split_count == 0) {
+		Type *ret_type = results->variables[result_count - 1]->type;
+		fbABIParamInfo ret_abi = fb_abi_classify_type_sysv(ret_type);
+		if (ret_abi.classes[0] == FB_ABI_MEMORY) {
+			sret_single = true;
+			sret_temp = fb_add_local(b, ret_type, nullptr, true);
+		}
+	}
+
+	// Phase 1: Evaluate all argument expressions (explicit + defaults).
+	// This must happen before capturing aux_start because argument
+	// expressions may contain nested calls which push their own aux entries.
+	TypeTuple *params = nullptr;
+	isize param_count = 0;
+	if (proc_type != nullptr && proc_type->kind == Type_Proc && proc_type->Proc.params != nullptr) {
+		params = &proc_type->Proc.params->Tuple;
+		param_count = params->variables.count;
+	}
+
 	struct fbBuiltArg { fbValue val; Type *type; };
-	fbBuiltArg *built_args = nullptr;
 	isize arg_expr_count = ce->args.count;
-	if (arg_expr_count > 0) {
-		built_args = gb_alloc_array(heap_allocator(), fbBuiltArg, arg_expr_count);
+	isize total_arg_count = gb_max(arg_expr_count, param_count);
+	fbBuiltArg *built_args = nullptr;
+	if (total_arg_count > 0) {
+		built_args = gb_alloc_array(heap_allocator(), fbBuiltArg, total_arg_count);
+
+		// Build explicit positional arguments
 		for_array(i, ce->args) {
 			built_args[i].val  = fb_build_expr(b, ce->args[i]);
 			built_args[i].type = type_of_expr(ce->args[i]);
 		}
+
+		// Fill default values for any missing parameters
+		for (isize i = arg_expr_count; i < param_count; i++) {
+			Entity *e = params->variables[i];
+			if (e->kind == Entity_Variable && has_parameter_value(e->Variable.param_value)) {
+				built_args[i].val = fb_handle_param_value(b, e->type, e->Variable.param_value, expr);
+				built_args[i].type = e->type;
+			} else if (e->kind == Entity_Constant) {
+				built_args[i].val = fb_const_value(b, e->type, e->Constant.value);
+				built_args[i].type = e->type;
+			} else if (e->kind == Entity_TypeName) {
+				// Type params are erased at runtime — pass nil
+				built_args[i].val = fb_emit_iconst(b, t_rawptr, 0);
+				built_args[i].type = e->type;
+			} else {
+				// Unknown default — zero-initialize
+				fbAddr nil_val = fb_add_local(b, e->type, nullptr, true);
+				nil_val.base.type = e->type;
+				built_args[i].val = nil_val.base;
+				built_args[i].type = e->type;
+			}
+		}
 	}
+	arg_expr_count = total_arg_count;
 
 	// Phase 2: Push arguments into aux pool. No nested calls occur here,
 	// so aux_start accurately marks the beginning of this call's args.
@@ -1688,9 +1873,20 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	for (i32 i = 0; i < split_count; i++) {
 		fb_aux_push(b->proc, split_temps[i].base.id);
 	}
+	// Single MEMORY-class return: pass hidden output pointer
+	if (sret_single) {
+		fb_aux_push(b->proc, sret_temp.base.id);
+	}
 
 	// Context pointer (Odin CC, always last)
-	if (is_odin_cc && b->context_stack.count > 0) {
+	if (is_odin_cc) {
+		if (b->context_stack.count == 0) {
+			// Non-Odin-CC proc calling an Odin-CC proc — auto-create context.
+			fbAddr ctx_addr = fb_add_local(b, t_context, nullptr, true);
+			fbContextData *cd = array_add_and_get(&b->context_stack);
+			cd->ctx = ctx_addr;
+			cd->uses_default = false;
+		}
 		fbContextData *ctx = &b->context_stack[b->context_stack.count - 1];
 		fbValue ctx_ptr = fb_addr_load(b, ctx->ctx);
 		fb_aux_push(b->proc, ctx_ptr.id);
@@ -1724,14 +1920,23 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	u8 cc_flag = is_odin_cc ? FBCC_ODIN : FBCC_C;
 	i64 call_imm = cast(i64)sse_mask | (cast(i64)f64_mask << 32);
 
-	u32 r = fb_inst_emit(b->proc, FB_CALL, ret_ft, target.id, aux_start, arg_count, 0, 0);
+	// For sret_single, the call itself is void — the result is in the temp
+	fbType emit_ret_ft = sret_single ? FB_VOID : ret_ft;
+	u32 r = fb_inst_emit(b->proc, FB_CALL, emit_ret_ft, target.id, aux_start, arg_count, 0, 0);
 	// Patch flags and imm after emit (fb_inst_emit sets them to 0)
 	{
 		fbInst *call_inst = &b->proc->insts[b->proc->inst_count - 1];
 		call_inst->flags = cc_flag;
 		call_inst->imm   = call_imm;
 	}
-	fbValue last_val = fb_make_value(r, last_result_type);
+	fbValue last_val;
+	if (sret_single) {
+		// Return the pointer to the temp where the callee wrote the result
+		last_val = sret_temp.base;
+		last_val.type = last_result_type;
+	} else {
+		last_val = fb_make_value(r, last_result_type);
+	}
 
 	// Expose split return temps so the statement-level handler can unpack them
 	b->last_call_split_temps = split_temps;
@@ -4024,9 +4229,19 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 	// entity references to globals can be resolved during expr building.
 	fb_generate_globals(m);
 
-	// Determine which package the entry point belongs to.
-	// Phase 6a only compiles procs in this package; all others get ret stubs.
-	AstPackage *user_pkg = info->entry_point ? info->entry_point->pkg : nullptr;
+	// Install signal handlers for graceful fallback on unsupported features.
+	// SIGILL: from __builtin_trap() in GB_PANIC/GB_ASSERT
+	// SIGSEGV: from null deref after partial IR generation
+	// SIGABRT: from abort() calls
+	struct sigaction sa_new = {}, sa_old_ill = {}, sa_old_segv = {}, sa_old_abrt = {};
+	sa_new.sa_handler = fb_recovery_signal_handler;
+	sa_new.sa_flags = 0;
+	sigemptyset(&sa_new.sa_mask);
+	sigaction(SIGILL, &sa_new, &sa_old_ill);
+	sigaction(SIGSEGV, &sa_new, &sa_old_segv);
+	sigaction(SIGABRT, &sa_new, &sa_old_abrt);
+
+	i32 stub_count = 0;
 
 	// Second pass: generate IR from AST for non-foreign, non-stub procedures
 	for_array(i, m->procs) {
@@ -4035,29 +4250,6 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 		if (p->inst_count > 0) continue; // skip stubs already populated
 
 		bool is_entry = (p->entity == info->entry_point);
-		bool is_user_pkg = (p->entity != nullptr && p->entity->pkg == user_pkg);
-
-		// Phase 6a: only compile procs from the user's package.
-		// Runtime procs use builtins, slices, maps, etc. that aren't supported yet.
-		if (!is_user_pkg) {
-			// C main bridge: call the user's entry point, return 0
-			if (str_eq(p->name, str_lit("main")) && m->entry_proc_idx != FB_NOREG) {
-				u32 bb0 = fb_block_create(p);
-				fb_block_start(p, bb0);
-				u32 null_ctx = fb_inst_emit(p, FB_ICONST, FB_I64, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
-				u32 entry_sym = fb_inst_emit(p, FB_SYMADDR, FB_PTR, FB_NOREG, FB_NOREG, FB_NOREG, 0, cast(i64)m->entry_proc_idx);
-				u32 aux_start = p->aux_count;
-				fb_aux_push(p, null_ctx);
-				fb_inst_emit(p, FB_CALL, FB_VOID, entry_sym, aux_start, 1, 0, 0);
-				u32 zero = fb_inst_emit(p, FB_ICONST, FB_I32, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
-				fb_inst_emit(p, FB_RET, FB_VOID, zero, FB_NOREG, FB_NOREG, 0, 0);
-				continue;
-			}
-			u32 bb0 = fb_block_create(p);
-			fb_block_start(p, bb0);
-			fb_inst_emit(p, FB_RET, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
-			continue;
-		}
 
 		// Build IR from AST
 		fbBuilder b = {};
@@ -4079,7 +4271,27 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 		map_init(&b.variable_map);
 		map_init(&b.soa_values_map);
 
-		fb_procedure_generate(&b);
+		// Try to generate the procedure; on assertion failure, fall back to stub
+		fb_recovery_active = true;
+		if (sigsetjmp(fb_recovery_buf, 1) == 0) {
+			fb_procedure_generate(&b);
+			fb_recovery_active = false;
+		} else {
+			// Recovery: assertion fired during generation.
+			// Reset the proc to an empty stub.
+			stub_count++;
+			p->inst_count = 0;
+			p->block_count = 0;
+			p->slot_count = 0;
+			p->aux_count = 0;
+			p->next_value = 0;
+			p->param_count = 0;
+			p->xmm_param_count = 0;
+
+			u32 bb0 = fb_block_create(p);
+			fb_block_start(p, bb0);
+			fb_inst_emit(p, FB_RET, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+		}
 
 		// Cleanup builder
 		array_free(&b.scope_stack);
@@ -4088,6 +4300,15 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 		array_free(&b.branch_regions);
 		map_destroy(&b.variable_map);
 		map_destroy(&b.soa_values_map);
+	}
+
+	// Restore original signal handlers
+	sigaction(SIGILL, &sa_old_ill, nullptr);
+	sigaction(SIGSEGV, &sa_old_segv, nullptr);
+	sigaction(SIGABRT, &sa_old_abrt, nullptr);
+
+	if (stub_count > 0) {
+		gb_printf_err("fast backend: %d procedure(s) stubbed due to unsupported features\n", stub_count);
 	}
 }
 

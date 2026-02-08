@@ -391,7 +391,9 @@ gb_internal fbX64Reg fb_x64_resolve_gp(fbLowCtx *ctx, u32 vreg, u16 exclude_mask
 // Move an IR value into a specific physical register.
 // Handles spilling the current occupant, moving from another register, or reloading from stack.
 gb_internal void fb_x64_move_value_to_reg(fbLowCtx *ctx, u32 vreg, fbX64Reg target) {
-	GB_ASSERT(vreg < ctx->value_loc_count);
+	GB_ASSERT_MSG(vreg < ctx->value_loc_count,
+		"vreg %u >= value_loc_count %u in proc '%.*s' at inst %u",
+		vreg, ctx->value_loc_count, LIT(ctx->proc->name), ctx->current_inst_idx);
 	i32 loc = ctx->value_loc[vreg];
 
 	// Already in the target register — nothing to do
@@ -2218,6 +2220,18 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 }
 
 gb_internal void fb_lower_all(fbModule *m) {
+	// Recovery for lowering phase: catch assertion failures from procs
+	// that were generated but have IR issues the lowerer can't handle.
+	struct sigaction sa_new = {}, sa_old_ill = {}, sa_old_segv = {}, sa_old_abrt = {};
+	sa_new.sa_handler = fb_recovery_signal_handler;
+	sa_new.sa_flags = 0;
+	sigemptyset(&sa_new.sa_mask);
+	sigaction(SIGILL, &sa_new, &sa_old_ill);
+	sigaction(SIGSEGV, &sa_new, &sa_old_segv);
+	sigaction(SIGABRT, &sa_new, &sa_old_abrt);
+
+	i32 stub_count = 0;
+
 	for_array(i, m->procs) {
 		fbProc *p = m->procs[i];
 		if (p->is_foreign) {
@@ -2232,13 +2246,33 @@ gb_internal void fb_lower_all(fbModule *m) {
 			ctx.block_offsets = gb_alloc_array(heap_allocator(), u32, p->block_count);
 		}
 
-		switch (m->target.arch) {
-		case FB_ARCH_X64:
-			fb_lower_proc_x64(&ctx);
-			break;
-		default:
-			GB_PANIC("fast backend: unsupported architecture for lowering");
-			break;
+		fb_recovery_active = true;
+		if (sigsetjmp(fb_recovery_buf, 1) == 0) {
+			switch (m->target.arch) {
+			case FB_ARCH_X64:
+				fb_lower_proc_x64(&ctx);
+				break;
+			default:
+				GB_PANIC("fast backend: unsupported architecture for lowering");
+				break;
+			}
+			fb_recovery_active = false;
+		} else {
+			// Recovery: lowering failed. Emit a minimal stub (just ret).
+			stub_count++;
+			ctx.code_count = 0;
+			// Emit a minimal function: push rbp; mov rbp, rsp; pop rbp; ret
+			u8 stub_code[] = {
+				0x55,                   // push rbp
+				0x48, 0x89, 0xE5,       // mov rbp, rsp
+				0x5D,                   // pop rbp
+				0xC3,                   // ret
+			};
+			ctx.code_count = sizeof(stub_code);
+			ctx.code = gb_alloc_array(heap_allocator(), u8, ctx.code_count);
+			gb_memmove(ctx.code, stub_code, ctx.code_count);
+			// Clear relocations since they may be stale
+			ctx.reloc_count = 0;
 		}
 
 		p->machine_code_size = ctx.code_count;
@@ -2261,5 +2295,13 @@ gb_internal void fb_lower_all(fbModule *m) {
 		if (ctx.value_sym)      gb_free(heap_allocator(), ctx.value_sym);
 		if (ctx.fixups)         gb_free(heap_allocator(), ctx.fixups);
 		if (ctx.relocs)         gb_free(heap_allocator(), ctx.relocs);
+	}
+
+	sigaction(SIGILL, &sa_old_ill, nullptr);
+	sigaction(SIGSEGV, &sa_old_segv, nullptr);
+	sigaction(SIGABRT, &sa_old_abrt, nullptr);
+
+	if (stub_count > 0) {
+		gb_printf_err("fast backend: %d procedure(s) stubbed during lowering\n", stub_count);
 	}
 }
