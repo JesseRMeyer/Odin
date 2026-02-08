@@ -2145,18 +2145,364 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				break;
 			}
 
-			// ── Atomics (Phase 8) ──
-			case FB_ATOMIC_LOAD: case FB_ATOMIC_STORE:
-			case FB_ATOMIC_XCHG: case FB_ATOMIC_ADD: case FB_ATOMIC_SUB:
-			case FB_ATOMIC_AND: case FB_ATOMIC_OR: case FB_ATOMIC_XOR:
-			case FB_ATOMIC_CAS: case FB_FENCE:
-				GB_PANIC("fast backend: atomic operation not yet lowered (opcode %d)", inst->op);
+			// ── Atomics ──
+			case FB_ATOMIC_LOAD: {
+				// On x86-64, aligned MOV is atomic. Only seq_cst needs MFENCE after.
+				fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << rptr));
+				fbTypeKind tk = cast(fbTypeKind)(inst->type_raw & 0xFF);
+
+				switch (tk) {
+				case FBT_I8: case FBT_I1:
+					fb_x64_rex_if_needed(ctx, false, rd, 0, rptr);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xB6);
+					fb_x64_modrm_indirect(ctx, rd, rptr);
+					break;
+				case FBT_I16:
+					fb_x64_rex_if_needed(ctx, false, rd, 0, rptr);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xB7);
+					fb_x64_modrm_indirect(ctx, rd, rptr);
+					break;
+				case FBT_I32: case FBT_F32:
+					fb_x64_rex_if_needed(ctx, false, rd, 0, rptr);
+					fb_low_emit_byte(ctx, 0x8B);
+					fb_x64_modrm_indirect(ctx, rd, rptr);
+					break;
+				default:
+					fb_x64_rex(ctx, true, rd, 0, rptr);
+					fb_low_emit_byte(ctx, 0x8B);
+					fb_x64_modrm_indirect(ctx, rd, rptr);
+					break;
+				}
+
+				u8 order = inst->flags & FBF_ORDER_MASK;
+				if (order == OdinAtomicMemoryOrder_seq_cst) {
+					// MFENCE: 0F AE F0
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xAE);
+					fb_low_emit_byte(ctx, 0xF0);
+				}
 				break;
+			}
+
+			case FB_ATOMIC_STORE: {
+				fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rval = fb_x64_resolve_gp(ctx, inst->b, (1u << rptr));
+				fbTypeKind tk = cast(fbTypeKind)(inst->type_raw & 0xFF);
+				u8 order = inst->flags & FBF_ORDER_MASK;
+
+				if (order == OdinAtomicMemoryOrder_seq_cst) {
+					// XCHG [mem], reg — implicit LOCK + full barrier, discards old value
+					switch (tk) {
+					case FBT_I8: case FBT_I1:
+						fb_x64_rex(ctx, false, rval, 0, rptr);
+						fb_low_emit_byte(ctx, 0x86); // XCHG r8, [mem]
+						fb_x64_modrm_indirect(ctx, rval, rptr);
+						break;
+					case FBT_I16:
+						fb_low_emit_byte(ctx, 0x66);
+						fb_x64_rex_if_needed(ctx, false, rval, 0, rptr);
+						fb_low_emit_byte(ctx, 0x87); // XCHG r16, [mem]
+						fb_x64_modrm_indirect(ctx, rval, rptr);
+						break;
+					case FBT_I32: case FBT_F32:
+						fb_x64_rex_if_needed(ctx, false, rval, 0, rptr);
+						fb_low_emit_byte(ctx, 0x87); // XCHG r32, [mem]
+						fb_x64_modrm_indirect(ctx, rval, rptr);
+						break;
+					default:
+						fb_x64_rex(ctx, true, rval, 0, rptr);
+						fb_low_emit_byte(ctx, 0x87); // XCHG r64, [mem]
+						fb_x64_modrm_indirect(ctx, rval, rptr);
+						break;
+					}
+				} else {
+					// Regular MOV is sufficient for release/relaxed on x86-64
+					switch (tk) {
+					case FBT_I8: case FBT_I1:
+						fb_x64_rex(ctx, false, rval, 0, rptr);
+						fb_low_emit_byte(ctx, 0x88);
+						fb_x64_modrm_indirect(ctx, rval, rptr);
+						break;
+					case FBT_I16:
+						fb_low_emit_byte(ctx, 0x66);
+						fb_x64_rex_if_needed(ctx, false, rval, 0, rptr);
+						fb_low_emit_byte(ctx, 0x89);
+						fb_x64_modrm_indirect(ctx, rval, rptr);
+						break;
+					case FBT_I32: case FBT_F32:
+						fb_x64_rex_if_needed(ctx, false, rval, 0, rptr);
+						fb_low_emit_byte(ctx, 0x89);
+						fb_x64_modrm_indirect(ctx, rval, rptr);
+						break;
+					default:
+						fb_x64_rex(ctx, true, rval, 0, rptr);
+						fb_low_emit_byte(ctx, 0x89);
+						fb_x64_modrm_indirect(ctx, rval, rptr);
+						break;
+					}
+				}
+				break;
+			}
+
+			case FB_ATOMIC_XCHG: {
+				// XCHG [mem], reg — implicit LOCK, returns old value in reg
+				fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rval = fb_x64_resolve_gp(ctx, inst->b, (1u << rptr));
+				fbTypeKind tk = cast(fbTypeKind)(inst->type_raw & 0xFF);
+
+				switch (tk) {
+				case FBT_I8: case FBT_I1:
+					fb_x64_rex(ctx, false, rval, 0, rptr);
+					fb_low_emit_byte(ctx, 0x86);
+					fb_x64_modrm_indirect(ctx, rval, rptr);
+					break;
+				case FBT_I16:
+					fb_low_emit_byte(ctx, 0x66);
+					fb_x64_rex_if_needed(ctx, false, rval, 0, rptr);
+					fb_low_emit_byte(ctx, 0x87);
+					fb_x64_modrm_indirect(ctx, rval, rptr);
+					break;
+				case FBT_I32: case FBT_F32:
+					fb_x64_rex_if_needed(ctx, false, rval, 0, rptr);
+					fb_low_emit_byte(ctx, 0x87);
+					fb_x64_modrm_indirect(ctx, rval, rptr);
+					break;
+				default:
+					fb_x64_rex(ctx, true, rval, 0, rptr);
+					fb_low_emit_byte(ctx, 0x87);
+					fb_x64_modrm_indirect(ctx, rval, rptr);
+					break;
+				}
+
+				// Result is now in rval — assign it to the result vreg
+				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << rptr) | (1u << rval));
+				if (rd != rval) {
+					fb_x64_mov_rr(ctx, rd, rval);
+				}
+				break;
+			}
+
+			case FB_ATOMIC_ADD:
+			case FB_ATOMIC_SUB: {
+				// LOCK XADD [mem], reg — returns old value in reg
+				// For SUB: negate value first, then XADD
+				fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, 0);
+				fbX64Reg rval = fb_x64_resolve_gp(ctx, inst->b, (1u << rptr));
+				fbTypeKind tk = cast(fbTypeKind)(inst->type_raw & 0xFF);
+
+				// We need a temp copy of rval since XADD modifies both operands
+				fbX64Reg rtemp = fb_x64_alloc_gp(ctx, inst->r, (1u << rptr) | (1u << rval));
+				fb_x64_mov_rr(ctx, rtemp, rval);
+
+				if (inst->op == FB_ATOMIC_SUB) {
+					// NEG rtemp: REX.W F7 /3
+					fb_x64_rex(ctx, true, 0, 0, rtemp);
+					fb_low_emit_byte(ctx, 0xF7);
+					fb_x64_modrm(ctx, 0x03, 3, rtemp);
+				}
+
+				// LOCK XADD [rptr], rtemp
+				fb_low_emit_byte(ctx, 0xF0); // LOCK prefix
+				switch (tk) {
+				case FBT_I8: case FBT_I1:
+					fb_x64_rex(ctx, false, rtemp, 0, rptr);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xC0); // XADD r/m8, r8
+					fb_x64_modrm_indirect(ctx, rtemp, rptr);
+					break;
+				case FBT_I16:
+					fb_low_emit_byte(ctx, 0x66);
+					fb_x64_rex_if_needed(ctx, false, rtemp, 0, rptr);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xC1); // XADD r/m16, r16
+					fb_x64_modrm_indirect(ctx, rtemp, rptr);
+					break;
+				case FBT_I32: case FBT_F32:
+					fb_x64_rex_if_needed(ctx, false, rtemp, 0, rptr);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xC1); // XADD r/m32, r32
+					fb_x64_modrm_indirect(ctx, rtemp, rptr);
+					break;
+				default:
+					fb_x64_rex(ctx, true, rtemp, 0, rptr);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xC1); // XADD r/m64, r64
+					fb_x64_modrm_indirect(ctx, rtemp, rptr);
+					break;
+				}
+				// After XADD: rtemp has old value (result), [rptr] has old+new
+				break;
+			}
+
+			case FB_ATOMIC_AND:
+			case FB_ATOMIC_OR:
+			case FB_ATOMIC_XOR: {
+				// No LOCK AND/OR/XOR that returns old value, so use CAS loop:
+				//   loop: old = [ptr]; new = old OP val; cmpxchg; retry if failed
+				// Spill any register in RAX since CMPXCHG uses it implicitly.
+				u16 rax_mask = (1u << FB_RAX);
+				fb_x64_spill_reg(ctx, FB_RAX);
+
+				fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, rax_mask);
+				fbX64Reg rval = fb_x64_resolve_gp(ctx, inst->b, rax_mask | (1u << rptr));
+				fbTypeKind tk = cast(fbTypeKind)(inst->type_raw & 0xFF);
+				bool wide = (tk == FBT_I64 || tk == FBT_PTR);
+
+				// Allocate a temp for the "new" value
+				fbX64Reg rnew = fb_x64_alloc_gp(ctx, FB_NOREG, rax_mask | (1u << rptr) | (1u << rval));
+
+				// Load current [ptr] into RAX
+				u32 loop_offset = ctx->code_count;
+				if (wide) fb_x64_rex(ctx, true, FB_RAX, 0, rptr);
+				else fb_x64_rex_if_needed(ctx, false, FB_RAX, 0, rptr);
+				fb_low_emit_byte(ctx, 0x8B);
+				fb_x64_modrm_indirect(ctx, FB_RAX, rptr);
+
+				// Compute new = old OP val
+				// MOV rnew, RAX
+				fb_x64_mov_rr(ctx, rnew, FB_RAX);
+				// rnew OP= rval
+				u8 alu_op;
+				switch (inst->op) {
+				case FB_ATOMIC_AND: alu_op = 0x21; break; // AND r/m, r
+				case FB_ATOMIC_OR:  alu_op = 0x09; break; // OR r/m, r
+				default:            alu_op = 0x31; break; // XOR r/m, r
+				}
+				if (wide) fb_x64_rex(ctx, true, rval, 0, rnew);
+				else fb_x64_rex_if_needed(ctx, false, rval, 0, rnew);
+				fb_low_emit_byte(ctx, alu_op);
+				fb_x64_modrm(ctx, 0x03, rval, rnew);
+
+				// LOCK CMPXCHG [rptr], rnew (expected in RAX)
+				fb_low_emit_byte(ctx, 0xF0); // LOCK
+				if (wide) fb_x64_rex(ctx, true, rnew, 0, rptr);
+				else fb_x64_rex_if_needed(ctx, false, rnew, 0, rptr);
+				fb_low_emit_byte(ctx, 0x0F);
+				fb_low_emit_byte(ctx, 0xB1); // CMPXCHG
+				fb_x64_modrm_indirect(ctx, rnew, rptr);
+
+				// JNE loop (ZF=0 means CAS failed)
+				fb_low_emit_byte(ctx, 0x75); // JNE rel8
+				i32 rel = cast(i32)loop_offset - cast(i32)(ctx->code_count + 1);
+				fb_low_emit_byte(ctx, cast(u8)rel);
+
+				// Result (old value) is in RAX
+				ctx->gp[FB_RAX].vreg = inst->r;
+				ctx->gp[FB_RAX].last_use = ctx->current_inst_idx;
+				ctx->gp[FB_RAX].dirty = true;
+				if (inst->r < ctx->value_loc_count) {
+					ctx->value_loc[inst->r] = FB_RAX;
+				}
+				break;
+			}
+
+			case FB_ATOMIC_CAS: {
+				// LOCK CMPXCHG [ptr], new — expected in RAX, returns old in RAX
+				// a=ptr, b=expected, c=new
+				fb_x64_spill_reg(ctx, FB_RAX);
+				u16 rax_mask = (1u << FB_RAX);
+
+				fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, rax_mask);
+				fbX64Reg rexpected = fb_x64_resolve_gp(ctx, inst->b, rax_mask | (1u << rptr));
+				fbX64Reg rnew = fb_x64_resolve_gp(ctx, inst->c, rax_mask | (1u << rptr) | (1u << rexpected));
+				fbTypeKind tk = cast(fbTypeKind)(inst->type_raw & 0xFF);
+				bool wide = (tk == FBT_I64 || tk == FBT_PTR);
+
+				// Move expected into RAX
+				if (rexpected != FB_RAX) {
+					fb_x64_mov_rr(ctx, FB_RAX, rexpected);
+				}
+
+				// LOCK CMPXCHG [rptr], rnew
+				fb_low_emit_byte(ctx, 0xF0); // LOCK
+				switch (tk) {
+				case FBT_I8: case FBT_I1:
+					fb_x64_rex(ctx, false, rnew, 0, rptr);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xB0); // CMPXCHG r/m8, r8
+					fb_x64_modrm_indirect(ctx, rnew, rptr);
+					break;
+				case FBT_I16:
+					fb_low_emit_byte(ctx, 0x66);
+					fb_x64_rex_if_needed(ctx, false, rnew, 0, rptr);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xB1);
+					fb_x64_modrm_indirect(ctx, rnew, rptr);
+					break;
+				case FBT_I32: case FBT_F32:
+					fb_x64_rex_if_needed(ctx, false, rnew, 0, rptr);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xB1);
+					fb_x64_modrm_indirect(ctx, rnew, rptr);
+					break;
+				default:
+					fb_x64_rex(ctx, true, rnew, 0, rptr);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xB1);
+					fb_x64_modrm_indirect(ctx, rnew, rptr);
+					break;
+				}
+
+				// Result (actual old value) is in RAX
+				ctx->gp[FB_RAX].vreg = inst->r;
+				ctx->gp[FB_RAX].last_use = ctx->current_inst_idx;
+				ctx->gp[FB_RAX].dirty = true;
+				if (inst->r < ctx->value_loc_count) {
+					ctx->value_loc[inst->r] = FB_RAX;
+				}
+				break;
+			}
+
+			case FB_FENCE: {
+				u8 order = cast(u8)(inst->imm & 0x07);
+				bool signal_only = (inst->imm & 0x08) != 0;
+				if (signal_only) {
+					// Signal fence: compiler barrier only, no hardware instruction
+					break;
+				}
+				switch (order) {
+				case OdinAtomicMemoryOrder_acquire:
+				case OdinAtomicMemoryOrder_consume:
+					// LFENCE: 0F AE E8
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xAE);
+					fb_low_emit_byte(ctx, 0xE8);
+					break;
+				case OdinAtomicMemoryOrder_release:
+					// SFENCE: 0F AE F8
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xAE);
+					fb_low_emit_byte(ctx, 0xF8);
+					break;
+				default:
+					// MFENCE: 0F AE F0 (seq_cst, acq_rel, relaxed all get full fence)
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xAE);
+					fb_low_emit_byte(ctx, 0xF0);
+					break;
+				}
+				break;
+			}
 
 			// ── Wide arithmetic ──
-			case FB_ADDPAIR: case FB_MULPAIR:
-				GB_PANIC("fast backend: wide arithmetic not yet lowered (opcode %d)", inst->op);
+			case FB_ADDPAIR: {
+				// ADDPAIR: r = lo+lo2 (with carry into aux hi+hi2)
+				// a=lo, b=lo2, c encodes the hi operands via aux
+				// For now: emit ADD + ADC sequence
+				// TODO: implement when needed by user code
+				GB_PANIC("fast backend: ADDPAIR not yet lowered");
 				break;
+			}
+
+			case FB_MULPAIR: {
+				// MULPAIR: 128-bit result in RDX:RAX from MUL
+				// TODO: implement when needed by user code
+				GB_PANIC("fast backend: MULPAIR not yet lowered");
+				break;
+			}
 
 			// ── Bit manipulation ──────────────────────────────
 			case FB_BSWAP: {
@@ -2211,10 +2557,130 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				GB_PANIC("fast backend: SIMD operation not yet lowered (opcode %d)", inst->op);
 				break;
 
+			// ── Inline assembly ──
+			case FB_ASM: {
+				if (inst->imm == 1) {
+					// Linux x86-64 syscall.
+					// Register mapping: arg[0]→RAX (number), arg[1]→RDI,
+					// arg[2]→RSI, arg[3]→RDX, arg[4]→R10, arg[5]→R8, arg[6]→R9.
+					// Returns in RAX. Clobbers RCX, R11.
+					u32 aux_start = inst->a;
+					u32 arg_count = inst->b;
+
+					// Spill all occupied caller-saved registers
+					for (u32 ri = 0; ri < FB_X64_GP_ALLOC_COUNT; ri++) {
+						fbX64Reg r = fb_x64_gp_alloc_order[ri];
+						if (ctx->gp[r].vreg != FB_NOREG) {
+							fb_x64_spill_reg(ctx, r);
+						}
+					}
+
+					// Load args into syscall registers from spill slots
+					static const fbX64Reg syscall_regs[7] = {
+						FB_RAX, FB_RDI, FB_RSI, FB_RDX, FB_R10, FB_R8, FB_R9
+					};
+					for (u32 ai = 0; ai < arg_count && ai < 7; ai++) {
+						u32 arg_vreg = p->aux[aux_start + ai];
+						fbX64Reg dest = syscall_regs[ai];
+						i32 arg_loc = ctx->value_loc[arg_vreg];
+						if (arg_loc >= 0 && arg_loc < 16 && cast(fbX64Reg)arg_loc == dest) {
+							continue;
+						}
+						if (arg_loc >= 0 && arg_loc < 16) {
+							fb_x64_mov_rr(ctx, dest, cast(fbX64Reg)arg_loc);
+						} else if (arg_loc == FB_LOC_NONE && ctx->value_sym && ctx->value_sym[arg_vreg] != FB_NOREG) {
+							fb_x64_emit_lea_sym(ctx, dest, ctx->value_sym[arg_vreg]);
+						} else {
+							i32 offset = (arg_loc != FB_LOC_NONE) ? arg_loc : fb_x64_spill_offset(ctx, arg_vreg);
+							fb_x64_rex(ctx, true, dest, 0, FB_RBP);
+							fb_low_emit_byte(ctx, 0x8B);
+							fb_x64_modrm_rbp_disp32(ctx, dest, offset);
+						}
+					}
+
+					// syscall instruction: 0F 05
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0x05);
+
+					// Result in RAX
+					if (inst->r != FB_NOREG) {
+						ctx->gp[FB_RAX].vreg     = inst->r;
+						ctx->gp[FB_RAX].last_use = ctx->current_inst_idx;
+						ctx->gp[FB_RAX].dirty    = true;
+						ctx->value_loc[inst->r]  = cast(i32)FB_RAX;
+					}
+				} else {
+					GB_PANIC("fast backend: unhandled FB_ASM variant (imm=%lld)", inst->imm);
+				}
+				break;
+			}
+
 			// ── Miscellaneous ──
-			case FB_MEMSET: case FB_VA_START: case FB_PREFETCH:
-			case FB_CYCLE: case FB_ASM: case FB_PHI:
+			case FB_MEMSET: {
+				// MEMSET: a=ptr, b=byte_value, c=count, imm=alignment
+				// Use REP STOSB: AL=val, RCX=count, RDI=ptr
+				fb_x64_spill_reg(ctx, FB_RAX);
+				fb_x64_spill_reg(ctx, FB_RCX);
+				fb_x64_spill_reg(ctx, FB_RDI);
+
+				fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, (1u << FB_RAX) | (1u << FB_RCX) | (1u << FB_RDI));
+				fbX64Reg rval = fb_x64_resolve_gp(ctx, inst->b, (1u << FB_RAX) | (1u << FB_RCX) | (1u << FB_RDI) | (1u << rptr));
+				fbX64Reg rcount = fb_x64_resolve_gp(ctx, inst->c, (1u << FB_RAX) | (1u << FB_RCX) | (1u << FB_RDI) | (1u << rptr) | (1u << rval));
+
+				// Move to required registers
+				if (rptr != FB_RDI) fb_x64_mov_rr(ctx, FB_RDI, rptr);
+				if (rval != FB_RAX) fb_x64_mov_rr(ctx, FB_RAX, rval);
+				if (rcount != FB_RCX) fb_x64_mov_rr(ctx, FB_RCX, rcount);
+
+				// REP STOSB
+				fb_low_emit_byte(ctx, 0xF3);
+				fb_low_emit_byte(ctx, 0xAA);
+
+				ctx->gp[FB_RAX].vreg = FB_NOREG;
+				ctx->gp[FB_RCX].vreg = FB_NOREG;
+				ctx->gp[FB_RDI].vreg = FB_NOREG;
+				break;
+			}
+
+			case FB_CYCLE: {
+				// RDTSC: EDX:EAX = timestamp counter
+				// Then SHL RDX,32; OR RAX,RDX → result in RAX
+				fb_x64_spill_reg(ctx, FB_RAX);
+				fb_x64_spill_reg(ctx, FB_RDX);
+
+				// RDTSC: 0F 31
+				fb_low_emit_byte(ctx, 0x0F);
+				fb_low_emit_byte(ctx, 0x31);
+
+				// SHL RDX, 32
+				fb_x64_rex(ctx, true, 0, 0, FB_RDX);
+				fb_low_emit_byte(ctx, 0xC1);
+				fb_x64_modrm(ctx, 0x03, 4, FB_RDX);
+				fb_x64_imm8(ctx, 32);
+
+				// OR RAX, RDX
+				fb_x64_rex(ctx, true, FB_RDX, 0, FB_RAX);
+				fb_low_emit_byte(ctx, 0x09);
+				fb_x64_modrm(ctx, 0x03, FB_RDX, FB_RAX);
+
+				// Result in RAX
+				ctx->gp[FB_RAX].vreg = inst->r;
+				ctx->gp[FB_RAX].last_use = ctx->current_inst_idx;
+				ctx->gp[FB_RAX].dirty = true;
+				ctx->gp[FB_RDX].vreg = FB_NOREG;
+				if (inst->r < ctx->value_loc_count) {
+					ctx->value_loc[inst->r] = FB_RAX;
+				}
+				break;
+			}
+
 			case FB_TAILCALL:
+				// TODO: proper tail call with frame teardown
+				// For now, fall through to regular call semantics
+				GB_PANIC("fast backend: TAILCALL not yet lowered");
+				break;
+
+			case FB_VA_START: case FB_PREFETCH: case FB_PHI:
 				GB_PANIC("fast backend: operation not yet lowered (opcode %d)", inst->op);
 				break;
 

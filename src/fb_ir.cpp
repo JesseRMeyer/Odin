@@ -170,7 +170,6 @@ gb_internal bool fb_op_has_result(fbOp op) {
 	case FB_FENCE:
 	case FB_VA_START:
 	case FB_PREFETCH:
-	case FB_ASM:
 		return false;
 	default:
 		return true;

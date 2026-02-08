@@ -36,9 +36,10 @@ gb_internal void fb_setup_params(fbProc *p) {
 	GB_ASSERT(pt != nullptr && pt->kind == Type_Proc);
 
 	TypeProc *proc_type = &pt->Proc;
-	bool is_odin_cc = (proc_type->calling_convention == ProcCC_Odin);
+	bool is_odin_like = is_calling_convention_odin(proc_type->calling_convention);
+	bool has_context  = (proc_type->calling_convention == ProcCC_Odin);
 
-	if (proc_type->params == nullptr && !is_odin_cc) {
+	if (proc_type->params == nullptr && !is_odin_like) {
 		return;
 	}
 
@@ -49,9 +50,9 @@ gb_internal void fb_setup_params(fbProc *p) {
 	// returned in a register.
 	TypeTuple *results = proc_type->results ? &proc_type->results->Tuple : nullptr;
 	i32 result_count = results ? cast(i32)results->variables.count : 0;
-	i32 split_count = (is_odin_cc && result_count > 1) ? (result_count - 1) : 0;
+	i32 split_count = (is_odin_like && result_count > 1) ? (result_count - 1) : 0;
 
-	u32 max_gp_params = param_count + split_count + (is_odin_cc ? 1 : 0);
+	u32 max_gp_params = param_count + split_count + (has_context ? 1 : 0);
 	if (max_gp_params == 0 && param_count == 0) return;
 
 	// Allocate for the hard upper bound on GP register params
@@ -103,7 +104,7 @@ gb_internal void fb_setup_params(fbProc *p) {
 		}
 
 		if (abi.classes[0] == FB_ABI_SSE) {
-			if (!is_odin_cc && xmm_idx < 8) {
+			if (!is_odin_like && xmm_idx < 8) {
 				// Non-Odin CC (C/foreign): SSE params arrive in XMM0-7.
 				// Create a stack slot and record XMM param location so
 				// the prologue stores XMMn to the slot.
@@ -209,7 +210,7 @@ gb_internal void fb_setup_params(fbProc *p) {
 	}
 
 	// Odin CC: append context pointer as the last GP parameter
-	if (is_odin_cc) {
+	if (has_context) {
 		if (gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
 			u32 slot = fb_slot_create(p, 8, 8, nullptr, nullptr);
 			locs[gp_idx].slot_idx   = slot;
@@ -607,6 +608,79 @@ gb_internal fbValue fb_addr_load(fbBuilder *b, fbAddr addr) {
 		}
 		return fb_emit_load(b, addr.base, addr.type);
 	}
+	if (addr.kind == fbAddr_BitField) {
+		u32 bit_off = addr.bitfield.bit_offset;
+		u32 bit_cnt = addr.bitfield.bit_count;
+		u32 byte_off = bit_off / 8;
+		u32 bit_shift = bit_off % 8;
+
+		// Determine the load type: smallest integer type that covers the bits
+		u32 bits_needed = bit_shift + bit_cnt;
+		Type *load_type;
+		if (bits_needed <= 8)  load_type = t_u8;
+		else if (bits_needed <= 16) load_type = t_u16;
+		else if (bits_needed <= 32) load_type = t_u32;
+		else load_type = t_u64;
+
+		fbValue ptr = addr.base;
+		if (byte_off != 0) {
+			ptr = fb_emit_member(b, ptr, byte_off);
+		}
+		fbValue raw = fb_emit_load(b, ptr, load_type);
+
+		// Shift right to align the bit field
+		if (bit_shift != 0) {
+			fbValue shift = fb_emit_iconst(b, load_type, bit_shift);
+			raw = fb_emit_arith(b, FB_LSHR, raw, shift, load_type);
+		}
+
+		// Mask to bit_cnt bits
+		if (bit_cnt < 64) {
+			i64 mask = (cast(i64)1 << bit_cnt) - 1;
+			fbValue mask_val = fb_emit_iconst(b, load_type, mask);
+			raw = fb_emit_arith(b, FB_AND, raw, mask_val, load_type);
+		}
+
+		// Sign extend if the field type is signed
+		if (fb_type_is_signed(addr.type) && bit_cnt < cast(u32)(fb_type_size(fb_data_type(load_type)) * 8)) {
+			i64 sign_bit = cast(i64)1 << (bit_cnt - 1);
+			fbValue sb = fb_emit_iconst(b, load_type, sign_bit);
+			raw = fb_emit_arith(b, FB_XOR, raw, sb, load_type);
+			raw = fb_emit_arith(b, FB_SUB, raw, sb, load_type);
+		}
+
+		return fb_emit_conv(b, raw, addr.type);
+	}
+
+	if (addr.kind == fbAddr_Swizzle) {
+		// Gather elements from the source array by swizzle indices into a new temp array.
+		Type *result_type = addr.type;
+		Type *array_type = base_type(result_type);
+		GB_ASSERT(array_type->kind == Type_Array);
+		Type *elem_type = array_type->Array.elem;
+		i64 stride = type_size_of(elem_type);
+
+		fbAddr res = fb_add_local(b, result_type, nullptr, false);
+		for (u8 i = 0; i < addr.swizzle.count; i++) {
+			u8 src_idx = addr.swizzle.indices[i];
+			fbValue src_ptr = addr.base;
+			if (src_idx > 0) src_ptr = fb_emit_member(b, addr.base, cast(i64)src_idx * stride);
+			fbValue val = fb_emit_load(b, src_ptr, elem_type);
+
+			fbValue dst_ptr = res.base;
+			if (i > 0) dst_ptr = fb_emit_member(b, res.base, cast(i64)i * stride);
+			fb_emit_store(b, dst_ptr, val);
+		}
+
+		fbType ft = fb_data_type(result_type);
+		if (ft.kind != FBT_VOID) {
+			return fb_emit_load(b, res.base, result_type);
+		}
+		fbValue ret = res.base;
+		ret.type = result_type;
+		return ret;
+	}
+
 	GB_PANIC("TODO fb_addr_load kind=%d", addr.kind);
 	return fb_value_nil();
 }
@@ -616,6 +690,72 @@ gb_internal void fb_addr_store(fbBuilder *b, fbAddr addr, fbValue val) {
 		fb_emit_store(b, addr.base, val);
 		return;
 	}
+
+	if (addr.kind == fbAddr_BitField) {
+		u32 bit_off = addr.bitfield.bit_offset;
+		u32 bit_cnt = addr.bitfield.bit_count;
+		u32 byte_off = bit_off / 8;
+		u32 bit_shift = bit_off % 8;
+
+		u32 bits_needed = bit_shift + bit_cnt;
+		Type *store_type;
+		if (bits_needed <= 8)  store_type = t_u8;
+		else if (bits_needed <= 16) store_type = t_u16;
+		else if (bits_needed <= 32) store_type = t_u32;
+		else store_type = t_u64;
+
+		// Convert the value to the storage integer type and mask to bit width
+		fbValue new_val = fb_emit_conv(b, val, store_type);
+		if (bit_cnt < 64) {
+			i64 mask = (cast(i64)1 << bit_cnt) - 1;
+			fbValue mask_val = fb_emit_iconst(b, store_type, mask);
+			new_val = fb_emit_arith(b, FB_AND, new_val, mask_val, store_type);
+		}
+
+		// Shift into position
+		if (bit_shift != 0) {
+			fbValue shift = fb_emit_iconst(b, store_type, bit_shift);
+			new_val = fb_emit_arith(b, FB_SHL, new_val, shift, store_type);
+		}
+
+		fbValue ptr = addr.base;
+		if (byte_off != 0) {
+			ptr = fb_emit_member(b, ptr, byte_off);
+		}
+
+		// Read-modify-write: clear target bits, OR in new bits
+		fbValue old_val = fb_emit_load(b, ptr, store_type);
+		i64 clear_mask = ~(((cast(i64)1 << bit_cnt) - 1) << bit_shift);
+		fbValue cmask = fb_emit_iconst(b, store_type, clear_mask);
+		fbValue cleared = fb_emit_arith(b, FB_AND, old_val, cmask, store_type);
+		fbValue merged = fb_emit_arith(b, FB_OR, cleared, new_val, store_type);
+		fb_emit_store(b, ptr, merged);
+		return;
+	}
+
+	if (addr.kind == fbAddr_Swizzle) {
+		// Scatter-write: decompose the source value into elements and store
+		// each at the swizzle-mapped position in the destination array.
+		Type *result_type = addr.type;
+		Type *array_type = base_type(result_type);
+		GB_ASSERT(array_type->kind == Type_Array);
+		Type *elem_type = array_type->Array.elem;
+		i64 stride = type_size_of(elem_type);
+
+		// val is either a scalar (if swizzle produces a scalar) or an aggregate pointer
+		for (u8 i = 0; i < addr.swizzle.count; i++) {
+			u8 dst_idx = addr.swizzle.indices[i];
+			fbValue src_ptr = val;
+			if (i > 0) src_ptr = fb_emit_member(b, val, cast(i64)i * stride);
+			fbValue elem_val = fb_emit_load(b, src_ptr, elem_type);
+
+			fbValue dst_ptr = addr.base;
+			if (dst_idx > 0) dst_ptr = fb_emit_member(b, addr.base, cast(i64)dst_idx * stride);
+			fb_emit_store(b, dst_ptr, elem_val);
+		}
+		return;
+	}
+
 	GB_PANIC("TODO fb_addr_store kind=%d", addr.kind);
 }
 
@@ -791,6 +931,29 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 			return *found;
 		}
 
+		if (se->swizzle_count > 0) {
+			u8 swizzle_count = se->swizzle_count;
+			u8 swizzle_indices_raw = se->swizzle_indices;
+			u8 indices[4] = {};
+			for (u8 i = 0; i < swizzle_count; i++) {
+				indices[i] = (swizzle_indices_raw >> (i * 2)) & 3;
+			}
+
+			fbAddr base_addr = fb_build_addr(b, se->expr);
+
+			Type *result_type = type_of_expr(expr);
+			fbAddr addr = {};
+			addr.kind = fbAddr_Swizzle;
+			addr.base = base_addr.base;
+			addr.type = result_type;
+			addr.swizzle.count = swizzle_count;
+			addr.swizzle.indices[0] = indices[0];
+			addr.swizzle.indices[1] = indices[1];
+			addr.swizzle.indices[2] = indices[2];
+			addr.swizzle.indices[3] = indices[3];
+			return addr;
+		}
+
 		Selection sel = lookup_field(type_of_expr(se->expr), e->token.string, false);
 		fbAddr base_addr = fb_build_addr(b, se->expr);
 		fbValue base_ptr = base_addr.base;
@@ -820,6 +983,26 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 		}
 
 		Type *result_type = e->type;
+
+		if (sel.is_bit_field) {
+			// Bit field access: the base pointer points to the containing
+			// backing storage. Store bit offset and size for load/store.
+			Type *parent_type = base_type(type_of_expr(se->expr));
+			GB_ASSERT(parent_type->kind == Type_BitField);
+			GB_ASSERT(sel.index.count == 1);
+			i32 field_idx = sel.index[0];
+			i64 bit_offset = parent_type->BitField.bit_offsets[field_idx];
+			i64 bit_size   = parent_type->BitField.bit_sizes[field_idx];
+
+			fbAddr addr = {};
+			addr.kind = fbAddr_BitField;
+			addr.base = base_addr.base;
+			addr.type = result_type;
+			addr.bitfield.bit_offset = cast(u32)bit_offset;
+			addr.bitfield.bit_count  = cast(u32)bit_size;
+			return addr;
+		}
+
 		fbAddr addr = {};
 		addr.kind = fbAddr_Default;
 		addr.base = base_ptr;
@@ -973,6 +1156,16 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 		fbValue len_ptr = fb_emit_member(b, result.base, ptr_size);
 		fb_emit_store(b, len_ptr, new_len);
 		return result;
+	}
+
+	case Ast_CallExpr: {
+		// Call result needs to be addressable (e.g., for slicing).
+		// Build the call, store to a temp local, return the local's addr.
+		fbValue val = fb_build_expr(b, expr);
+		Type *type = type_of_expr(expr);
+		fbAddr temp = fb_add_local(b, type, nullptr, false);
+		fb_emit_copy_value(b, temp.base, val, type);
+		return temp;
 	}
 
 	default:
@@ -1175,6 +1368,18 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 		return fb_make_value(r, dst_type);
 	}
 
+	// Aggregate → Aggregate (FBT_VOID → FBT_VOID, different Odin types): rebrand
+	if (src_ft.kind == FBT_VOID && dst_ft.kind == FBT_VOID) {
+		val.type = dst_type;
+		return val;
+	}
+
+	// Aggregate → Scalar: the fast backend represents aggregates as pointers
+	// to stack memory. Load the destination scalar type from that pointer.
+	if (src_ft.kind == FBT_VOID && dst_ft.kind != FBT_VOID) {
+		return fb_emit_load(b, val, dst_type);
+	}
+
 	GB_PANIC("fb_emit_conv: unhandled conversion from %d to %d", src_ft.kind, dst_ft.kind);
 	return fb_value_nil();
 }
@@ -1375,6 +1580,84 @@ gb_internal fbAddr fb_build_compound_lit(fbBuilder *b, Ast *expr) {
 		fbValue val = fb_build_expr(b, value_expr);
 		Type *variant_type = type_of_expr(value_expr);
 		fb_emit_store_union_variant(b, v.base, val, bt, variant_type);
+		break;
+	}
+
+	case Type_BitSet: {
+		// BitSet compound literal: {.Elem1, .Elem2, ...}
+		// BitSets are scalar integers in the fast backend (fb_data_type delegates
+		// to bit_set_to_int). Each element is an enum/int value; the corresponding
+		// bit (value - lower) is set in the result.
+		Type *int_type = bit_set_to_int(bt);
+		i64 lower = bt->BitSet.lower;
+
+		// Try constant-folding: if all elements are compile-time constants,
+		// emit a single ICONST + STORE instead of per-element OR chains.
+		bool all_const = true;
+		i64 const_bits = 0;
+		for_array(i, cl->elems) {
+			Ast *elem = cl->elems[i];
+			GB_ASSERT(elem->kind != Ast_FieldValue);
+			TypeAndValue tv = type_and_value_of_expr(elem);
+			if (tv.mode != Addressing_Constant) {
+				all_const = false;
+				break;
+			}
+			i64 val = exact_value_to_i64(tv.value);
+			const_bits |= (cast(i64)1 << (val - lower));
+		}
+
+		if (all_const) {
+			fbValue bits = fb_emit_iconst(b, int_type, const_bits);
+			fb_emit_store(b, v.base, bits);
+		} else {
+			for_array(i, cl->elems) {
+				Ast *elem = cl->elems[i];
+				GB_ASSERT(elem->kind != Ast_FieldValue);
+				fbValue e = fb_build_expr(b, elem);
+				e = fb_emit_conv(b, e, int_type);
+				fbValue shift = fb_emit_arith(b, FB_SUB, e,
+					fb_emit_iconst(b, int_type, lower), int_type);
+				fbValue bit = fb_emit_arith(b, FB_SHL,
+					fb_emit_iconst(b, int_type, 1), shift, int_type);
+				fbValue old_val = fb_emit_load(b, v.base, int_type);
+				fbValue new_val = fb_emit_arith(b, FB_OR, old_val, bit, int_type);
+				fb_emit_store(b, v.base, new_val);
+			}
+		}
+		break;
+	}
+
+	case Type_Slice: {
+		// Slice compound literal: []T{a, b, c}
+		// 1. Allocate backing array on stack
+		// 2. Populate elements
+		// 3. Build slice struct {data_ptr, len}
+		Type *elem_type = bt->Slice.elem;
+		i64 elem_count = cl->elems.count;
+		i64 stride = type_size_of(elem_type);
+		i64 ptr_size = b->module->target.ptr_size;
+
+		Type *backing_type = alloc_type_array(elem_type, elem_count);
+		fbAddr backing = fb_add_local(b, backing_type, nullptr, true);
+
+		for (i64 i = 0; i < elem_count; i++) {
+			Ast *elem_expr = cl->elems[i];
+			if (elem_expr->kind == Ast_FieldValue) {
+				elem_expr = elem_expr->FieldValue.value;
+			}
+			fbValue val = fb_build_expr(b, elem_expr);
+			val = fb_emit_conv(b, val, elem_type);
+			fbValue dst = backing.base;
+			if (i > 0) dst = fb_emit_member(b, backing.base, i * stride);
+			fb_emit_copy_value(b, dst, val, elem_type);
+		}
+
+		// Store data pointer at offset 0
+		fb_emit_store(b, v.base, backing.base);
+		// Store length at offset ptr_size
+		fbValue len_ptr = fb_emit_member(b, v.base, ptr_size);
+		fb_emit_store(b, len_ptr, fb_emit_iconst(b, t_int, elem_count));
 		break;
 	}
 
@@ -1807,12 +2090,14 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	if (proc_type != nullptr) {
 		proc_type = base_type(proc_type);
 	}
-	bool is_odin_cc = false;
+	bool is_odin_like = false;
+	bool has_context  = false;
 	TypeTuple *results = nullptr;
 	i32 result_count = 0;
 
 	if (proc_type != nullptr && proc_type->kind == Type_Proc) {
-		is_odin_cc = (proc_type->Proc.calling_convention == ProcCC_Odin);
+		is_odin_like = is_calling_convention_odin(proc_type->Proc.calling_convention);
+		has_context  = (proc_type->Proc.calling_convention == ProcCC_Odin);
 		if (proc_type->Proc.results != nullptr) {
 			results = &proc_type->Proc.results->Tuple;
 			result_count = cast(i32)results->variables.count;
@@ -1822,7 +2107,7 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	// For Odin CC: values passed via hidden output pointers.
 	// Multi-return: values 0..N-2 get split temps.
 	// Single-return MEMORY-class: the sole result also needs a temp.
-	i32 split_count = (is_odin_cc && result_count > 1) ? (result_count - 1) : 0;
+	i32 split_count = (is_odin_like && result_count > 1) ? (result_count - 1) : 0;
 	fbAddr *split_temps = nullptr;
 	bool sret_single = false; // single MEMORY-class return via hidden output pointer
 	fbAddr sret_temp = {};
@@ -1834,13 +2119,14 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 		}
 	}
 
-	// Check if the last/sole return type is MEMORY class (large aggregate).
-	// For single return: the sole result needs sret hidden output pointer.
-	// Applies to all calling conventions: Odin, contextless, C, etc.
+	// Check if the last/sole return type is an aggregate (FBT_VOID).
+	// The fast backend IR can't represent multi-register aggregate returns,
+	// so any aggregate return (including small INTEGER×2 structs like Allocator)
+	// must use a hidden output pointer (sret).
 	if (!sret_single && result_count >= 1 && split_count == 0) {
 		Type *ret_type = results->variables[result_count - 1]->type;
-		fbABIParamInfo ret_abi = fb_abi_classify_type_sysv(ret_type);
-		if (ret_abi.classes[0] == FB_ABI_MEMORY) {
+		fbType ret_ft = fb_data_type(ret_type);
+		if (ret_ft.kind == FBT_VOID) {
 			sret_single = true;
 			sret_temp = fb_add_local(b, ret_type, nullptr, true);
 		}
@@ -1939,7 +2225,7 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 			fb_aux_push(b->proc, val.id);
 			aux_idx++;
 		} else {
-			if (!is_odin_cc && abi.num_classes >= 1 && abi.classes[0] == FB_ABI_SSE && aux_idx < 32) {
+			if (!is_odin_like && abi.num_classes >= 1 && abi.classes[0] == FB_ABI_SSE && aux_idx < 32) {
 				sse_mask |= (1u << aux_idx);
 				fbType ft = fb_data_type(default_type(arg_type));
 				if (ft.kind == FBT_F64) {
@@ -1965,7 +2251,7 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	}
 
 	// Context pointer (Odin CC, always last)
-	if (is_odin_cc) {
+	if (has_context) {
 		if (b->context_stack.count == 0) {
 			// Non-Odin-CC proc calling an Odin-CC proc — auto-create context.
 			fbAddr ctx_addr = fb_add_local(b, t_context, nullptr, true);
@@ -1984,7 +2270,7 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	Type *last_result_type = nullptr;
 	fbType ret_ft = FB_VOID;
 	if (result_count > 0) {
-		if (is_odin_cc) {
+		if (is_odin_like) {
 			last_result_type = results->variables[result_count - 1]->type;
 		} else {
 			Type *rt = proc_type->Proc.results;
@@ -2003,7 +2289,7 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	// Encode calling convention and SSE bitmasks into the call instruction.
 	// flags = calling convention (0=Odin, 1=C, ...)
 	// imm = sse_mask (low 32) | f64_mask (high 32)
-	u8 cc_flag = is_odin_cc ? FBCC_ODIN : FBCC_C;
+	u8 cc_flag = is_odin_like ? FBCC_ODIN : FBCC_C;
 	i64 call_imm = cast(i64)sse_mask | (cast(i64)f64_mask << 32);
 
 	// For sret_single, the call itself is void — the result is in the temp
@@ -2859,7 +3145,7 @@ gb_internal void fb_build_return_stmt(fbBuilder *b, Slice<Ast *> const &results)
 	Type *pt = base_type(b->type);
 	GB_ASSERT(pt->kind == Type_Proc);
 	TypeProc *proc_type = &pt->Proc;
-	bool is_odin_cc = (proc_type->calling_convention == ProcCC_Odin);
+	bool is_odin_like = is_calling_convention_odin(proc_type->calling_convention);
 
 	TypeTuple *res_tuple = (proc_type->results != nullptr)
 		? &proc_type->results->Tuple : nullptr;
@@ -2873,11 +3159,11 @@ gb_internal void fb_build_return_stmt(fbBuilder *b, Slice<Ast *> const &results)
 		return;
 	}
 
-	if (results.count == 1 && !(is_odin_cc && res_count > 1)) {
+	if (results.count == 1 && !(is_odin_like && res_count > 1)) {
 		// Single return value (the common case)
 		fbValue val = fb_build_expr(b, results[0]);
 		Type *ret_type = nullptr;
-		if (is_odin_cc && res_count > 0) {
+		if (is_odin_like && res_count > 0) {
 			ret_type = res_tuple->variables[res_count - 1]->type;
 		} else if (res_count > 0) {
 			ret_type = res_tuple->variables[0]->type;
@@ -2892,7 +3178,7 @@ gb_internal void fb_build_return_stmt(fbBuilder *b, Slice<Ast *> const &results)
 
 	// Multi-return (Odin CC): store first N-1 values through hidden output
 	// pointer params, return the last value in a register.
-	GB_ASSERT(is_odin_cc && res_count > 1);
+	GB_ASSERT(is_odin_like && res_count > 1);
 	GB_ASSERT(b->proc->split_returns_index >= 0);
 
 	// Phase 1: Flatten — build each result expression. If a single
