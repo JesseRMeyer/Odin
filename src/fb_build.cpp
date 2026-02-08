@@ -201,6 +201,15 @@ gb_internal fbValue fb_emit_typed(fbBuilder *b, fbOp op, Type *odin_type, u32 a,
 gb_internal fbValue fb_emit_iconst(fbBuilder *b, Type *type, i64 val) {
 	fbType ft = fb_data_type(type);
 	if (ft.kind == FBT_VOID) ft = FB_I64;
+	// Mask to type width so the 64-bit representation matches what
+	// LOAD produces via MOVZX (zero-extension is canonical form).
+	switch (ft.kind) {
+	case FBT_I1:  val &= 0x1; break;
+	case FBT_I8:  val = cast(i64)(cast(u8)val); break;
+	case FBT_I16: val = cast(i64)(cast(u16)val); break;
+	case FBT_I32: val = cast(i64)(cast(u32)val); break;
+	default: break;
+	}
 	u32 r = fb_inst_emit(b->proc, FB_ICONST, ft, FB_NOREG, FB_NOREG, FB_NOREG, 0, val);
 	return fb_make_value(r, type);
 }
@@ -644,29 +653,27 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 		fbAddr base_addr = fb_build_addr(b, se->expr);
 		fbValue base_ptr = base_addr.base;
 
-		// Walk the selection path
+		// Walk the selection path.
+		// type_offset_of() handles structs, basic struct-like types
+		// (any, string), slices, dynamic arrays, tuples, and unions.
 		Type *current_type = base_addr.type;
 		for_array(i, sel.index) {
 			i32 field_idx = sel.index[i];
 			Type *bt = base_type(current_type);
-			if (bt->kind == Type_Struct) {
-				i64 offset = bt->Struct.offsets[field_idx];
-				if (offset != 0) {
-					base_ptr = fb_emit_member(b, base_ptr, offset);
-				}
-				current_type = bt->Struct.fields[field_idx]->type;
-			} else if (is_type_pointer(bt)) {
+			if (is_type_pointer(bt)) {
 				base_ptr = fb_emit_load(b, base_ptr, current_type);
 				current_type = type_deref(current_type);
-				// Retry this index on the dereferenced type
 				bt = base_type(current_type);
-				if (bt->kind == Type_Struct) {
-					i64 offset = bt->Struct.offsets[field_idx];
-					if (offset != 0) {
-						base_ptr = fb_emit_member(b, base_ptr, offset);
-					}
-					current_type = bt->Struct.fields[field_idx]->type;
-				}
+			}
+			Type *field_type = nullptr;
+			i64 offset = type_offset_of(bt, field_idx, &field_type);
+			if (offset != 0) {
+				base_ptr = fb_emit_member(b, base_ptr, offset);
+			}
+			if (field_type != nullptr) {
+				current_type = field_type;
+			} else if (bt->kind == Type_Struct) {
+				current_type = bt->Struct.fields[field_idx]->type;
 			}
 		}
 
@@ -826,6 +833,51 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 
 	Type *src_type = val.type;
 	if (are_types_identical(src_type, dst_type)) return val;
+
+	// ── any boxing: value → any ─────────────────────────────────
+	if (is_type_any(dst_type)) {
+		if (is_type_untyped_uninit(src_type) || is_type_untyped_nil(src_type)) {
+			fbAddr temp = fb_add_local(b, dst_type, nullptr, true);
+			fbValue result = temp.base;
+			result.type = dst_type;
+			return result;
+		}
+
+		Type *st = default_type(src_type);
+
+		// Get a pointer to the source value.
+		fbValue data_ptr;
+		fbType src_ft = fb_data_type(st);
+		if (src_ft.kind == FBT_VOID) {
+			// Aggregate: val is already a pointer to stable memory.
+			data_ptr = val;
+			data_ptr.type = t_rawptr;
+		} else {
+			// Scalar: materialize to a stack slot, take its address.
+			fbAddr temp_val = fb_add_local(b, st, nullptr, false);
+			fb_emit_store(b, temp_val.base, val);
+			data_ptr = temp_val.base;
+			data_ptr.type = t_rawptr;
+		}
+
+		// Compute typeid (compile-time constant hash).
+		u64 typeid_value = type_hash_canonical_type(st);
+		fbValue id_val = fb_emit_iconst(b, t_typeid, cast(i64)typeid_value);
+
+		// Build the any struct on the stack: {data: rawptr, id: typeid}
+		fbAddr any_addr = fb_add_local(b, dst_type, nullptr, true);
+		i64 ptr_sz = build_context.ptr_size;
+
+		fbValue data_field = fb_emit_member(b, any_addr.base, 0);
+		fb_emit_store(b, data_field, data_ptr);
+
+		fbValue id_field = fb_emit_member(b, any_addr.base, ptr_sz);
+		fb_emit_store(b, id_field, id_val);
+
+		fbValue result = any_addr.base;
+		result.type = dst_type;
+		return result;
+	}
 
 	// ── Union conversion: value → union ─────────────────────────
 	if (is_type_union(base_type(dst_type))) {

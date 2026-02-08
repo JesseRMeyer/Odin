@@ -1762,7 +1762,26 @@ Union type switches (`switch v in union_val { case T: ... }`), the primary patte
 **Deferred:**
 - `any` type switches — requires runtime type info generation (Phase 7); asserts with clear message
 
-### Phase 7: Remaining Odin Features (TODO)
+### Phase 7: Remaining Odin Features (in progress)
+
+**Phase 7a: `any` type construction + narrow-type fix** ✅
+
+`any` boxing (`fb_emit_conv` in `fb_build.cpp`):
+- `any` is `{data: rawptr, id: typeid}` — 16-byte aggregate, classified as FBT_VOID
+- Boxing: allocate local, store value, compute `type_hash_canonical_type()` at compile time, store data pointer and typeid
+- Handles scalars (alloc temp, store, take address) and aggregates (already pointers in IR)
+- Handles `untyped_nil`/`untyped_uninit` → zero-initialized any
+
+Selector expression fix (`fb_build_addr`, SelectorExpr):
+- Replaced struct-only field walking with general `type_offset_of()` from `types.cpp`
+- Now correctly handles field access on all aggregate-like types: `any`, `string`, `slice`, `dynamic_array`, `struct`, `tuple`, `union`
+
+Signed narrow-type ICONST fix (`fb_emit_iconst`):
+- **Root cause:** LOAD uses MOVZX (zero-extension is canonical form for sub-64-bit values), but ICONST stored sign-extended 64-bit values. Negative i8/i16/i32 constants had different 64-bit representations than loaded values.
+- **Fix:** Mask ICONST immediates to type width via unsigned cast: `val = (i64)(u8/u16/u32)val`. Both LOADs and ICONSTs now produce identical zero-extended 64-bit representations.
+- **Invariant:** All sub-64-bit integer values in registers are zero-extended. SEXT/ZEXT/TRUNC/STORE all read only the low bits, so this is safe. Signed ordering comparisons (SLT/SGT) on narrow types remain a separate TODO (CMP always uses 64-bit operands).
+
+**Remaining:**
 
 - Map operations (runtime calls)
 - SOA addressing
@@ -1772,6 +1791,7 @@ Union type switches (`switch v in union_val { case T: ... }`), the primary patte
 - `any` type switches (requires runtime type info)
 - Runtime type info generation
 - SIMD builtins, atomic builtins
+- Narrow-type signed ordering comparisons (CMP_SLT etc. need type-width CMP or pre-SEXT)
 
 ### Phase 8: SIMD, Atomics (TODO)
 

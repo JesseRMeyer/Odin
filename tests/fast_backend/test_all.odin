@@ -1091,6 +1091,126 @@ test_type_switch :: proc() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// any type construction (1200-1219)
+// ═══════════════════════════════════════════════════════════════════════
+
+any_check_not_nil :: proc(a: any) -> bool {
+	return a.data != nil
+}
+
+any_read_int :: proc(a: any) -> int {
+	ip := (^int)(a.data)
+	return ip^
+}
+
+test_any :: proc() {
+	// 1200: box int to any, read back through data pointer
+	x: int = 42
+	a: any = x
+	check(a.data != nil, 1200)
+	ip := (^int)(a.data)
+	check(ip^ == 42, 1201)
+
+	// 1202: box bool to any
+	flag := true
+	b: any = flag
+	bp := (^bool)(b.data)
+	check(bp^, 1202)
+
+	// 1203: box float to any
+	f := 3.14
+	c: any = f
+	fp := (^f64)(c.data)
+	check(fp^ > 3.0, 1203)
+	check(fp^ < 3.2, 1204)
+
+	// 1205: nil any (zero-initialized)
+	d: any
+	check(d.data == nil, 1205)
+
+	// 1206: same-type any values share typeid
+	y: int = 99
+	e: any = y
+	check(a.id == e.id, 1206)
+
+	// 1207: different-type any values have different typeid
+	check(a.id != c.id, 1207)
+
+	// 1208: pass any to function, read fields there
+	g: any = x
+	check(any_check_not_nil(g), 1208)
+	check(any_read_int(g) == 42, 1209)
+
+	// 1210: box small signed types (tests ICONST masking for narrow types)
+	b8: i8 = -1
+	a_b8: any = b8
+	check((^i8)(a_b8.data)^ == -1, 1210)
+
+	i16v: i16 = -1234
+	a_i16: any = i16v
+	check((^i16)(a_i16.data)^ == -1234, 1211)
+
+	// 1212: any from struct
+	s := Circle{5.0}
+	a_s: any = s
+	check(a_s.data != nil, 1212)
+	sp := (^Circle)(a_s.data)
+	check(sp.radius == 5.0, 1213)
+
+	// 1214: any from string
+	str := "hello"
+	a_str: any = str
+	check(a_str.data != nil, 1214)
+	sp_str := (^string)(a_str.data)
+	check(len(sp_str^) == 5, 1215)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Signed narrow types — equality of negative i8, i16, i32 values
+// ═══════════════════════════════════════════════════════════════════════
+
+test_signed_narrow :: proc() {
+	// i8 negative values
+	a8: i8 = -1
+	check(a8 == -1, 1300)
+	b8: i8 = -128
+	check(b8 == -128, 1301)
+	c8: i8 = 127
+	check(c8 == 127, 1302)
+
+	// i16 negative values
+	a16: i16 = -1
+	check(a16 == -1, 1303)
+	b16: i16 = -1234
+	check(b16 == -1234, 1304)
+	c16: i16 = -32768
+	check(c16 == -32768, 1305)
+	d16: i16 = 32767
+	check(d16 == 32767, 1306)
+
+	// i32 negative values
+	a32: i32 = -1
+	check(a32 == -1, 1307)
+	b32: i32 = -2147483648
+	check(b32 == -2147483648, 1308)
+	c32: i32 = 2147483647
+	check(c32 == 2147483647, 1309)
+
+	// Via pointer (tests LOAD + CMP consistency)
+	p8 := &a8
+	check(p8^ == -1, 1310)
+	p16 := &a16
+	check(p16^ == -1, 1311)
+	p32 := &a32
+	check(p32^ == -1, 1312)
+
+	// Negative inequality
+	check(a8 != 0, 1313)
+	check(a16 != 0, 1314)
+	check(a32 != 0, 1315)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Main — run everything
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1153,6 +1273,10 @@ main :: proc() {
 	test_ternary_combined()
 	print_msg("  type_switch...\n")
 	test_type_switch()
+	print_msg("  any...\n")
+	test_any()
+	print_msg("  signed_narrow...\n")
+	test_signed_narrow()
 	print_msg("ALL PASS\n")
 	exit(0)
 }
