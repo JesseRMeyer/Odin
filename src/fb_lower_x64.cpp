@@ -139,7 +139,7 @@ gb_internal void fb_x64_mov_ri64(fbLowCtx *ctx, fbX64Reg dst, i64 val) {
 // ───────────────────────────────────────────────────────────────────────
 
 // XMM register indices (0 = XMM0, 1 = XMM1, etc.)
-enum : u8 { FB_XMM0 = 0, FB_XMM1 = 1 };
+enum : u8 { FB_XMM0 = 0, FB_XMM1 = 1, FB_XMM2 = 2 };
 
 // MOVD xmm, r32: 66 [REX] 0F 6E /r (32-bit GP→XMM)
 gb_internal void fb_x64_movd_gp_to_xmm(fbLowCtx *ctx, u8 xmm, fbX64Reg gp) {
@@ -201,6 +201,104 @@ gb_internal void fb_x64_xmm_to_gp(fbLowCtx *ctx, fbX64Reg gp, u8 xmm, fbTypeKind
 	} else {
 		fb_x64_movq_xmm_to_gp(ctx, gp, xmm);
 	}
+}
+
+// ───────────────────────────────────────────────────────────────────────
+// SIMD encoding helpers (128-bit XMM operations via scratch registers)
+//
+// SIMD values live in their spill slots (16 bytes each). All operations
+// load to scratch XMM0/XMM1, operate, store result back to spill slot.
+// No XMM register allocation needed.
+// ───────────────────────────────────────────────────────────────────────
+
+gb_internal i32 fb_x64_spill_offset(fbLowCtx *ctx, u32 vreg); // forward decl
+
+// MOVDQU xmm, [base]: F3 [REX] 0F 6F /r  (unaligned 128-bit load)
+gb_internal void fb_x64_movdqu_load_indirect(fbLowCtx *ctx, u8 xmm, fbX64Reg base) {
+	fb_low_emit_byte(ctx, 0xF3);
+	fb_x64_rex_if_needed(ctx, false, xmm, 0, base);
+	fb_low_emit_byte(ctx, 0x0F);
+	fb_low_emit_byte(ctx, 0x6F);
+	fb_x64_modrm_indirect(ctx, xmm, base);
+}
+
+// MOVDQU [base], xmm: F3 [REX] 0F 7F /r  (unaligned 128-bit store)
+gb_internal void fb_x64_movdqu_store_indirect(fbLowCtx *ctx, u8 xmm, fbX64Reg base) {
+	fb_low_emit_byte(ctx, 0xF3);
+	fb_x64_rex_if_needed(ctx, false, xmm, 0, base);
+	fb_low_emit_byte(ctx, 0x0F);
+	fb_low_emit_byte(ctx, 0x7F);
+	fb_x64_modrm_indirect(ctx, xmm, base);
+}
+
+// MOVDQU xmm, [rbp+disp32]: F3 [REX] 0F 6F modrm(02, xmm, rbp) disp32
+gb_internal void fb_x64_movdqu_load_rbp(fbLowCtx *ctx, u8 xmm, i32 disp) {
+	fb_low_emit_byte(ctx, 0xF3);
+	fb_x64_rex_if_needed(ctx, false, xmm, 0, FB_RBP);
+	fb_low_emit_byte(ctx, 0x0F);
+	fb_low_emit_byte(ctx, 0x6F);
+	fb_x64_modrm_rbp_disp32(ctx, xmm, disp);
+}
+
+// MOVDQU [rbp+disp32], xmm: F3 [REX] 0F 7F modrm(02, xmm, rbp) disp32
+gb_internal void fb_x64_movdqu_store_rbp(fbLowCtx *ctx, u8 xmm, i32 disp) {
+	fb_low_emit_byte(ctx, 0xF3);
+	fb_x64_rex_if_needed(ctx, false, xmm, 0, FB_RBP);
+	fb_low_emit_byte(ctx, 0x0F);
+	fb_low_emit_byte(ctx, 0x7F);
+	fb_x64_modrm_rbp_disp32(ctx, xmm, disp);
+}
+
+// MOVQ xmm, [base]: F3 0F 7E /r  (load 64-bit, zero-extend to 128)
+gb_internal void fb_x64_movq_load_indirect(fbLowCtx *ctx, u8 xmm, fbX64Reg base) {
+	fb_low_emit_byte(ctx, 0xF3);
+	fb_x64_rex_if_needed(ctx, false, xmm, 0, base);
+	fb_low_emit_byte(ctx, 0x0F);
+	fb_low_emit_byte(ctx, 0x7E);
+	fb_x64_modrm_indirect(ctx, xmm, base);
+}
+
+// MOVQ [base], xmm: 66 0F D6 /r  (store low 64 bits)
+gb_internal void fb_x64_movq_store_indirect(fbLowCtx *ctx, u8 xmm, fbX64Reg base) {
+	fb_low_emit_byte(ctx, 0x66);
+	fb_x64_rex_if_needed(ctx, false, xmm, 0, base);
+	fb_low_emit_byte(ctx, 0x0F);
+	fb_low_emit_byte(ctx, 0xD6);
+	fb_x64_modrm_indirect(ctx, xmm, base);
+}
+
+// Load a SIMD vreg from its spill slot into a scratch XMM register.
+gb_internal void fb_x64_simd_load_vreg(fbLowCtx *ctx, u8 xmm, u32 vreg) {
+	i32 offset = fb_x64_spill_offset(ctx, vreg);
+	fb_x64_movdqu_load_rbp(ctx, xmm, offset);
+}
+
+// Store a scratch XMM register to a SIMD vreg's spill slot.
+gb_internal void fb_x64_simd_store_vreg(fbLowCtx *ctx, u8 xmm, u32 vreg) {
+	i32 offset = fb_x64_spill_offset(ctx, vreg);
+	ctx->value_loc[vreg] = offset;
+	fb_x64_movdqu_store_rbp(ctx, xmm, offset);
+}
+
+// SSE2 packed integer op: prefix 0F opcode ModRM(11, xmm_dst, xmm_src)
+// Used for PADDD, PXOR, PAND, POR, PSUBD, etc.
+gb_internal void fb_x64_sse2_rr(fbLowCtx *ctx, u8 opcode, u8 xmm_dst, u8 xmm_src) {
+	fb_low_emit_byte(ctx, 0x66);
+	fb_x64_rex_if_needed(ctx, false, xmm_dst, 0, xmm_src);
+	fb_low_emit_byte(ctx, 0x0F);
+	fb_low_emit_byte(ctx, opcode);
+	fb_x64_modrm(ctx, 0x03, xmm_dst, xmm_src);
+}
+
+// SSE2 packed shift by immediate: 66 0F opcode ModRM(11, /r, xmm) imm8
+// /r is the sub-opcode (6=sll, 2=srl, 4=sra for dword shifts)
+gb_internal void fb_x64_sse2_shift_imm(fbLowCtx *ctx, u8 opcode, u8 sub_r, u8 xmm, u8 imm8) {
+	fb_low_emit_byte(ctx, 0x66);
+	fb_x64_rex_if_needed(ctx, false, sub_r, 0, xmm);
+	fb_low_emit_byte(ctx, 0x0F);
+	fb_low_emit_byte(ctx, opcode);
+	fb_x64_modrm(ctx, 0x03, sub_r, xmm);
+	fb_x64_imm8(ctx, imm8);
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -286,9 +384,9 @@ gb_internal void fb_x64_init_value_loc(fbLowCtx *ctx) {
 	}
 }
 
-// Compute spill offset for value vreg: [rbp - slot_area - (vreg+1)*8]
+// Compute spill offset for value vreg: [rbp - slot_area - (vreg+1)*16]
 gb_internal i32 fb_x64_spill_offset(fbLowCtx *ctx, u32 vreg) {
-	return -cast(i32)ctx->frame.slot_area_size - cast(i32)((vreg + 1) * 8);
+	return -cast(i32)ctx->frame.slot_area_size - cast(i32)((vreg + 1) * 16);
 }
 
 // Find the least-recently-used register among the allocatable set, skipping masked registers
@@ -470,8 +568,9 @@ gb_internal void fb_x64_compute_frame(fbLowCtx *ctx) {
 
 	if (order) gb_free(heap_allocator(), order);
 
-	// Spill area: next_value * 8 bytes below slot area
-	u32 spill_bytes = p->next_value * 8;
+	// Spill area: next_value * 16 bytes below slot area
+	// (16 bytes each to accommodate both GP and 128-bit SIMD values)
+	u32 spill_bytes = p->next_value * 16;
 
 	// Total = slot_area + spill_area, aligned to 16
 	u32 total = ctx->frame.slot_area_size + spill_bytes;
@@ -722,6 +821,123 @@ gb_internal void fb_x64_float_binop(fbLowCtx *ctx, fbInst *inst, u8 sse_opcode) 
 }
 
 // ───────────────────────────────────────────────────────────────────────
+// SIMD binary op helper: load operands from spill, SSE2 packed op, store result
+// sse2_opcode: 0xFE=PADDD, 0xFA=PSUBD, 0xEF=PXOR, 0xDB=PAND, 0xEB=POR,
+//              0xD4=PADDQ, 0xFB=PSUBQ, 0xF5=PMADDWD(mul helper)
+// ───────────────────────────────────────────────────────────────────────
+
+gb_internal void fb_x64_simd_binop(fbLowCtx *ctx, fbInst *inst, u8 sse2_opcode) {
+	fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+	fb_x64_simd_load_vreg(ctx, FB_XMM1, inst->b);
+	fb_x64_sse2_rr(ctx, sse2_opcode, FB_XMM0, FB_XMM1);
+	fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
+}
+
+// SIMD shift by immediate: load operand, shift, store result
+// opcode: 0x72=PSLLD/PSRLD/PSRAD (dword), 0x73=PSLLQ/PSRLQ (qword)
+// sub_r: 6=SLL, 2=SRL, 4=SRA
+gb_internal void fb_x64_simd_shift_imm(fbLowCtx *ctx, fbInst *inst, u8 opcode, u8 sub_r) {
+	fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+	fb_x64_sse2_shift_imm(ctx, opcode, sub_r, FB_XMM0, cast(u8)inst->imm);
+	fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
+}
+
+// PMOVMSKB r32, xmm: 66 0F D7 /r  (extract MSB of each byte → GP)
+gb_internal void fb_x64_pmovmskb(fbLowCtx *ctx, fbX64Reg gp, u8 xmm) {
+	fb_low_emit_byte(ctx, 0x66);
+	fb_x64_rex_if_needed(ctx, false, gp, 0, xmm);
+	fb_low_emit_byte(ctx, 0x0F);
+	fb_low_emit_byte(ctx, 0xD7);
+	fb_x64_modrm(ctx, 0x03, gp, xmm);
+}
+
+// PSLLDQ xmm, imm8: 66 0F 73 /7 imm8  (byte shift left, zeros enter low)
+gb_internal void fb_x64_pslldq(fbLowCtx *ctx, u8 xmm, u8 imm8) {
+	fb_x64_sse2_shift_imm(ctx, 0x73, 7, xmm, imm8);
+}
+
+// PSRLDQ xmm, imm8: 66 0F 73 /3 imm8  (byte shift right, zeros enter high)
+gb_internal void fb_x64_psrldq(fbLowCtx *ctx, u8 xmm, u8 imm8) {
+	fb_x64_sse2_shift_imm(ctx, 0x73, 3, xmm, imm8);
+}
+
+// PSHUFD xmm_dst, xmm_src, imm8: 66 0F 70 /r imm8
+gb_internal void fb_x64_pshufd(fbLowCtx *ctx, u8 xmm_dst, u8 xmm_src, u8 imm8) {
+	fb_low_emit_byte(ctx, 0x66);
+	fb_x64_rex_if_needed(ctx, false, xmm_dst, 0, xmm_src);
+	fb_low_emit_byte(ctx, 0x0F);
+	fb_low_emit_byte(ctx, 0x70);
+	fb_x64_modrm(ctx, 0x03, xmm_dst, xmm_src);
+	fb_x64_imm8(ctx, imm8);
+}
+
+// PANDN xmm_dst, xmm_src: 66 0F DF /r  (~dst & src)
+gb_internal void fb_x64_pandn(fbLowCtx *ctx, u8 xmm_dst, u8 xmm_src) {
+	fb_x64_sse2_rr(ctx, 0xDF, xmm_dst, xmm_src);
+}
+
+// PMINUB xmm_dst, xmm_src: 66 0F DA /r (packed unsigned byte min)
+gb_internal void fb_x64_pminub(fbLowCtx *ctx, u8 xmm_dst, u8 xmm_src) {
+	fb_x64_sse2_rr(ctx, 0xDA, xmm_dst, xmm_src);
+}
+
+// PUNPCKLBW xmm_dst, xmm_src: 66 0F 60 /r (interleave low bytes)
+gb_internal void fb_x64_punpcklbw(fbLowCtx *ctx, u8 xmm_dst, u8 xmm_src) {
+	fb_x64_sse2_rr(ctx, 0x60, xmm_dst, xmm_src);
+}
+
+// PUNPCKLWD xmm_dst, xmm_src: 66 0F 61 /r (interleave low words)
+gb_internal void fb_x64_punpcklwd(fbLowCtx *ctx, u8 xmm_dst, u8 xmm_src) {
+	fb_x64_sse2_rr(ctx, 0x61, xmm_dst, xmm_src);
+}
+
+// Compute the byte size of a SIMD type from its element kind and lane count.
+gb_internal u32 fb_simd_byte_size(fbType ft) {
+	u32 elem_bytes;
+	switch (ft.kind) {
+	case FBT_I8:  elem_bytes = 1; break;
+	case FBT_I16: elem_bytes = 2; break;
+	case FBT_I32: case FBT_F32: elem_bytes = 4; break;
+	case FBT_I64: case FBT_F64: case FBT_PTR: elem_bytes = 8; break;
+	default: elem_bytes = 1; break;
+	}
+	return elem_bytes * cast(u32)ft.lanes;
+}
+
+// Load SIMD vector from memory [base] using appropriate width instruction.
+// Uses MOVDQU for 128-bit, MOVQ for 64-bit, MOVD for 32-bit.
+gb_internal void fb_x64_simd_load_mem(fbLowCtx *ctx, u8 xmm, fbX64Reg base, u32 byte_size) {
+	if (byte_size <= 4) {
+		// MOVD xmm, [base]: 66 [REX] 0F 6E modrm_indirect
+		fb_low_emit_byte(ctx, 0x66);
+		fb_x64_rex_if_needed(ctx, false, xmm, 0, base);
+		fb_low_emit_byte(ctx, 0x0F);
+		fb_low_emit_byte(ctx, 0x6E);
+		fb_x64_modrm_indirect(ctx, xmm, base);
+	} else if (byte_size <= 8) {
+		fb_x64_movq_load_indirect(ctx, xmm, base);
+	} else {
+		fb_x64_movdqu_load_indirect(ctx, xmm, base);
+	}
+}
+
+// Store SIMD vector to memory [base] using appropriate width instruction.
+gb_internal void fb_x64_simd_store_mem(fbLowCtx *ctx, u8 xmm, fbX64Reg base, u32 byte_size) {
+	if (byte_size <= 4) {
+		// MOVD [base], xmm: 66 [REX] 0F 7E modrm_indirect
+		fb_low_emit_byte(ctx, 0x66);
+		fb_x64_rex_if_needed(ctx, false, xmm, 0, base);
+		fb_low_emit_byte(ctx, 0x0F);
+		fb_low_emit_byte(ctx, 0x7E);
+		fb_x64_modrm_indirect(ctx, xmm, base);
+	} else if (byte_size <= 8) {
+		fb_x64_movq_store_indirect(ctx, xmm, base);
+	} else {
+		fb_x64_movdqu_store_indirect(ctx, xmm, base);
+	}
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // Float comparison NaN-safe helper: setcc + set{np,p} + {and,or}
 //
 // UCOMISS/UCOMISD set PF=1 for NaN. Four of the six float comparisons
@@ -959,11 +1175,19 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 
 			// ── Memory ─────────────────────────────────────────
 			case FB_LOAD: {
+				fbType ft = fb_type_unpack(inst->type_raw);
+				if (ft.lanes > 0) {
+					// SIMD load: use width-appropriate instruction
+					fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, 0);
+					u32 vec_bytes = fb_simd_byte_size(ft);
+					fb_x64_simd_load_mem(ctx, FB_XMM0, rptr, vec_bytes);
+					fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
+					break;
+				}
 				fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, 0);
 				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << rptr));
-				fbTypeKind tk = cast(fbTypeKind)(inst->type_raw & 0xFF);
 
-				switch (tk) {
+				switch (ft.kind) {
 				case FBT_I8:
 				case FBT_I1:
 					// movzx r32, byte [rptr]: 0F B6 modrm (32-bit dest zero-extends to 64)
@@ -997,11 +1221,19 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 			}
 
 			case FB_STORE: {
+				fbType ft = fb_type_unpack(inst->type_raw);
+				if (ft.lanes > 0) {
+					// SIMD store: use width-appropriate instruction
+					fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, 0);
+					fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->b);
+					u32 vec_bytes = fb_simd_byte_size(ft);
+					fb_x64_simd_store_mem(ctx, FB_XMM0, rptr, vec_bytes);
+					break;
+				}
 				fbX64Reg rptr = fb_x64_resolve_gp(ctx, inst->a, 0);
 				fbX64Reg rval = fb_x64_resolve_gp(ctx, inst->b, (1u << rptr));
-				fbTypeKind tk = cast(fbTypeKind)(inst->type_raw & 0xFF);
 
-				switch (tk) {
+				switch (ft.kind) {
 				case FBT_I8:
 				case FBT_I1:
 					// mov byte [rptr], rval(8): REX 88 modrm
@@ -1174,12 +1406,47 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				break;
 			}
 
-			// ── Integer arithmetic ─────────────────────────────
-			case FB_ADD: fb_x64_alu_rr(ctx, inst, 0x01); break; // ADD
-			case FB_SUB: fb_x64_alu_rr(ctx, inst, 0x29); break; // SUB
-			case FB_AND: fb_x64_alu_rr(ctx, inst, 0x21); break; // AND
-			case FB_OR:  fb_x64_alu_rr(ctx, inst, 0x09); break; // OR
-			case FB_XOR: fb_x64_alu_rr(ctx, inst, 0x31); break; // XOR
+			// ── Integer arithmetic (scalar and SIMD) ──────────
+			case FB_ADD: {
+				fbType ft = fb_type_unpack(inst->type_raw);
+				if (ft.lanes > 0) {
+					// PADDD for 32-bit lanes, PADDQ for 64-bit lanes
+					u8 opc = (ft.kind == FBT_I64 || ft.kind == FBT_PTR) ? 0xD4 : 0xFE;
+					fb_x64_simd_binop(ctx, inst, opc);
+				} else {
+					fb_x64_alu_rr(ctx, inst, 0x01);
+				}
+				break;
+			}
+			case FB_SUB: {
+				fbType ft = fb_type_unpack(inst->type_raw);
+				if (ft.lanes > 0) {
+					// PSUBD for 32-bit lanes, PSUBQ for 64-bit lanes
+					u8 opc = (ft.kind == FBT_I64 || ft.kind == FBT_PTR) ? 0xFB : 0xFA;
+					fb_x64_simd_binop(ctx, inst, opc);
+				} else {
+					fb_x64_alu_rr(ctx, inst, 0x29);
+				}
+				break;
+			}
+			case FB_AND: {
+				fbType ft = fb_type_unpack(inst->type_raw);
+				if (ft.lanes > 0) { fb_x64_simd_binop(ctx, inst, 0xDB); } // PAND
+				else { fb_x64_alu_rr(ctx, inst, 0x21); }
+				break;
+			}
+			case FB_OR: {
+				fbType ft = fb_type_unpack(inst->type_raw);
+				if (ft.lanes > 0) { fb_x64_simd_binop(ctx, inst, 0xEB); } // POR
+				else { fb_x64_alu_rr(ctx, inst, 0x09); }
+				break;
+			}
+			case FB_XOR: {
+				fbType ft = fb_type_unpack(inst->type_raw);
+				if (ft.lanes > 0) { fb_x64_simd_binop(ctx, inst, 0xEF); } // PXOR
+				else { fb_x64_alu_rr(ctx, inst, 0x31); }
+				break;
+			}
 
 			case FB_MUL: {
 				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
@@ -1206,20 +1473,86 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 			}
 
 			case FB_NOT: {
-				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
-				fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
-				if (rd != ra) fb_x64_mov_rr(ctx, rd, ra);
-				// NOT rd: REX.W F7 /2
-				fb_x64_rex(ctx, true, 2, 0, rd);
-				fb_low_emit_byte(ctx, 0xF7);
-				fb_x64_modrm(ctx, 0x03, 2, rd);
+				fbType ft = fb_type_unpack(inst->type_raw);
+				if (ft.lanes > 0) {
+					// SIMD NOT: XOR with all-ones
+					// PCMPEQD xmm1, xmm1 (set all bits)  then  PXOR xmm0, xmm1
+					fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+					fb_x64_sse2_rr(ctx, 0x76, FB_XMM1, FB_XMM1); // PCMPEQD xmm1, xmm1 → all ones
+					fb_x64_sse2_rr(ctx, 0xEF, FB_XMM0, FB_XMM1); // PXOR xmm0, xmm1
+					fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
+				} else {
+					fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+					fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, (1u << ra));
+					if (rd != ra) fb_x64_mov_rr(ctx, rd, ra);
+					// NOT rd: REX.W F7 /2
+					fb_x64_rex(ctx, true, 2, 0, rd);
+					fb_low_emit_byte(ctx, 0xF7);
+					fb_x64_modrm(ctx, 0x03, 2, rd);
+				}
 				break;
 			}
 
 			// ── Shifts & rotates ───────────────────────────────
-			case FB_SHL:  fb_x64_shift_cl(ctx, inst, 4); break;
-			case FB_LSHR: fb_x64_shift_cl(ctx, inst, 5); break;
-			case FB_ASHR: fb_x64_shift_cl(ctx, inst, 7); break;
+			case FB_SHL: {
+				fbType ft = fb_type_unpack(inst->type_raw);
+				if (ft.lanes > 0) {
+					if (inst->b == FB_NOREG) {
+						// Constant shift (imm field): PSLLD xmm, imm8
+						// opcode 0x72 /6 for dword, 0x73 /6 for qword
+						u8 opc = (ft.kind == FBT_I64 || ft.kind == FBT_PTR) ? 0x73 : 0x72;
+						fb_x64_simd_shift_imm(ctx, inst, opc, 6);
+					} else {
+						// Variable shift: extract lane 0 to XMM1, PSLLD xmm0, xmm1
+						fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+						fb_x64_simd_load_vreg(ctx, FB_XMM1, inst->b);
+						u8 opc = (ft.kind == FBT_I64 || ft.kind == FBT_PTR) ? 0xF3 : 0xF2;
+						fb_x64_sse2_rr(ctx, opc, FB_XMM0, FB_XMM1);
+						fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
+					}
+				} else {
+					fb_x64_shift_cl(ctx, inst, 4);
+				}
+				break;
+			}
+			case FB_LSHR: {
+				fbType ft = fb_type_unpack(inst->type_raw);
+				if (ft.lanes > 0) {
+					if (inst->b == FB_NOREG) {
+						// Constant shift: PSRLD xmm, imm8
+						u8 opc = (ft.kind == FBT_I64 || ft.kind == FBT_PTR) ? 0x73 : 0x72;
+						fb_x64_simd_shift_imm(ctx, inst, opc, 2);
+					} else {
+						// Variable shift: PSRLD xmm0, xmm1
+						fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+						fb_x64_simd_load_vreg(ctx, FB_XMM1, inst->b);
+						u8 opc = (ft.kind == FBT_I64 || ft.kind == FBT_PTR) ? 0xD3 : 0xD2;
+						fb_x64_sse2_rr(ctx, opc, FB_XMM0, FB_XMM1);
+						fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
+					}
+				} else {
+					fb_x64_shift_cl(ctx, inst, 5);
+				}
+				break;
+			}
+			case FB_ASHR: {
+				fbType ft = fb_type_unpack(inst->type_raw);
+				if (ft.lanes > 0) {
+					if (inst->b == FB_NOREG) {
+						// Constant shift: PSRAD xmm, imm8
+						fb_x64_simd_shift_imm(ctx, inst, 0x72, 4);
+					} else {
+						// Variable shift: PSRAD xmm0, xmm1
+						fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+						fb_x64_simd_load_vreg(ctx, FB_XMM1, inst->b);
+						fb_x64_sse2_rr(ctx, 0xE2, FB_XMM0, FB_XMM1);
+						fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
+					}
+				} else {
+					fb_x64_shift_cl(ctx, inst, 7);
+				}
+				break;
+			}
 			case FB_ROL:  fb_x64_shift_cl(ctx, inst, 0); break;
 			case FB_ROR:  fb_x64_shift_cl(ctx, inst, 1); break;
 
@@ -1235,6 +1568,161 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 			case FB_CMP_SGT: case FB_CMP_SGE:
 			case FB_CMP_ULT: case FB_CMP_ULE:
 			case FB_CMP_UGT: case FB_CMP_UGE: {
+				// Check for SIMD lane-wise comparison (result is vector mask)
+				fbType cmp_ft = fb_type_unpack(inst->type_raw);
+				if (cmp_ft.lanes > 0) {
+					// SSE2 packed integer comparison opcodes by element size:
+					//   PCMPEQB=0x74, PCMPEQW=0x75, PCMPEQD=0x76
+					//   PCMPGTB=0x64, PCMPGTW=0x65, PCMPGTD=0x66
+					u8 eq_opc, gt_opc;
+					switch (cmp_ft.kind) {
+					case FBT_I8:  eq_opc = 0x74; gt_opc = 0x64; break;
+					case FBT_I16: eq_opc = 0x75; gt_opc = 0x65; break;
+					default:      eq_opc = 0x76; gt_opc = 0x66; break; // I32
+					}
+
+					fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+					fb_x64_simd_load_vreg(ctx, FB_XMM1, inst->b);
+
+					switch (inst->op) {
+					case FB_CMP_EQ:
+						// PCMPEQ: result[i] = (a[i] == b[i]) ? 0xFF : 0x00
+						fb_x64_sse2_rr(ctx, eq_opc, FB_XMM0, FB_XMM1);
+						break;
+
+					case FB_CMP_NE:
+						// PCMPEQ then invert: ~(a == b)
+						fb_x64_sse2_rr(ctx, eq_opc, FB_XMM0, FB_XMM1);
+						// XOR with all-ones: PCMPEQD xmm2,xmm2 then PXOR xmm0,xmm2
+						fb_x64_sse2_rr(ctx, 0x76, FB_XMM2, FB_XMM2); // all ones
+						fb_x64_sse2_rr(ctx, 0xEF, FB_XMM0, FB_XMM2); // PXOR
+						break;
+
+					case FB_CMP_SGT: case FB_CMP_SGE:
+						// PCMPGT: result[i] = (a[i] > b[i]) ? 0xFF : 0x00 (signed)
+						if (inst->op == FB_CMP_SGE) {
+							// a >= b → NOT(b > a): swap and invert
+							fb_x64_sse2_rr(ctx, gt_opc, FB_XMM1, FB_XMM0); // b > a
+							fb_x64_sse2_rr(ctx, 0x76, FB_XMM2, FB_XMM2);   // all ones
+							fb_x64_sse2_rr(ctx, 0xEF, FB_XMM1, FB_XMM2);   // NOT
+							// Result in XMM1, copy to XMM0
+							fb_x64_sse2_rr(ctx, 0x6F, FB_XMM0, FB_XMM1);   // MOVDQA
+						} else {
+							fb_x64_sse2_rr(ctx, gt_opc, FB_XMM0, FB_XMM1);
+						}
+						break;
+
+					case FB_CMP_SLT: case FB_CMP_SLE:
+						// a < b → b > a: swap operands
+						if (inst->op == FB_CMP_SLE) {
+							// a <= b → NOT(a > b)
+							fb_x64_sse2_rr(ctx, gt_opc, FB_XMM0, FB_XMM1); // a > b
+							fb_x64_sse2_rr(ctx, 0x76, FB_XMM2, FB_XMM2);   // all ones
+							fb_x64_sse2_rr(ctx, 0xEF, FB_XMM0, FB_XMM2);   // NOT
+						} else {
+							fb_x64_sse2_rr(ctx, gt_opc, FB_XMM1, FB_XMM0); // b > a
+							fb_x64_sse2_rr(ctx, 0x6F, FB_XMM0, FB_XMM1);   // MOVDQA
+						}
+						break;
+
+					case FB_CMP_UGT: case FB_CMP_UGE:
+					case FB_CMP_ULT: case FB_CMP_ULE: {
+						// Unsigned comparison via bias: XOR both with 0x80 (per element)
+						// to flip the sign bit, then use signed PCMPGT.
+						// Create bias vector: PCMPEQD xmm2,xmm2 (all 1s) then
+						// shift to get 0x80 per byte.
+						// For bytes: PABSB(all_ones) gives 0x01, PSLLW by 7 gives 0x80.
+						// Simpler: use half the max value. For u8:
+						// PCMPEQD xmm2, xmm2 → all 0xFF
+						// PSLLW xmm2, 7 → 0x80 per byte (each word: 0xFF << 7 = 0x80)
+						// Wait, PSLLW shifts within 16-bit words. 0xFFFF << 7 = 0xFF80.
+						// That's wrong for byte-level ops.
+						// Better approach: PCMPEQD → 0xFFFFFFFF, PSRLW by 1 → 0x7F7F...
+						// Not right either. For byte-level: 0x80808080...
+						// = PCMPEQD → all 1s, PABSB → all 0x01, PSLLW 7 still wrong.
+						// Easiest: create 0x80 constant. PCMPEQD → 0xFF, PSLLB? No PSLLB.
+						// Use: PCMPEQD xmm2, xmm2 → all 0xFF = -1 signed bytes
+						// PADDB xmm2, xmm2 → 0xFE... no. Think differently.
+						// 0x80 = average of 0 and 0xFF+1? No.
+						// 0x80 = PSRLW(0xFFFF, 8) → 0x00FF per word, then PACKUSWB?
+						// Getting complex. Just build it: PXOR xmm2,xmm2 (zeros),
+						// PCMPEQD xmm2,xmm2 (ones), shift... Hmm.
+						//
+						// Actually simplest: 0x80 per byte = the integer -128 = 0x80.
+						// PCMPEQD xmm2,xmm2 gives all 1s. Then PSLLW xmm2, 7 gives
+						// each 16-bit word = 0xFF80. Then mask off high byte per word:
+						// PSRLW xmm2, 8 gives 0x00FF. Not right.
+						//
+						// Let me just use: all ones → shift left by 7 within dwords:
+						// PSLLD xmm2, 31 → 0x80000000 per dword. Then PSRLD xmm2, 24
+						// → 0x00000080. Then PACKSSDW? No, I want 0x80 per byte.
+						//
+						// Simplest correct approach: XOR both operands with all-ones (0xFF)
+						// bytes = flip all bits, which for unsigned comparison is equivalent
+						// to: a >u b iff ~a <s ~b (for non-negative after flip).
+						// Wait, that's not quite right either.
+						//
+						// The standard trick for unsigned PCMPGT on bytes:
+						// (a >u b) iff ((a XOR 0x80) >s (b XOR 0x80))
+						// 0x80 per byte. Let me build it as:
+						// MOV eax, 0x80808080; MOVD xmm2, eax; PSHUFD xmm2, xmm2, 0
+						fb_x64_sse2_rr(ctx, 0xEF, FB_XMM2, FB_XMM2); // PXOR xmm2, xmm2 → zero
+
+						// Need a GP register for the constant
+						fbX64Reg rtmp = fb_x64_find_lru(ctx, 0);
+						fb_x64_spill_reg(ctx, rtmp);
+
+						u32 bias_val;
+						switch (cmp_ft.kind) {
+						case FBT_I8:  bias_val = 0x80808080; break;
+						case FBT_I16: bias_val = 0x80008000; break;
+						default:      bias_val = 0x80000000; break;
+						}
+
+						// MOV r32, imm32
+						fb_x64_rex_if_needed(ctx, false, 0, 0, rtmp);
+						fb_low_emit_byte(ctx, cast(u8)(0xB8 + (rtmp & 7)));
+						fb_x64_imm32(ctx, cast(i32)bias_val);
+						// MOVD xmm2, rtmp
+						fb_x64_movd_gp_to_xmm(ctx, FB_XMM2, rtmp);
+						// PSHUFD xmm2, xmm2, 0x00 (broadcast)
+						fb_x64_pshufd(ctx, FB_XMM2, FB_XMM2, 0x00);
+						// XOR both operands with bias
+						fb_x64_sse2_rr(ctx, 0xEF, FB_XMM0, FB_XMM2); // a ^= 0x80
+						fb_x64_sse2_rr(ctx, 0xEF, FB_XMM1, FB_XMM2); // b ^= 0x80
+
+						// Now use signed comparison on the biased values
+						bool want_gt;
+						switch (inst->op) {
+						case FB_CMP_UGT: want_gt = true;  break;
+						case FB_CMP_ULT: want_gt = false; break;
+						case FB_CMP_UGE: want_gt = true;  break; // will invert
+						case FB_CMP_ULE: want_gt = false; break; // will invert
+						default: want_gt = true; break;
+						}
+
+						if (want_gt) {
+							fb_x64_sse2_rr(ctx, gt_opc, FB_XMM0, FB_XMM1); // a > b
+						} else {
+							fb_x64_sse2_rr(ctx, gt_opc, FB_XMM1, FB_XMM0); // b > a
+							fb_x64_sse2_rr(ctx, 0x6F, FB_XMM0, FB_XMM1);   // MOVDQA
+						}
+
+						// Invert for GE/LE
+						if (inst->op == FB_CMP_UGE || inst->op == FB_CMP_ULE) {
+							fb_x64_sse2_rr(ctx, 0x76, FB_XMM2, FB_XMM2); // all ones
+							fb_x64_sse2_rr(ctx, 0xEF, FB_XMM0, FB_XMM2); // NOT
+						}
+						break;
+					}
+
+					default: break;
+					}
+
+					fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
+					break;
+				}
+
 				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
 				fbX64Reg rb = fb_x64_resolve_gp(ctx, inst->b, (1u << ra));
 				// Signed ordering comparisons on sub-64-bit types need
@@ -1292,6 +1780,19 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 
 			// ── Select (conditional move) ─────────────────────
 			case FB_SELECT: {
+				fbType sel_ft = fb_type_unpack(inst->type_raw);
+				if (sel_ft.lanes > 0) {
+					// SIMD select (blend): result = (mask & true_val) | (~mask & false_val)
+					// a=mask, b=true_val, c=false_val
+					fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);  // mask
+					fb_x64_simd_load_vreg(ctx, FB_XMM1, inst->b);  // true_val
+					fb_x64_simd_load_vreg(ctx, FB_XMM2, inst->c);  // false_val
+					fb_x64_sse2_rr(ctx, 0xDB, FB_XMM1, FB_XMM0);  // PAND: true & mask
+					fb_x64_pandn(ctx, FB_XMM0, FB_XMM2);           // PANDN: ~mask & false
+					fb_x64_sse2_rr(ctx, 0xEB, FB_XMM1, FB_XMM0);  // POR: combine
+					fb_x64_simd_store_vreg(ctx, FB_XMM1, inst->r);
+					break;
+				}
 				// cond in a, true_val in b, false_val in c
 				fbX64Reg rcond = fb_x64_resolve_gp(ctx, inst->a, 0);
 				fbX64Reg rtrue = fb_x64_resolve_gp(ctx, inst->b, (1u << rcond));
@@ -2552,9 +3053,194 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				break;
 			}
 
-			// ── SIMD (Phase 8) ──
-			case FB_VSHUFFLE: case FB_VEXTRACT: case FB_VINSERT: case FB_VSPLAT:
-				GB_PANIC("fast backend: SIMD operation not yet lowered (opcode %d)", inst->op);
+			// ── SIMD vector operations ────────────────────────
+			case FB_VEXTRACT: {
+				fbType vt = fb_type_unpack(inst->type_raw);
+				i64 lane = inst->imm;
+
+				if (lane == -1) {
+					// reduce_or: OR all lanes, return nonzero if any set.
+					// Use PMOVMSKB → GP register (tests MSB of each byte).
+					// For comparison masks (0xFF or 0x00 per lane), MSB=1 iff lane set.
+					fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+					fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, 0);
+					fb_x64_pmovmskb(ctx, rd, FB_XMM0);
+					// Result is a bitmask (u16 for 16 bytes). Any nonzero bit means
+					// at least one lane was set. The caller compares with 0, so the
+					// raw bitmask value works (nonzero iff any lane set).
+					// Truncate to u8 range since result type is u8:
+					// MOVZX r32, r8 to clear upper bits and re-canonicalize
+					fb_x64_rex(ctx, false, rd, 0, rd);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xB6);
+					fb_x64_modrm(ctx, 0x03, rd, rd);
+				} else if (lane == -2) {
+					// reduce_min: unsigned byte minimum across all lanes.
+					// PMINUB-fold: halve the vector width each step.
+					fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+
+					// For sub-16-byte vectors (e.g. #simd[8]u8), high bytes are
+					// zero from MOVQ which would pull the min to 0. However, the
+					// reduce_min input is always the output of simd_select which
+					// has 0xFF sentinel in unused lanes. So the full 16-byte fold
+					// is safe — unused lanes are 0xFF and don't affect the minimum.
+
+					// Fold: PSRLDQ by 8, PMINUB, by 4, PMINUB, by 2, PMINUB, by 1, PMINUB
+					fb_x64_sse2_rr(ctx, 0x6F, FB_XMM1, FB_XMM0);  // MOVDQA xmm1, xmm0
+					fb_x64_psrldq(ctx, FB_XMM1, 8);
+					fb_x64_pminub(ctx, FB_XMM0, FB_XMM1);
+
+					fb_x64_sse2_rr(ctx, 0x6F, FB_XMM1, FB_XMM0);
+					fb_x64_psrldq(ctx, FB_XMM1, 4);
+					fb_x64_pminub(ctx, FB_XMM0, FB_XMM1);
+
+					fb_x64_sse2_rr(ctx, 0x6F, FB_XMM1, FB_XMM0);
+					fb_x64_psrldq(ctx, FB_XMM1, 2);
+					fb_x64_pminub(ctx, FB_XMM0, FB_XMM1);
+
+					fb_x64_sse2_rr(ctx, 0x6F, FB_XMM1, FB_XMM0);
+					fb_x64_psrldq(ctx, FB_XMM1, 1);
+					fb_x64_pminub(ctx, FB_XMM0, FB_XMM1);
+
+					// Extract byte 0: MOVD to GP, then MOVZX r32,r8
+					fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, 0);
+					fb_x64_movd_xmm_to_gp(ctx, rd, FB_XMM0);
+					// Zero-extend byte to 64-bit
+					fb_x64_rex(ctx, false, rd, 0, rd);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0xB6);
+					fb_x64_modrm(ctx, 0x03, rd, rd);
+				} else {
+					// Extract single lane to GP register.
+					fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+					fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, 0);
+
+					if (vt.kind == FBT_I32 || vt.kind == FBT_F32) {
+						if (lane != 0) {
+							// PSHUFD to rotate target lane to position 0
+							u8 shuf = cast(u8)lane; // select lane N from all 4 positions
+							fb_x64_pshufd(ctx, FB_XMM0, FB_XMM0, shuf);
+						}
+						fb_x64_movd_xmm_to_gp(ctx, rd, FB_XMM0);
+					} else if (vt.kind == FBT_I64 || vt.kind == FBT_F64 || vt.kind == FBT_PTR) {
+						if (lane != 0) {
+							// PSHUFD to bring high qword to low: shuf = 0x0E (lanes 2,3 → 0,1)
+							fb_x64_pshufd(ctx, FB_XMM0, FB_XMM0, 0x0E);
+						}
+						fb_x64_movq_xmm_to_gp(ctx, rd, FB_XMM0);
+					} else {
+						// Byte/word: shift right by lane*element_bytes, then extract low
+						u32 elem_bytes = (vt.kind == FBT_I16) ? 2 : 1;
+						u32 shift_bytes = cast(u32)lane * elem_bytes;
+						if (shift_bytes > 0) {
+							fb_x64_psrldq(ctx, FB_XMM0, cast(u8)shift_bytes);
+						}
+						fb_x64_movd_xmm_to_gp(ctx, rd, FB_XMM0);
+						// Mask to element width
+						if (vt.kind == FBT_I8) {
+							fb_x64_rex(ctx, false, rd, 0, rd);
+							fb_low_emit_byte(ctx, 0x0F);
+							fb_low_emit_byte(ctx, 0xB6); // MOVZX r32, r8
+							fb_x64_modrm(ctx, 0x03, rd, rd);
+						} else if (vt.kind == FBT_I16) {
+							fb_x64_rex(ctx, false, rd, 0, rd);
+							fb_low_emit_byte(ctx, 0x0F);
+							fb_low_emit_byte(ctx, 0xB7); // MOVZX r32, r16
+							fb_x64_modrm(ctx, 0x03, rd, rd);
+						}
+					}
+				}
+				break;
+			}
+
+			case FB_VINSERT: {
+				// Insert scalar (b) at lane (imm) into vector (a), result in r.
+				// Memory round-trip: copy vector to result spill, store scalar at offset.
+				fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+				fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
+
+				fbType vt = fb_type_unpack(inst->type_raw);
+				u32 elem_bytes;
+				switch (vt.kind) {
+				case FBT_I8:  elem_bytes = 1; break;
+				case FBT_I16: elem_bytes = 2; break;
+				case FBT_I32: case FBT_F32: elem_bytes = 4; break;
+				default: elem_bytes = 8; break;
+				}
+				u32 byte_offset = cast(u32)inst->imm * elem_bytes;
+
+				// Store scalar to the correct byte offset within the spill slot
+				fbX64Reg rval = fb_x64_resolve_gp(ctx, inst->b, 0);
+				i32 slot_offset = fb_x64_spill_offset(ctx, inst->r);
+				i32 elem_offset = slot_offset + cast(i32)byte_offset;
+
+				switch (elem_bytes) {
+				case 1:
+					// MOV [rbp+disp32], r8
+					fb_x64_rex(ctx, false, rval, 0, FB_RBP);
+					fb_low_emit_byte(ctx, 0x88);
+					fb_x64_modrm_rbp_disp32(ctx, rval, elem_offset);
+					break;
+				case 2:
+					// MOV [rbp+disp32], r16
+					fb_low_emit_byte(ctx, 0x66);
+					fb_x64_rex_if_needed(ctx, false, rval, 0, FB_RBP);
+					fb_low_emit_byte(ctx, 0x89);
+					fb_x64_modrm_rbp_disp32(ctx, rval, elem_offset);
+					break;
+				case 4:
+					// MOV [rbp+disp32], r32
+					fb_x64_rex_if_needed(ctx, false, rval, 0, FB_RBP);
+					fb_low_emit_byte(ctx, 0x89);
+					fb_x64_modrm_rbp_disp32(ctx, rval, elem_offset);
+					break;
+				default: // 8
+					// MOV [rbp+disp32], r64
+					fb_x64_rex(ctx, true, rval, 0, FB_RBP);
+					fb_low_emit_byte(ctx, 0x89);
+					fb_x64_modrm_rbp_disp32(ctx, rval, elem_offset);
+					break;
+				}
+				break;
+			}
+
+			case FB_VSPLAT: {
+				// Broadcast scalar (a) to all lanes.
+				fbType vt = fb_type_unpack(inst->type_raw);
+				fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
+
+				if (vt.kind == FBT_I64 || vt.kind == FBT_F64 || vt.kind == FBT_PTR) {
+					// MOVQ xmm0, r64; PSHUFD xmm0, xmm0, 0x44 (broadcast qword)
+					fb_x64_movq_gp_to_xmm(ctx, FB_XMM0, ra);
+					fb_x64_pshufd(ctx, FB_XMM0, FB_XMM0, 0x44); // 01 00 01 00 = low qword to both
+				} else if (vt.kind == FBT_I32 || vt.kind == FBT_F32) {
+					// MOVD xmm0, r32; PSHUFD xmm0, xmm0, 0x00 (broadcast dword)
+					fb_x64_movd_gp_to_xmm(ctx, FB_XMM0, ra);
+					fb_x64_pshufd(ctx, FB_XMM0, FB_XMM0, 0x00);
+				} else if (vt.kind == FBT_I16) {
+					// MOVD xmm0, r32; PSHUFLW xmm0, xmm0, 0; PSHUFD xmm0, xmm0, 0
+					fb_x64_movd_gp_to_xmm(ctx, FB_XMM0, ra);
+					// PSHUFLW xmm0, xmm0, 0x00: F2 0F 70 /r imm8
+					fb_low_emit_byte(ctx, 0xF2);
+					fb_low_emit_byte(ctx, 0x0F);
+					fb_low_emit_byte(ctx, 0x70);
+					fb_x64_modrm(ctx, 0x03, FB_XMM0, FB_XMM0);
+					fb_x64_imm8(ctx, 0x00);
+					fb_x64_pshufd(ctx, FB_XMM0, FB_XMM0, 0x00);
+				} else {
+					// I8: MOVD, PUNPCKLBW(self), PUNPCKLWD(self), PSHUFD 0x00
+					fb_x64_movd_gp_to_xmm(ctx, FB_XMM0, ra);
+					fb_x64_punpcklbw(ctx, FB_XMM0, FB_XMM0);
+					fb_x64_punpcklwd(ctx, FB_XMM0, FB_XMM0);
+					fb_x64_pshufd(ctx, FB_XMM0, FB_XMM0, 0x00);
+				}
+
+				fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
+				break;
+			}
+
+			case FB_VSHUFFLE:
+				GB_PANIC("fast backend: FB_VSHUFFLE not yet lowered");
 				break;
 
 			// ── Inline assembly ──

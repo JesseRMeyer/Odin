@@ -540,6 +540,14 @@ gb_internal fbValue fb_const_value(fbBuilder *b, Type *type, ExactValue value) {
 		return s.base;
 	}
 
+	case ExactValue_Compound: {
+		// Compound constant (e.g. SIMD vector constant, struct literal).
+		// Delegate to compound literal builder.
+		Ast *node = value.value_compound;
+		fbAddr addr = fb_build_compound_lit(b, node);
+		return fb_addr_load(b, addr);
+	}
+
 	case ExactValue_Complex:
 	case ExactValue_Quaternion:
 	case ExactValue_Typeid:
@@ -1661,6 +1669,27 @@ gb_internal fbAddr fb_build_compound_lit(fbBuilder *b, Ast *expr) {
 		break;
 	}
 
+	case Type_SimdVector: {
+		// SimdVector compound literal: #simd[N]T{e0, e1, ..., eN-1}
+		// Elements are stored contiguously in memory.
+		Type *elem_type = bt->SimdVector.elem;
+		i64 elem_size = type_size_of(elem_type);
+		i64 count = bt->SimdVector.count;
+
+		for (i64 i = 0; i < cl->elems.count && i < count; i++) {
+			Ast *elem_expr = cl->elems[i];
+			if (elem_expr->kind == Ast_FieldValue) {
+				elem_expr = elem_expr->FieldValue.value;
+			}
+			fbValue val = fb_build_expr(b, elem_expr);
+			val = fb_emit_conv(b, val, elem_type);
+			fbValue dst = v.base;
+			if (i > 0) dst = fb_emit_member(b, v.base, i * elem_size);
+			fb_emit_store(b, dst, val);
+		}
+		break;
+	}
+
 	default:
 		GB_PANIC("fast backend: compound literal for type kind %d not yet supported (%s)",
 			bt->kind, type_to_string(type));
@@ -2065,6 +2094,51 @@ gb_internal fbValue fb_handle_param_value(fbBuilder *b, Type *param_type, Parame
 	case ParameterValue_Expression: {
 		Ast *orig = pv.original_ast_expr;
 		if (orig != nullptr) {
+			if (orig->kind == Ast_BasicDirective) {
+				// Bare #caller_expression: convert the call expression to a string
+				gbString expr_str = expr_to_string(call_expr, temporary_allocator());
+				String s = make_string_c(expr_str);
+				ExactValue sv = exact_value_string(s);
+				return fb_const_value(b, t_string, sv);
+			}
+			// Parametrized #caller_expression(param_name):
+			// Find the referenced parameter's argument at the call site.
+			if (orig->kind == Ast_CallExpr && orig->CallExpr.proc->kind == Ast_BasicDirective) {
+				GB_ASSERT(orig->CallExpr.args.count == 1);
+				Ast *target = orig->CallExpr.args[0];
+				GB_ASSERT(target->kind == Ast_Ident);
+				String target_str = target->Ident.token.string;
+
+				// Look up the parameter index in the callee's procedure type
+				ast_node(ce, CallExpr, call_expr);
+				Type *callee_type = type_of_expr(ce->proc);
+				if (callee_type != nullptr) callee_type = base_type(callee_type);
+				isize param_idx = -1;
+				if (callee_type != nullptr && callee_type->kind == Type_Proc) {
+					param_idx = lookup_procedure_parameter(callee_type, target_str);
+				}
+
+				// Find the corresponding argument at the call site
+				Ast *target_expr = nullptr;
+				if (param_idx >= 0 && ce->split_args != nullptr) {
+					if (ce->split_args->positional.count > param_idx) {
+						target_expr = ce->split_args->positional[param_idx];
+					}
+					for_array(i, ce->split_args->named) {
+						Ast *arg = ce->split_args->named[i];
+						ast_node(fv, FieldValue, arg);
+						if (fv->field->kind == Ast_Ident && fv->field->Ident.token.string == target_str) {
+							target_expr = fv->value;
+							break;
+						}
+					}
+				}
+
+				gbString expr_str = expr_to_string(target_expr, temporary_allocator());
+				String s = make_string_c(expr_str);
+				ExactValue sv = exact_value_string(s);
+				return fb_const_value(b, t_string, sv);
+			}
 			return fb_build_expr(b, orig);
 		}
 		// Fallthrough to zero

@@ -85,6 +85,12 @@ gb_internal fbType fb_data_type(Type *t) {
 
 	case Type_Enum:
 		return fb_data_type(t->Enum.base_type);
+
+	case Type_SimdVector: {
+		fbType elem_ft = fb_data_type(t->SimdVector.elem);
+		elem_ft.lanes = cast(u8)t->SimdVector.count;
+		return elem_ft;
+	}
 	}
 
 	return FB_VOID;

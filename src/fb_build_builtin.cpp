@@ -433,6 +433,250 @@ gb_internal fbValue fb_build_atomic_builtin(fbBuilder *b, Ast *expr, TypeAndValu
 }
 
 // ───────────────────────────────────────────────────────────────────────
+// SIMD builtins
+// ───────────────────────────────────────────────────────────────────────
+
+gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue const &tv, BuiltinProcId id) {
+	ast_node(ce, CallExpr, expr);
+	Type *type = type_of_expr(expr);
+	Type *bt = base_type(type);
+
+	switch (id) {
+	// ── Lane-wise arithmetic ─────────────────────────────────────
+	case BuiltinProc_simd_add:
+	case BuiltinProc_simd_sub:
+	case BuiltinProc_simd_mul: {
+		fbValue a = fb_build_expr(b, ce->args[0]);
+		fbValue b_ = fb_build_expr(b, ce->args[1]);
+		Type *elem = base_type(type)->SimdVector.elem;
+		bool is_float = is_type_float(elem);
+
+		fbOp op;
+		switch (id) {
+		case BuiltinProc_simd_add: op = is_float ? FB_FADD : FB_ADD; break;
+		case BuiltinProc_simd_sub: op = is_float ? FB_FSUB : FB_SUB; break;
+		case BuiltinProc_simd_mul: op = is_float ? FB_FMUL : FB_MUL; break;
+		default: GB_PANIC("unreachable"); op = FB_ADD; break;
+		}
+		return fb_emit_arith(b, op, a, b_, type);
+	}
+
+	// ── Lane-wise bitwise ────────────────────────────────────────
+	case BuiltinProc_simd_bit_and:
+	case BuiltinProc_simd_bit_or:
+	case BuiltinProc_simd_bit_xor: {
+		fbValue a = fb_build_expr(b, ce->args[0]);
+		fbValue b_ = fb_build_expr(b, ce->args[1]);
+
+		fbOp op;
+		switch (id) {
+		case BuiltinProc_simd_bit_and: op = FB_AND; break;
+		case BuiltinProc_simd_bit_or:  op = FB_OR;  break;
+		case BuiltinProc_simd_bit_xor: op = FB_XOR; break;
+		default: GB_PANIC("unreachable"); op = FB_XOR; break;
+		}
+		return fb_emit_arith(b, op, a, b_, type);
+	}
+
+	case BuiltinProc_simd_bit_and_not: {
+		fbValue a = fb_build_expr(b, ce->args[0]);
+		fbValue b_ = fb_build_expr(b, ce->args[1]);
+		// a & ~b  →  PANDN in SSE2 (b_not = NOT b, result = AND a, b_not)
+		fbType ft = fb_data_type(type);
+		fbValue b_not;
+		b_not.id = fb_inst_emit(b->proc, FB_NOT, ft, b_.id, FB_NOREG, FB_NOREG, 0, 0);
+		b_not.type = type;
+		return fb_emit_arith(b, FB_AND, a, b_not, type);
+	}
+
+	case BuiltinProc_simd_bit_not: {
+		fbValue a = fb_build_expr(b, ce->args[0]);
+		fbType ft = fb_data_type(type);
+		fbValue r;
+		r.id = fb_inst_emit(b->proc, FB_NOT, ft, a.id, FB_NOREG, FB_NOREG, 0, 0);
+		r.type = type;
+		return r;
+	}
+
+	// ── Lane-wise shifts ─────────────────────────────────────────
+	// SSE2 PSLLD/PSRLD/PSRAD use a single shift count from the low
+	// 64 bits of the source operand. For uniform shift vectors (all
+	// lanes same value), we extract the scalar count and store it in
+	// imm, then the lowerer can use the immediate form directly.
+	case BuiltinProc_simd_shl:
+	case BuiltinProc_simd_shr:
+	case BuiltinProc_simd_shl_masked:
+	case BuiltinProc_simd_shr_masked: {
+		fbValue a = fb_build_expr(b, ce->args[0]);
+		Type *elem = bt->SimdVector.elem;
+		bool is_signed = is_type_integer(elem) && !is_type_unsigned(elem);
+
+		fbOp op;
+		if (id == BuiltinProc_simd_shl || id == BuiltinProc_simd_shl_masked) {
+			op = FB_SHL;
+		} else {
+			op = is_signed ? FB_ASHR : FB_LSHR;
+		}
+
+		// Try to extract compile-time constant shift amount from the
+		// shift vector argument (handles both scalar and splat vector).
+		TypeAndValue shift_tv = type_and_value_of_expr(ce->args[1]);
+		i64 shift_amount = -1;
+		if (shift_tv.value.kind != ExactValue_Invalid) {
+			shift_amount = exact_value_to_i64(shift_tv.value);
+		}
+
+		fbType ft = fb_data_type(type);
+		if (shift_amount >= 0) {
+			// Constant shift: store in imm field. Lowerer uses PSLLD/PSRLD imm8.
+			// For Odin semantics: if shift >= bit_width, PSLLD already zeros.
+			fbValue r;
+			r.id = fb_inst_emit(b->proc, op, ft, a.id, FB_NOREG, FB_NOREG, 0, shift_amount);
+			r.type = type;
+			return r;
+		}
+
+		// Non-constant: build shift vector, extract lane 0, use as scalar.
+		fbValue b_ = fb_build_expr(b, ce->args[1]);
+		fbValue r;
+		r.id = fb_inst_emit(b->proc, op, ft, a.id, b_.id, FB_NOREG, 0, 0);
+		r.type = type;
+		return r;
+	}
+
+	// ── Extract / Replace / Shuffle ──────────────────────────────
+	case BuiltinProc_simd_extract: {
+		fbValue vec = fb_build_expr(b, ce->args[0]);
+		// Lane index is a compile-time constant
+		TypeAndValue idx_tv = type_and_value_of_expr(ce->args[1]);
+		i64 lane = exact_value_to_i64(idx_tv.value);
+		Type *elem = bt->SimdVector.elem;
+		fbType ft = fb_data_type(elem);
+		fbValue r;
+		r.id = fb_inst_emit(b->proc, FB_VEXTRACT, ft, vec.id, FB_NOREG, FB_NOREG, 0, lane);
+		r.type = elem;
+		return r;
+	}
+
+	case BuiltinProc_simd_replace: {
+		fbValue vec = fb_build_expr(b, ce->args[0]);
+		TypeAndValue idx_tv = type_and_value_of_expr(ce->args[1]);
+		i64 lane = exact_value_to_i64(idx_tv.value);
+		fbValue val = fb_build_expr(b, ce->args[2]);
+		fbType ft = fb_data_type(type);
+		fbValue r;
+		r.id = fb_inst_emit(b->proc, FB_VINSERT, ft, vec.id, val.id, FB_NOREG, 0, lane);
+		r.type = type;
+		return r;
+	}
+
+	// ── Lane-wise comparison ─────────────────────────────────────
+	case BuiltinProc_simd_lanes_eq:
+	case BuiltinProc_simd_lanes_ne:
+	case BuiltinProc_simd_lanes_lt:
+	case BuiltinProc_simd_lanes_le:
+	case BuiltinProc_simd_lanes_gt:
+	case BuiltinProc_simd_lanes_ge: {
+		fbValue a = fb_build_expr(b, ce->args[0]);
+		fbValue b_ = fb_build_expr(b, ce->args[1]);
+		Type *arg_type = type_of_expr(ce->args[0]);
+		Type *arg_bt = base_type(arg_type);
+		Type *elem = arg_bt->SimdVector.elem;
+		bool is_signed_int = is_type_integer(elem) && !is_type_unsigned(elem);
+		bool is_float_elem = is_type_float(elem);
+
+		fbOp cmp_op;
+		switch (id) {
+		case BuiltinProc_simd_lanes_eq: cmp_op = is_float_elem ? FB_CMP_FEQ : FB_CMP_EQ; break;
+		case BuiltinProc_simd_lanes_ne: cmp_op = is_float_elem ? FB_CMP_FNE : FB_CMP_NE; break;
+		case BuiltinProc_simd_lanes_lt: cmp_op = is_float_elem ? FB_CMP_FLT : (is_signed_int ? FB_CMP_SLT : FB_CMP_ULT); break;
+		case BuiltinProc_simd_lanes_le: cmp_op = is_float_elem ? FB_CMP_FLE : (is_signed_int ? FB_CMP_SLE : FB_CMP_ULE); break;
+		case BuiltinProc_simd_lanes_gt: cmp_op = is_float_elem ? FB_CMP_FGT : (is_signed_int ? FB_CMP_SGT : FB_CMP_UGT); break;
+		case BuiltinProc_simd_lanes_ge: cmp_op = is_float_elem ? FB_CMP_FGE : (is_signed_int ? FB_CMP_SGE : FB_CMP_UGE); break;
+		default: GB_PANIC("unreachable"); cmp_op = FB_CMP_EQ; break;
+		}
+
+		fbType ft = fb_data_type(type);
+		fbValue r;
+		r.id = fb_inst_emit(b->proc, cmp_op, ft, a.id, b_.id, FB_NOREG, 0, 0);
+		r.type = type;
+		return r;
+	}
+
+	// ── Reductions ───────────────────────────────────────────────
+	case BuiltinProc_simd_reduce_or: {
+		fbValue a = fb_build_expr(b, ce->args[0]);
+		Type *arg_type = type_of_expr(ce->args[0]);
+		fbType src_ft = fb_data_type(arg_type);
+		fbType dst_ft = fb_data_type(type);
+		// Horizontal OR reduction: extract to scalar via a new opcode
+		// We use FB_VEXTRACT with lane=-1 as a convention for "reduce_or"
+		fbValue r;
+		r.id = fb_inst_emit(b->proc, FB_VEXTRACT, dst_ft, a.id, FB_NOREG, FB_NOREG, 0, -1);
+		r.type = type;
+		return r;
+	}
+
+	case BuiltinProc_simd_reduce_min: {
+		fbValue a = fb_build_expr(b, ce->args[0]);
+		fbType dst_ft = fb_data_type(type);
+		// Horizontal MIN reduction: use lane=-2 convention
+		fbValue r;
+		r.id = fb_inst_emit(b->proc, FB_VEXTRACT, dst_ft, a.id, FB_NOREG, FB_NOREG, 0, -2);
+		r.type = type;
+		return r;
+	}
+
+	// ── Select (blend) ───────────────────────────────────────────
+	case BuiltinProc_simd_select: {
+		// simd_select(mask, true_val, false_val)
+		fbValue mask = fb_build_expr(b, ce->args[0]);
+		fbValue t_val = fb_build_expr(b, ce->args[1]);
+		fbValue f_val = fb_build_expr(b, ce->args[2]);
+		fbType ft = fb_data_type(type);
+		fbValue r;
+		r.id = fb_inst_emit(b->proc, FB_SELECT, ft, mask.id, t_val.id, f_val.id, 0, 0);
+		r.type = type;
+		return r;
+	}
+
+	// ── Indices (iota) ───────────────────────────────────────────
+	case BuiltinProc_simd_indices: {
+		// Returns a vector {0, 1, 2, ..., N-1}
+		// Build as a compound literal on the stack
+		i64 count = bt->SimdVector.count;
+		Type *elem = bt->SimdVector.elem;
+		i64 elem_size = type_size_of(elem);
+		fbAddr v = fb_add_local(b, type, nullptr, false);
+		for (i64 i = 0; i < count; i++) {
+			fbValue val = fb_emit_iconst(b, elem, i);
+			fbValue dst = v.base;
+			if (i > 0) dst = fb_emit_member(b, v.base, i * elem_size);
+			fb_emit_store(b, dst, val);
+		}
+		return fb_addr_load(b, v);
+	}
+
+	// ── Neg ──────────────────────────────────────────────────────
+	case BuiltinProc_simd_neg: {
+		fbValue a = fb_build_expr(b, ce->args[0]);
+		Type *elem = bt->SimdVector.elem;
+		bool is_float_elem = is_type_float(elem);
+		fbType ft = fb_data_type(type);
+		fbValue r;
+		r.id = fb_inst_emit(b->proc, is_float_elem ? FB_FNEG : FB_NEG, ft, a.id, FB_NOREG, FB_NOREG, 0, 0);
+		r.type = type;
+		return r;
+	}
+
+	default:
+		GB_PANIC("fast backend: unhandled SIMD builtin '%.*s' (id=%d)",
+			LIT(builtin_procs[id].name), id);
+		return fb_value_nil();
+	}
+}
+
+// ───────────────────────────────────────────────────────────────────────
 // Main dispatch
 // ───────────────────────────────────────────────────────────────────────
 
@@ -440,9 +684,9 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 	ast_node(ce, CallExpr, expr);
 	Type *type = type_of_expr(expr);
 
-	// SIMD builtins: deferred to Phase 8
+	// SIMD builtins
 	if (BuiltinProc__simd_begin < id && id < BuiltinProc__simd_end) {
-		GB_PANIC("fast backend: SIMD builtins not yet supported");
+		return fb_build_simd_builtin(b, expr, tv, id);
 	}
 
 	// Atomic builtins

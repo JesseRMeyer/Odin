@@ -1577,6 +1577,86 @@ test_proc_values :: proc() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// SIMD — compound literals, arithmetic, comparisons, reductions
+// Exit codes 1800-1899
+// ═══════════════════════════════════════════════════════════════════════
+
+import "base:intrinsics"
+
+test_simd :: proc() {
+	// 1800: Basic SIMD compound literal and element access
+	v := #simd[4]u32{10, 20, 30, 40}
+	check(intrinsics.simd_extract(v, 0) == 10, 1800)
+	check(intrinsics.simd_extract(v, 1) == 20, 1801)
+	check(intrinsics.simd_extract(v, 2) == 30, 1802)
+	check(intrinsics.simd_extract(v, 3) == 40, 1803)
+
+	// 1810: SIMD add
+	a := #simd[4]u32{1, 2, 3, 4}
+	b := #simd[4]u32{10, 20, 30, 40}
+	c := intrinsics.simd_add(a, b)
+	check(intrinsics.simd_extract(c, 0) == 11, 1810)
+	check(intrinsics.simd_extract(c, 1) == 22, 1811)
+	check(intrinsics.simd_extract(c, 2) == 33, 1812)
+	check(intrinsics.simd_extract(c, 3) == 44, 1813)
+
+	// 1820: SIMD sub
+	d := intrinsics.simd_sub(b, a)
+	check(intrinsics.simd_extract(d, 0) == 9, 1820)
+	check(intrinsics.simd_extract(d, 3) == 36, 1821)
+
+	// 1830: SIMD bitwise XOR
+	x := #simd[4]u32{0xFF, 0x00, 0xAA, 0x55}
+	y := #simd[4]u32{0x0F, 0x0F, 0x55, 0xAA}
+	z := intrinsics.simd_bit_xor(x, y)
+	check(intrinsics.simd_extract(z, 0) == 0xF0, 1830)
+	check(intrinsics.simd_extract(z, 1) == 0x0F, 1831)
+	check(intrinsics.simd_extract(z, 2) == 0xFF, 1832)
+	check(intrinsics.simd_extract(z, 3) == 0xFF, 1833)
+
+	// 1840: SIMD shift left (constant)
+	s := #simd[4]u32{1, 2, 3, 4}
+	sl := intrinsics.simd_shl(s, #simd[4]u32{4, 4, 4, 4})
+	check(intrinsics.simd_extract(sl, 0) == 16, 1840)
+	check(intrinsics.simd_extract(sl, 1) == 32, 1841)
+
+	// 1850: SIMD lanes_ne on u8 vectors (used by runtime memcmp)
+	p := #simd[16]u8{1,2,3,4,5,6,7,8, 9,10,11,12,13,14,15,16}
+	q := #simd[16]u8{1,2,3,4,5,6,7,8, 9,10,11,12,13,14,15,16}
+	ne1 := intrinsics.simd_lanes_ne(p, q)
+	check(intrinsics.simd_reduce_or(ne1) == 0, 1850) // all equal → no bits set
+
+	r := #simd[16]u8{1,2,3,4,5,6,7,8, 9,10,11,12,13,14,15,99}
+	ne2 := intrinsics.simd_lanes_ne(p, r)
+	check(intrinsics.simd_reduce_or(ne2) != 0, 1851) // last byte differs
+
+	// 1860: SIMD select + reduce_min (the runtime's mismatch-finding pattern)
+	sentinel : #simd[16]u8 = 0xFF
+	indices := intrinsics.simd_indices(#simd[16]u8)
+	sel := intrinsics.simd_select(ne2, indices, sentinel)
+	min_idx := intrinsics.simd_reduce_min(sel)
+	check(cast(int)min_idx == 15, 1860)  // mismatch at index 15
+
+	// 1861: mismatch at index 5
+	r2 := #simd[16]u8{1,2,3,4,5,99,7,8, 9,10,11,12,13,14,15,16}
+	ne3 := intrinsics.simd_lanes_ne(p, r2)
+	sel2 := intrinsics.simd_select(ne3, indices, sentinel)
+	min_idx2 := intrinsics.simd_reduce_min(sel2)
+	check(cast(int)min_idx2 == 5, 1861)
+
+	// 1870: SIMD insert
+	v2 := intrinsics.simd_replace(v, 2, cast(u32)999)
+	check(intrinsics.simd_extract(v2, 0) == 10, 1870)
+	check(intrinsics.simd_extract(v2, 2) == 999, 1871)
+	check(intrinsics.simd_extract(v2, 3) == 40, 1872)
+
+	// 1880: SIMD splat via scalar compound literal
+	sp : #simd[4]u32 = 42
+	check(intrinsics.simd_extract(sp, 0) == 42, 1880)
+	check(intrinsics.simd_extract(sp, 3) == 42, 1881)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Main — run everything
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -1651,6 +1731,8 @@ main :: proc() {
 	test_string_comparison()
 	print_msg("  proc_values...\n")
 	test_proc_values()
+	print_msg("  simd...\n")
+	test_simd()
 	print_msg("ALL PASS\n")
 	exit(0)
 }
