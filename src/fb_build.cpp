@@ -3211,39 +3211,51 @@ gb_internal void fb_build_type_switch_stmt(fbBuilder *b, Ast *node) {
 	Type *ut = base_type(type_deref(parent_type));
 
 	TypeSwitchKind switch_kind = check_valid_type_switch_type(parent_type);
-	if (switch_kind == TypeSwitch_Any) {
-		GB_PANIC("fast backend: 'any' type switches not yet implemented (requires runtime type info)");
-	}
-	GB_ASSERT(switch_kind == TypeSwitch_Union);
+	bool is_any = (switch_kind == TypeSwitch_Any);
 
-	// Get a pointer to the union data.
-	fbValue union_ptr = parent;
+	// Get a pointer to the subject (union or any).
+	fbValue subject_ptr = parent;
 	if (is_parent_ptr) {
-		union_ptr = fb_emit_load(b, parent, type_deref(parent_type));
+		subject_ptr = fb_emit_load(b, parent, type_deref(parent_type));
 	}
-	union_ptr.type = alloc_type_pointer(ut);
 
-	// Preload the tag for dispatch.
-	type_size_of(ut); // ensure layout cached
-	bool is_maybe_ptr = is_type_union_maybe_pointer(ut);
-	bool is_zero_sized = (type_size_of(ut) == 0);
 	fbValue tag = {};
+	fbValue union_ptr = {}; // only used for union paths
+	bool is_maybe_ptr = false;
+	bool is_zero_sized = false;
 
-	if (is_maybe_ptr) {
-		// Maybe-pointer union: load the data pointer (which IS the data).
-		Type *variant_type = ut->Union.variants[0];
-		fbValue data_ptr = union_ptr;
-		data_ptr.type = alloc_type_pointer(variant_type);
-		fbValue data = fb_emit_load(b, data_ptr, variant_type);
-		// Convert to rawptr for nil comparison.
-		data.type = t_rawptr;
-		tag = data;
-	} else if (!is_zero_sized) {
-		// Regular union: load tag from union_ptr + variant_block_size.
-		i64 tag_offset = ut->Union.variant_block_size.load(std::memory_order_relaxed);
-		Type *tag_type = union_tag_type(ut);
-		fbValue tag_ptr = fb_emit_member(b, union_ptr, tag_offset);
-		tag = fb_emit_load(b, tag_ptr, tag_type);
+	if (is_any) {
+		// any is {data: rawptr, id: typeid}. Load the id field for dispatch.
+		subject_ptr.type = alloc_type_pointer(ut);
+		i64 ptr_sz = build_context.ptr_size;
+		fbValue id_ptr = fb_emit_member(b, subject_ptr, ptr_sz);
+		tag = fb_emit_load(b, id_ptr, t_typeid);
+	} else {
+		GB_ASSERT(switch_kind == TypeSwitch_Union);
+		union_ptr = subject_ptr;
+		union_ptr.type = alloc_type_pointer(ut);
+
+		// Preload the tag for dispatch.
+		type_size_of(ut); // ensure layout cached
+		is_maybe_ptr = is_type_union_maybe_pointer(ut);
+		is_zero_sized = (type_size_of(ut) == 0);
+
+		if (is_maybe_ptr) {
+			// Maybe-pointer union: load the data pointer (which IS the data).
+			Type *variant_type = ut->Union.variants[0];
+			fbValue data_ptr = union_ptr;
+			data_ptr.type = alloc_type_pointer(variant_type);
+			fbValue data = fb_emit_load(b, data_ptr, variant_type);
+			// Convert to rawptr for nil comparison.
+			data.type = t_rawptr;
+			tag = data;
+		} else if (!is_zero_sized) {
+			// Regular union: load tag from union_ptr + variant_block_size.
+			i64 tag_offset = ut->Union.variant_block_size.load(std::memory_order_relaxed);
+			Type *tag_type = union_tag_type(ut);
+			fbValue tag_ptr = fb_emit_member(b, union_ptr, tag_offset);
+			tag = fb_emit_load(b, tag_ptr, tag_type);
+		}
 	}
 
 	u32 done_block = fb_new_block(b);
@@ -3276,7 +3288,17 @@ gb_internal void fb_build_type_switch_stmt(fbBuilder *b, Ast *node) {
 			Type *case_type = type_of_expr(type_expr);
 			fbValue cond = {};
 
-			if (is_maybe_ptr) {
+			if (is_any) {
+				// any: compare typeid against compile-time hash.
+				if (is_type_untyped_nil(case_type)) {
+					fbValue nil_id = fb_emit_iconst(b, t_typeid, 0);
+					cond = fb_emit_cmp(b, FB_CMP_EQ, tag, nil_id);
+				} else {
+					u64 case_id = type_hash_canonical_type(case_type);
+					fbValue case_tag = fb_emit_iconst(b, t_typeid, cast(i64)case_id);
+					cond = fb_emit_cmp(b, FB_CMP_EQ, tag, case_tag);
+				}
+			} else if (is_maybe_ptr) {
 				// Maybe-pointer: nil → compare data == 0, variant → compare data != 0.
 				fbValue nil_val = fb_emit_iconst(b, t_rawptr, 0);
 				if (is_type_untyped_nil(case_type)) {
@@ -3341,7 +3363,40 @@ gb_internal void fb_build_type_switch_stmt(fbBuilder *b, Ast *node) {
 			bool by_value = (case_entity->flags & EntityFlag_Value) != 0;
 			bool is_single_variant = (cc->list.count == 1 && !is_type_untyped_nil(type_of_expr(cc->list[0])));
 
-			if (is_single_variant && !is_type_untyped_nil(entity_type)) {
+			if (is_any) {
+				// any type switch: data pointer is field 0 of the any struct.
+				if (is_single_variant && !is_type_untyped_nil(entity_type)) {
+					// Load the data rawptr from field 0.
+					fbValue data_ptr = fb_emit_member(b, subject_ptr, 0);
+					fbValue data = fb_emit_load(b, data_ptr, t_rawptr);
+					// data is rawptr → reinterpret as ^case_type.
+					data.type = alloc_type_pointer(entity_type);
+
+					if (by_value) {
+						fbAddr local = fb_add_local(b, entity_type, case_entity, false);
+						fb_emit_copy_value(b, local.base, fb_addr_load(b, fbAddr{fbAddr_Default, data, entity_type}), entity_type);
+					} else {
+						fbAddr addr = {};
+						addr.kind = fbAddr_Default;
+						addr.base = data;
+						addr.type = entity_type;
+						map_set(&b->variable_map, case_entity, addr);
+					}
+				} else {
+					// Default or nil case: entity is the full any type.
+					if (by_value) {
+						fbAddr local = fb_add_local(b, entity_type, case_entity, false);
+						fb_emit_copy_value(b, local.base, fb_addr_load(b, fbAddr{fbAddr_Default, subject_ptr, ut}), entity_type);
+					} else {
+						fbAddr addr = {};
+						addr.kind = fbAddr_Default;
+						addr.base = subject_ptr;
+						addr.base.type = alloc_type_pointer(entity_type);
+						addr.type = entity_type;
+						map_set(&b->variable_map, case_entity, addr);
+					}
+				}
+			} else if (is_single_variant && !is_type_untyped_nil(entity_type)) {
 				// Single variant case: entity is typed as the variant.
 				if (by_value) {
 					// By-value: allocate local, copy variant data from union.

@@ -1281,6 +1281,120 @@ test_signed_ordering :: proc() {
 	check(pa32^ < b32, 1452)
 }
 
+test_any_type_switch :: proc() {
+	// Basic dispatch: int boxed into any
+	v1: any = 42
+	result1: i32 = 0
+	switch x in v1 {
+	case int:
+		result1 = 1
+	case bool:
+		result1 = 2
+	case f64:
+		result1 = 3
+	}
+	check(result1 == 1, 1500)
+
+	// Bool dispatch
+	v2: any = true
+	result2: i32 = 0
+	switch x in v2 {
+	case int:
+		result2 = 1
+	case bool:
+		result2 = 2
+	case f64:
+		result2 = 3
+	}
+	check(result2 == 2, 1501)
+
+	// Float dispatch
+	v3: any = 3.14
+	result3: i32 = 0
+	switch x in v3 {
+	case int:
+		result3 = 1
+	case bool:
+		result3 = 2
+	case f64:
+		result3 = 3
+	}
+	check(result3 == 3, 1502)
+
+	// Nil any → default case
+	v4: any
+	result4: i32 = 0
+	switch x in v4 {
+	case int:
+		result4 = 1
+	case:
+		result4 = 9
+	}
+	check(result4 == 9, 1503)
+
+	// Read the bound value (by value)
+	v5: any = 123
+	result5: int = 0
+	switch x in v5 {
+	case int:
+		result5 = x
+	}
+	check(result5 == 123, 1510)
+
+	// Read a bool value
+	v6: any = true
+	result6 := false
+	switch x in v6 {
+	case bool:
+		result6 = x
+	}
+	check(result6, 1511)
+
+	// Read an f64 value
+	v7: any = 2.5
+	result7: f64 = 0
+	switch x in v7 {
+	case f64:
+		result7 = x
+	}
+	check(result7 == 2.5, 1512)
+
+	// Unmatched type → default
+	v8: any = 42
+	result8: i32 = 0
+	switch x in v8 {
+	case bool:
+		result8 = 1
+	case f64:
+		result8 = 2
+	case:
+		result8 = 3
+	}
+	check(result8 == 3, 1520)
+
+	// By-reference: mutate the boxed value
+	val9: int = 100
+	v9: any = val9
+	switch &x in v9 {
+	case int:
+		x = 200
+	}
+	// The original val9 was copied into the any, so val9 unchanged.
+	check(val9 == 100, 1530)
+
+	// String type in any
+	v10: any = "hello"
+	result10: i32 = 0
+	switch x in v10 {
+	case string:
+		result10 = 1
+		check(len(x) == 5, 1541)
+	case int:
+		result10 = 2
+	}
+	check(result10 == 1, 1540)
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Main — run everything
 // ═══════════════════════════════════════════════════════════════════════
@@ -1350,6 +1464,8 @@ main :: proc() {
 	test_signed_narrow()
 	print_msg("  signed_ordering...\n")
 	test_signed_ordering()
+	print_msg("  any_type_switch...\n")
+	test_any_type_switch()
 	print_msg("ALL PASS\n")
 	exit(0)
 }

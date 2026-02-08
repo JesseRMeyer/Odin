@@ -1786,6 +1786,12 @@ Signed narrow-type ICONST fix (`fb_emit_iconst`):
 - **Fix:** `fb_emit_cmp` now stores packed operand type in `imm` for signed comparisons (FB_CMP_SLT through FB_CMP_SGE), same pattern already used for float comparisons. The x86-64 lowerer decodes the type and emits type-width CMP: 8-bit (`0x38`), 16-bit (`0x66 0x39`), 32-bit (`0x39`), 64-bit (`REX.W 0x39`).
 - **EQ/NE and unsigned comparisons remain 64-bit** — correct because zero-extended values have identical bit patterns for equality and unsigned ordering.
 
+**`any` type switches (DONE):**
+- Dispatch: load `id` field (offset `ptr_size`) from `any` struct, compare against `type_hash_canonical_type(case_type)` for each case clause.
+- Data binding: load `data` field (offset 0) — a `rawptr` — and cast to `^case_type`. By-value copies through the pointer; by-reference binds the pointer directly.
+- Nil/default cases: compare `id == 0` for nil; default falls through as usual.
+- Reuses the same chain-of-comparisons dispatch, scope management, and label handling as union type switches.
+
 **Remaining:**
 
 - Map operations (runtime calls)
@@ -1793,7 +1799,6 @@ Signed narrow-type ICONST fix (`fb_emit_iconst`):
 - Slice operations (`append`, `delete`, `make`, `new`)
 - Dynamic array operations
 - Bit fields, swizzle
-- `any` type switches (requires runtime type info)
 - Runtime type info generation
 - SIMD builtins, atomic builtins
 
