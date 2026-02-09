@@ -94,7 +94,9 @@ gb_global Timings global_timings = {0};
 
 #if ALLOW_FAST_BACKEND
 #include "fb_ir.h"
+#include "fb_verify.h"
 #include "fb_ir.cpp"
+#include "fb_verify.cpp"
 #include "fb_abi.cpp"
 #include "fb_build.cpp"
 #include "fb_build_builtin.cpp"

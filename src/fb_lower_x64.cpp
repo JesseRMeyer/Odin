@@ -420,6 +420,7 @@ gb_internal void fb_x64_spill_reg(fbLowCtx *ctx, fbX64Reg reg) {
 	}
 	ctx->value_loc[vreg] = offset;
 	ctx->gp[reg].vreg = FB_NOREG;
+	FB_VERIFY(ctx->gp[reg].vreg == FB_NOREG);
 }
 
 // Allocate a GP register for vreg. Finds free or evicts LRU.
@@ -448,6 +449,8 @@ gb_internal fbX64Reg fb_x64_alloc_gp(fbLowCtx *ctx, u32 vreg, u16 exclude_mask) 
 	if (vreg != FB_NOREG) {
 		ctx->value_loc[vreg] = cast(i32)victim;
 	}
+	FB_VERIFY(ctx->gp[victim].vreg == vreg);
+	if (vreg != FB_NOREG) FB_VERIFY(ctx->value_loc[vreg] == cast(i32)victim);
 	return victim;
 }
 
@@ -455,13 +458,13 @@ gb_internal fbX64Reg fb_x64_alloc_gp(fbLowCtx *ctx, u32 vreg, u16 exclude_mask) 
 // If spilled, reload it. If not yet materialized, allocate fresh.
 // exclude_mask: bitmask of registers to avoid when allocating (ignored if value already in a register)
 gb_internal fbX64Reg fb_x64_resolve_gp(fbLowCtx *ctx, u32 vreg, u16 exclude_mask) {
-	GB_ASSERT(vreg < ctx->value_loc_count);
+	FB_VERIFY(vreg < ctx->value_loc_count);
 	i32 loc = ctx->value_loc[vreg];
 
 	// Already in a register?
 	if (loc >= 0 && loc < 16) {
 		fbX64Reg r = cast(fbX64Reg)loc;
-		GB_ASSERT(ctx->gp[r].vreg == vreg);
+		FB_VERIFY(ctx->gp[r].vreg == vreg);
 		ctx->gp[r].last_use = ctx->current_inst_idx;
 		return r;
 	}
@@ -471,11 +474,12 @@ gb_internal fbX64Reg fb_x64_resolve_gp(fbLowCtx *ctx, u32 vreg, u16 exclude_mask
 	if (loc == FB_LOC_NONE && ctx->value_sym && ctx->value_sym[vreg] != FB_NOREG) {
 		fbX64Reg r = fb_x64_alloc_gp(ctx, vreg, exclude_mask);
 		fb_x64_emit_lea_sym(ctx, r, ctx->value_sym[vreg]);
+		FB_VERIFY(ctx->gp[r].vreg == vreg);
 		return r;
 	}
 
 	// Spilled — allocate and reload
-	GB_ASSERT_MSG(loc != FB_LOC_NONE,
+	FB_VERIFY_MSG(loc != FB_LOC_NONE,
 		"fb_x64_resolve_gp: value %u has no location and no symbol reference", vreg);
 	fbX64Reg r = fb_x64_alloc_gp(ctx, vreg, exclude_mask);
 	// Reload from spill slot: mov reg, [rbp+disp32]
@@ -483,20 +487,21 @@ gb_internal fbX64Reg fb_x64_resolve_gp(fbLowCtx *ctx, u32 vreg, u16 exclude_mask
 	fb_low_emit_byte(ctx, 0x8B);
 	fb_x64_modrm_rbp_disp32(ctx, r, loc);
 	ctx->gp[r].dirty = false; // just loaded, matches memory
+	FB_VERIFY(ctx->gp[r].vreg == vreg);
 	return r;
 }
 
 // Move an IR value into a specific physical register.
 // Handles spilling the current occupant, moving from another register, or reloading from stack.
 gb_internal void fb_x64_move_value_to_reg(fbLowCtx *ctx, u32 vreg, fbX64Reg target) {
-	GB_ASSERT_MSG(vreg < ctx->value_loc_count,
+	FB_VERIFY_MSG(vreg < ctx->value_loc_count,
 		"vreg %u >= value_loc_count %u in proc '%.*s' at inst %u",
 		vreg, ctx->value_loc_count, LIT(ctx->proc->name), ctx->current_inst_idx);
 	i32 loc = ctx->value_loc[vreg];
 
 	// Already in the target register — nothing to do
 	if (loc == cast(i32)target) {
-		GB_ASSERT(ctx->gp[target].vreg == vreg);
+		FB_VERIFY(ctx->gp[target].vreg == vreg);
 		ctx->gp[target].last_use = ctx->current_inst_idx;
 		return;
 	}
@@ -527,6 +532,8 @@ gb_internal void fb_x64_move_value_to_reg(fbLowCtx *ctx, u32 vreg, fbX64Reg targ
 	ctx->gp[target].last_use = ctx->current_inst_idx;
 	ctx->gp[target].dirty    = (loc >= 0 || loc == FB_LOC_NONE); // clean only when reloaded from spill slot
 	ctx->value_loc[vreg]     = cast(i32)target;
+	FB_VERIFY(ctx->gp[target].vreg == vreg);
+	FB_VERIFY(ctx->value_loc[vreg] == cast(i32)target);
 }
 
 // ───────────────────────────────────────────────────────────────────────
@@ -1096,6 +1103,7 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 		// All values are already on the stack — spilled by reset_regs
 		// before the previous block's terminator.
 		fb_x64_clear_reg_state(ctx);
+		fb_verify_regalloc(ctx);
 
 		fbBlock *blk = &p->blocks[bi];
 		for (u32 ii = 0; ii < blk->inst_count; ii++) {

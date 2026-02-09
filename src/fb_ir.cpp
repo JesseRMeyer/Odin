@@ -1,6 +1,11 @@
 // Fast Backend IR — module lifecycle, type helpers, instruction emission,
 // procedure lifecycle, name mangling, code generation orchestration
 
+// Recovery flag: set by fb_build.cpp to enable signal-based recovery.
+// Cleared by FB_VERIFY before trapping so compiler bugs crash hard.
+// Defined here (before fb_verify.h is used) so all fb_*.cpp files can reference it.
+gb_global thread_local volatile bool fb_recovery_active = false;
+
 // Maps Odin Type* to fbType (machine-level scalar kind).
 // Returns FB_VOID for aggregate types (structs, arrays, etc.) that live only in memory.
 gb_internal fbType fb_data_type(Type *t) {
@@ -186,6 +191,8 @@ gb_internal u32 fb_inst_emit(fbProc *p, fbOp op, fbType type,
                               u32 a, u32 b, u32 c, u32 loc, i64 imm) {
 	GB_ASSERT_MSG(p->current_block < p->block_count,
 		"fb_inst_emit: no active block");
+	GB_ASSERT(op < FB_OP_COUNT);
+	GB_ASSERT(fb_type_unpack(fb_type_pack(type)).kind < FBT_COUNT);
 
 	if (p->inst_count >= p->inst_cap) {
 		u32 new_cap = p->inst_cap * 2;
@@ -236,6 +243,9 @@ gb_internal void fb_block_start(fbProc *p, u32 block_id) {
 }
 
 gb_internal u32 fb_slot_create(fbProc *p, u32 size, u32 align, Entity *entity, Type *odin_type) {
+	GB_ASSERT(size > 0);
+	GB_ASSERT_MSG(align > 0 && (align & (align - 1)) == 0,
+		"fb_slot_create: align=%u must be power of 2", align);
 	if (p->slot_count >= p->slot_cap) {
 		u32 new_cap = p->slot_cap * 2;
 		if (new_cap < 16) new_cap = 16;
@@ -590,6 +600,7 @@ gb_internal bool fb_generate_code(Checker *c, LinkerData *ld) {
 #endif
 
 	fb_lower_all(m);
+	fb_verify_module(m);
 
 	String obj = fb_emit_object(m);
 	if (obj.len == 0) {

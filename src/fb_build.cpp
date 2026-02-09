@@ -8,8 +8,8 @@
 // Graceful fallback: catch assertion failures during procedure generation.
 // When a proc uses unsupported features, the assert fires __builtin_trap()
 // which raises SIGILL. We catch it and fall back to an empty stub.
+// fb_recovery_active is defined in fb_ir.cpp (before fb_verify.h needs it).
 gb_global thread_local sigjmp_buf fb_recovery_buf;
-gb_global thread_local volatile bool fb_recovery_active = false;
 
 gb_global thread_local volatile const char *fb_recovery_proc_name = nullptr;
 gb_global thread_local volatile int fb_recovery_last_line = 0;
@@ -369,6 +369,7 @@ gb_internal fbValue fb_emit_fconst(fbBuilder *b, Type *type, f64 val) {
 }
 
 gb_internal fbValue fb_emit_load(fbBuilder *b, fbValue ptr, Type *elem_type) {
+	GB_ASSERT(ptr.id != FB_NOREG);
 	fbType ft = fb_data_type(elem_type);
 	if (ft.kind == FBT_VOID) ft = FB_I64; // aggregate: load as i64
 	u32 r = fb_inst_emit(b->proc, FB_LOAD, ft, ptr.id, FB_NOREG, FB_NOREG, 0, 0);
@@ -376,6 +377,8 @@ gb_internal fbValue fb_emit_load(fbBuilder *b, fbValue ptr, Type *elem_type) {
 }
 
 gb_internal void fb_emit_store(fbBuilder *b, fbValue ptr, fbValue val) {
+	GB_ASSERT(ptr.id != FB_NOREG);
+	GB_ASSERT(val.id != FB_NOREG);
 	fbType ft = FB_I64;
 	if (val.type != nullptr) {
 		ft = fb_data_type(val.type);
@@ -385,15 +388,20 @@ gb_internal void fb_emit_store(fbBuilder *b, fbValue ptr, fbValue val) {
 }
 
 gb_internal fbValue fb_emit_alloca_from_slot(fbBuilder *b, u32 slot_idx) {
+	GB_ASSERT(slot_idx < b->proc->slot_count);
 	u32 r = fb_inst_emit(b->proc, FB_ALLOCA, FB_PTR, slot_idx, FB_NOREG, FB_NOREG, 0, 0);
 	return fb_make_value(r, nullptr);
 }
 
 gb_internal void fb_emit_jump(fbBuilder *b, u32 target_block) {
+	GB_ASSERT(target_block < b->proc->block_count);
 	fb_inst_emit(b->proc, FB_JUMP, FB_VOID, target_block, FB_NOREG, FB_NOREG, 0, 0);
 }
 
 gb_internal void fb_emit_branch(fbBuilder *b, fbValue cond, u32 true_blk, u32 false_blk) {
+	GB_ASSERT(cond.id != FB_NOREG);
+	GB_ASSERT(true_blk < b->proc->block_count);
+	GB_ASSERT(false_blk < b->proc->block_count);
 	fb_inst_emit(b->proc, FB_BRANCH, FB_VOID, cond.id, true_blk, false_blk, 0, 0);
 }
 
@@ -406,6 +414,8 @@ gb_internal void fb_emit_ret_void(fbBuilder *b) {
 }
 
 gb_internal fbValue fb_emit_arith(fbBuilder *b, fbOp op, fbValue lhs, fbValue rhs, Type *type) {
+	GB_ASSERT(lhs.id != FB_NOREG);
+	GB_ASSERT(rhs.id != FB_NOREG);
 	fbType ft = fb_data_type(type);
 	if (ft.kind == FBT_VOID) ft = FB_I64;
 	u32 r = fb_inst_emit(b->proc, op, ft, lhs.id, rhs.id, FB_NOREG, 0, 0);
@@ -413,6 +423,8 @@ gb_internal fbValue fb_emit_arith(fbBuilder *b, fbOp op, fbValue lhs, fbValue rh
 }
 
 gb_internal fbValue fb_emit_cmp(fbBuilder *b, fbOp cmp_op, fbValue lhs, fbValue rhs) {
+	GB_ASSERT(lhs.id != FB_NOREG);
+	GB_ASSERT(rhs.id != FB_NOREG);
 	// Store the operand type in imm so the lowerer can emit correctly-sized
 	// comparisons. Float CMP needs this for ucomiss vs ucomisd. Signed integer
 	// CMP needs this for type-width CMP encoding — without it, zero-extended
@@ -431,6 +443,9 @@ gb_internal fbValue fb_emit_cmp(fbBuilder *b, fbOp cmp_op, fbValue lhs, fbValue 
 }
 
 gb_internal fbValue fb_emit_select(fbBuilder *b, fbValue cond, fbValue t, fbValue f, Type *type) {
+	GB_ASSERT(cond.id != FB_NOREG);
+	GB_ASSERT(t.id != FB_NOREG);
+	GB_ASSERT(f.id != FB_NOREG);
 	fbType ft = fb_data_type(type);
 	if (ft.kind == FBT_VOID) ft = FB_I64;
 	u32 r = fb_inst_emit(b->proc, FB_SELECT, ft, cond.id, t.id, f.id, 0, 0);
@@ -438,6 +453,7 @@ gb_internal fbValue fb_emit_select(fbBuilder *b, fbValue cond, fbValue t, fbValu
 }
 
 gb_internal void fb_emit_memzero(fbBuilder *b, fbValue ptr, i64 size, i64 align) {
+	GB_ASSERT(ptr.id != FB_NOREG);
 	// Encoding: a=ptr, b=size_value, imm=alignment
 	fbValue size_val = fb_emit_iconst(b, t_int, size);
 	fb_inst_emit(b->proc, FB_MEMZERO, FB_VOID, ptr.id, size_val.id, FB_NOREG, 0, align);
@@ -449,6 +465,9 @@ gb_internal void fb_emit_memzero_v(fbBuilder *b, fbValue ptr, fbValue size, i64 
 }
 
 gb_internal void fb_emit_memcpy(fbBuilder *b, fbValue dst, fbValue src, fbValue size, i64 align) {
+	GB_ASSERT(dst.id != FB_NOREG);
+	GB_ASSERT(src.id != FB_NOREG);
+	GB_ASSERT(size.id != FB_NOREG);
 	// Encoding: a=dst, b=src, c=size_value, imm=alignment
 	fb_inst_emit(b->proc, FB_MEMCPY, FB_VOID, dst.id, src.id, size.id, 0, align);
 }
@@ -459,11 +478,14 @@ gb_internal fbValue fb_emit_symaddr(fbBuilder *b, u32 sym_idx) {
 }
 
 gb_internal fbValue fb_emit_member(fbBuilder *b, fbValue base, i64 byte_offset) {
+	GB_ASSERT(base.id != FB_NOREG);
 	u32 r = fb_inst_emit(b->proc, FB_MEMBER, FB_PTR, base.id, FB_NOREG, FB_NOREG, 0, byte_offset);
 	return fb_make_value(r, nullptr);
 }
 
 gb_internal fbValue fb_emit_array_access(fbBuilder *b, fbValue base, fbValue index, i64 stride) {
+	GB_ASSERT(base.id != FB_NOREG);
+	GB_ASSERT(index.id != FB_NOREG);
 	u32 r = fb_inst_emit(b->proc, FB_ARRAY, FB_PTR, base.id, index.id, FB_NOREG, 0, stride);
 	return fb_make_value(r, nullptr);
 }
@@ -475,6 +497,7 @@ gb_internal u32 fb_new_block(fbBuilder *b) {
 
 // Switch the insertion point to a block
 gb_internal void fb_set_block(fbBuilder *b, u32 block_id) {
+	GB_ASSERT(block_id < b->proc->block_count);
 	fb_block_start(b->proc, block_id);
 	b->current_block = block_id;
 }
@@ -482,7 +505,7 @@ gb_internal void fb_set_block(fbBuilder *b, u32 block_id) {
 // Check if the current block has a terminator (JUMP/BRANCH/RET/UNREACHABLE)
 gb_internal bool fb_block_is_terminated(fbBuilder *b) {
 	fbProc *p = b->proc;
-	if (p->current_block >= p->block_count) return true;
+	GB_ASSERT(p->current_block < p->block_count);
 	fbBlock *blk = &p->blocks[p->current_block];
 	if (blk->inst_count == 0) return false;
 	u32 last_idx = blk->first_inst + blk->inst_count - 1;
@@ -655,6 +678,7 @@ gb_internal fbValue fb_const_value(fbBuilder *b, Type *type, ExactValue value) {
 }
 
 gb_internal fbAddr fb_add_local(fbBuilder *b, Type *type, Entity *entity, bool zero_init) {
+	GB_ASSERT(type != nullptr);
 	i64 size  = type_size_of(type);
 	i64 align = type_align_of(type);
 	if (size == 0) size = 1;
@@ -699,6 +723,7 @@ gb_internal fbAddr fb_add_local(fbBuilder *b, Type *type, Entity *entity, bool z
 }
 
 gb_internal fbValue fb_addr_load(fbBuilder *b, fbAddr addr) {
+	GB_ASSERT(addr.type != nullptr);
 	if (addr.kind == fbAddr_Default) {
 		// Aggregates (strings, slices, structs): return the pointer.
 		// The caller is responsible for decomposing into scalar loads
@@ -881,6 +906,7 @@ gb_internal fbValue fb_addr_load(fbBuilder *b, fbAddr addr) {
 
 gb_internal void fb_addr_store(fbBuilder *b, fbAddr addr, fbValue val) {
 	if (addr.kind == fbAddr_Default) {
+		GB_ASSERT(addr.base.id != FB_NOREG);
 		fb_emit_copy_value(b, addr.base, val, addr.type);
 		return;
 	}
@@ -6351,6 +6377,7 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 		fb_recovery_proc_name = (const char *)p->name.text;
 		if (sigsetjmp(fb_recovery_buf, 1) == 0) {
 			fb_procedure_generate(&b);
+			fb_verify_proc(p);
 			fb_recovery_active = false;
 		} else {
 			// Recovery: assertion fired during generation.

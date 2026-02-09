@@ -37,6 +37,7 @@ gb_internal fbABIParamInfo fb_abi_classify_type_sysv(Type *t) {
 		return info;
 	}
 
+	GB_ASSERT(core_type(t) != nullptr);
 	t = core_type(t);
 	i64 sz = type_size_of(t);
 

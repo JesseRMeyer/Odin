@@ -514,14 +514,14 @@ gb_internal String fb_emit_elf(fbModule *m) {
 			u32 elf_sym;
 			if (rel->target_sym >= FB_GLOBAL_SYM_BASE) {
 				u32 gidx = rel->target_sym - FB_GLOBAL_SYM_BASE;
-				GB_ASSERT(gidx < global_count);
+				FB_VERIFY(gidx < global_count);
 				elf_sym = global_sym_elf_idx[gidx];
 			} else if (rel->target_sym >= FB_RODATA_SYM_BASE) {
 				u32 ridx = rel->target_sym - FB_RODATA_SYM_BASE;
-				GB_ASSERT(ridx < rodata_count);
+				FB_VERIFY(ridx < rodata_count);
 				elf_sym = rodata_elf_idx[ridx];
 			} else {
-				GB_ASSERT(rel->target_sym < proc_count);
+				FB_VERIFY(rel->target_sym < proc_count);
 				elf_sym = proc_elf_idx[rel->target_sym];
 			}
 			rela.r_info   = ELF64_R_INFO(elf_sym, elf_type);
@@ -541,7 +541,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	fb_buf_init(&reladata_buf, 64);
 	for_array(di, m->data_relocs) {
 		fbDataReloc *dr = &m->data_relocs[di];
-		GB_ASSERT(dr->global_idx < global_count);
+		FB_VERIFY(dr->global_idx < global_count);
 		if (global_is_bss && global_is_bss[dr->global_idx]) {
 			GB_PANIC("data reloc in .bss global %u", dr->global_idx);
 		}
@@ -551,14 +551,14 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		u32 elf_sym;
 		if (dr->target_sym >= FB_GLOBAL_SYM_BASE) {
 			u32 gidx = dr->target_sym - FB_GLOBAL_SYM_BASE;
-			GB_ASSERT(gidx < global_count);
+			FB_VERIFY(gidx < global_count);
 			elf_sym = global_sym_elf_idx[gidx];
 		} else if (dr->target_sym >= FB_RODATA_SYM_BASE) {
 			u32 ridx = dr->target_sym - FB_RODATA_SYM_BASE;
-			GB_ASSERT(ridx < rodata_count);
+			FB_VERIFY(ridx < rodata_count);
 			elf_sym = rodata_elf_idx[ridx];
 		} else {
-			GB_ASSERT(dr->target_sym < proc_count);
+			FB_VERIFY(dr->target_sym < proc_count);
 			elf_sym = proc_elf_idx[dr->target_sym];
 		}
 		rela.r_info   = ELF64_R_INFO(elf_sym, R_X86_64_64);

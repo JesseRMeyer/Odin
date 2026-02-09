@@ -63,6 +63,8 @@ src/                    # All compiler C++14 (monolithic build)
   fb_lower_x64.cpp      # IR → x86-64: fb_lower_proc_x64(), register allocator
   fb_emit_elf.cpp       # ELF .o writer: fb_emit_elf()
   fb_abi.cpp            # SysV ABI: fb_abi_classify_type_sysv()
+  fb_verify.h           # Verification macros (FB_VERIFY), opcode spec table (fbOpSpec)
+  fb_verify.cpp         # Structural verification: fb_verify_proc, fb_verify_module, fb_verify_regalloc
 
   # Tilde backend (cg_ prefix, Windows only)
   tilde.cpp, tilde_expr.cpp, tilde_stmt.cpp, tilde_proc.cpp
@@ -399,6 +401,26 @@ struct fbABIParamInfo { fbABIClass classes[2]; u8 num_classes; Type *odin_type; 
 // Stack overflow: params beyond 6 GP regs arrive at [RBP+16], [RBP+24], ...
 //   Callee copies them to local slots in prologue via fbStackParamLoc
 ```
+
+### Verification — `fb_verify.h` / `fb_verify.cpp`
+
+Three verification layers for the fast backend:
+
+```
+Layer 1: Inline contracts    — GB_ASSERT in emit helpers (recoverable, procs get stubbed)
+Layer 2: Structural verifier — fb_verify_proc (per-proc, after build, recoverable)
+                               fb_verify_module (post-lowering, FB_VERIFY hard crash)
+Layer 3: Register audit      — fb_verify_regalloc (during lowering, FB_VERIFY hard crash)
+```
+
+**FB_VERIFY vs GB_ASSERT**: `FB_VERIFY` clears `fb_recovery_active` before trapping,
+so SIGILL propagates to the default handler → core dump. Use `FB_VERIFY` only in code
+that runs *outside* the recovery scope (lowering, ELF emission, module verification).
+Use `GB_ASSERT` in builder code that runs *inside* the recovery scope.
+
+**Opcode spec table** (`fb_op_specs[FB_OP_COUNT]`): static array declaring per-opcode
+operand roles (`FBO_VALUE`, `FBO_BLOCK`, `FBO_SLOT`, `FBO_AUX`, `FBO_NONE`, `FBO_COUNT`)
+and whether each opcode has a result or is a terminator.
 
 ## Naming conventions
 
