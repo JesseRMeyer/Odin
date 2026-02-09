@@ -1514,9 +1514,17 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 						u8 opc = (ft.kind == FBT_I64 || ft.kind == FBT_PTR) ? 0x73 : 0x72;
 						fb_x64_simd_shift_imm(ctx, inst, opc, 6);
 					} else {
-						// Variable shift: extract lane 0 to XMM1, PSLLD xmm0, xmm1
+						// Variable shift: PSLLD xmm0, xmm1
+						// PSLLD reads the shift count from the low 64 bits of xmm1.
+						// The shift vector has the count replicated across all lanes,
+						// so for sub-64-bit element types we must isolate lane 0 via
+						// MOVD roundtrip (zero-extends 32→128 bits).
 						fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
 						fb_x64_simd_load_vreg(ctx, FB_XMM1, inst->b);
+						if (ft.kind != FBT_I64 && ft.kind != FBT_PTR) {
+							fb_x64_movd_xmm_to_gp(ctx, FB_RAX, FB_XMM1);
+							fb_x64_movd_gp_to_xmm(ctx, FB_XMM1, FB_RAX);
+						}
 						u8 opc = (ft.kind == FBT_I64 || ft.kind == FBT_PTR) ? 0xF3 : 0xF2;
 						fb_x64_sse2_rr(ctx, opc, FB_XMM0, FB_XMM1);
 						fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
@@ -1537,6 +1545,10 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 						// Variable shift: PSRLD xmm0, xmm1
 						fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
 						fb_x64_simd_load_vreg(ctx, FB_XMM1, inst->b);
+						if (ft.kind != FBT_I64 && ft.kind != FBT_PTR) {
+							fb_x64_movd_xmm_to_gp(ctx, FB_RAX, FB_XMM1);
+							fb_x64_movd_gp_to_xmm(ctx, FB_XMM1, FB_RAX);
+						}
 						u8 opc = (ft.kind == FBT_I64 || ft.kind == FBT_PTR) ? 0xD3 : 0xD2;
 						fb_x64_sse2_rr(ctx, opc, FB_XMM0, FB_XMM1);
 						fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
@@ -1556,6 +1568,10 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 						// Variable shift: PSRAD xmm0, xmm1
 						fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
 						fb_x64_simd_load_vreg(ctx, FB_XMM1, inst->b);
+						if (ft.kind != FBT_I64 && ft.kind != FBT_PTR) {
+							fb_x64_movd_xmm_to_gp(ctx, FB_RAX, FB_XMM1);
+							fb_x64_movd_gp_to_xmm(ctx, FB_XMM1, FB_RAX);
+						}
 						fb_x64_sse2_rr(ctx, 0xE2, FB_XMM0, FB_XMM1);
 						fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
 					}

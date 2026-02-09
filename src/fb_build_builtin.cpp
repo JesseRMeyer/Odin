@@ -197,7 +197,7 @@ gb_internal fbValue fb_builtin_abs(fbBuilder *b, fbValue x) {
 	fbValue cond = fb_emit_cmp(b, cmp_op, x, zero);
 
 	fbOp neg_op = is_float ? FB_FNEG : FB_NEG;
-	u32 neg_r = fb_inst_emit(b->proc, neg_op, ft, x.id, FB_NOREG, FB_NOREG, 0, 0);
+	u32 neg_r = fb_inst_emit(b->proc, neg_op, ft, x.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 	fbValue neg = {};
 	neg.id = neg_r;
 	neg.type = t;
@@ -230,7 +230,7 @@ gb_internal fbValue fb_build_atomic_builtin(fbBuilder *b, Ast *expr, TypeAndValu
 
 	case BuiltinProc_atomic_thread_fence: {
 		u8 order = fb_atomic_order_from_odin(ce->args[0]);
-		fb_inst_emit(b->proc, FB_FENCE, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, cast(i64)order);
+		fb_inst_emit(b->proc, FB_FENCE, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, b->current_loc, cast(i64)order);
 		return fb_value_nil();
 	}
 
@@ -238,7 +238,7 @@ gb_internal fbValue fb_build_atomic_builtin(fbBuilder *b, Ast *expr, TypeAndValu
 		// Signal fence is a compiler barrier only — no hardware fence on x86-64.
 		// Emit FB_FENCE with a special flag (bit 3) to mark it as signal-only.
 		u8 order = fb_atomic_order_from_odin(ce->args[0]);
-		fb_inst_emit(b->proc, FB_FENCE, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, cast(i64)(order | 0x08));
+		fb_inst_emit(b->proc, FB_FENCE, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, b->current_loc, cast(i64)(order | 0x08));
 		return fb_value_nil();
 	}
 
@@ -254,7 +254,7 @@ gb_internal fbValue fb_build_atomic_builtin(fbBuilder *b, Ast *expr, TypeAndValu
 			order = fb_atomic_order_from_odin(ce->args[1]);
 		}
 
-		u32 r = fb_inst_emit(b->proc, FB_ATOMIC_LOAD, ft, ptr.id, FB_NOREG, FB_NOREG, 0, 0);
+		u32 r = fb_inst_emit(b->proc, FB_ATOMIC_LOAD, ft, ptr.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		b->proc->insts[b->proc->inst_count - 1].flags = order & FBF_ORDER_MASK;
 		return fb_make_value(r, elem);
 	}
@@ -274,7 +274,7 @@ gb_internal fbValue fb_build_atomic_builtin(fbBuilder *b, Ast *expr, TypeAndValu
 			order = fb_atomic_order_from_odin(ce->args[2]);
 		}
 
-		fb_inst_emit(b->proc, FB_ATOMIC_STORE, ft, ptr.id, val.id, FB_NOREG, 0, 0);
+		fb_inst_emit(b->proc, FB_ATOMIC_STORE, ft, ptr.id, val.id, FB_NOREG, b->current_loc, 0);
 		b->proc->insts[b->proc->inst_count - 1].flags = order & FBF_ORDER_MASK;
 		return fb_value_nil();
 	}
@@ -323,7 +323,7 @@ gb_internal fbValue fb_build_atomic_builtin(fbBuilder *b, Ast *expr, TypeAndValu
 		default: GB_PANIC("unreachable"); op = FB_ATOMIC_ADD; break;
 		}
 
-		u32 r = fb_inst_emit(b->proc, op, ft, ptr.id, val.id, FB_NOREG, 0, 0);
+		u32 r = fb_inst_emit(b->proc, op, ft, ptr.id, val.id, FB_NOREG, b->current_loc, 0);
 		b->proc->insts[b->proc->inst_count - 1].flags = order & FBF_ORDER_MASK;
 		return fb_make_value(r, elem);
 	}
@@ -351,17 +351,17 @@ gb_internal fbValue fb_build_atomic_builtin(fbBuilder *b, Ast *expr, TypeAndValu
 		fb_emit_jump(b, loop_blk);
 		fb_set_block(b, loop_blk);
 
-		u32 old_r = fb_inst_emit(b->proc, FB_ATOMIC_LOAD, ft, ptr.id, FB_NOREG, FB_NOREG, 0, 0);
+		u32 old_r = fb_inst_emit(b->proc, FB_ATOMIC_LOAD, ft, ptr.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		b->proc->insts[b->proc->inst_count - 1].flags = order & FBF_ORDER_MASK;
 		fbValue old_val = fb_make_value(old_r, elem);
 
 		// Compute ~(old & val)
 		fbValue and_val = fb_emit_arith(b, FB_AND, old_val, val, elem);
-		u32 not_r = fb_inst_emit(b->proc, FB_NOT, ft, and_val.id, FB_NOREG, FB_NOREG, 0, 0);
+		u32 not_r = fb_inst_emit(b->proc, FB_NOT, ft, and_val.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		fbValue new_val = fb_make_value(not_r, elem);
 
 		// CAS: try to swap old → new
-		u32 cas_r = fb_inst_emit(b->proc, FB_ATOMIC_CAS, ft, ptr.id, old_val.id, new_val.id, 0, 0);
+		u32 cas_r = fb_inst_emit(b->proc, FB_ATOMIC_CAS, ft, ptr.id, old_val.id, new_val.id, b->current_loc, 0);
 		b->proc->insts[b->proc->inst_count - 1].flags = (order & FBF_ORDER_MASK) | ((order & FBF_ORDER_MASK) << FBF_FAIL_ORDER_SHIFT);
 
 		// CAS returns old value; succeeded if cas_result == expected
@@ -395,7 +395,7 @@ gb_internal fbValue fb_build_atomic_builtin(fbBuilder *b, Ast *expr, TypeAndValu
 			failure_order = fb_atomic_order_from_odin(ce->args[4]);
 		}
 
-		u32 cas_r = fb_inst_emit(b->proc, FB_ATOMIC_CAS, ft, ptr.id, expected.id, desired.id, 0, 0);
+		u32 cas_r = fb_inst_emit(b->proc, FB_ATOMIC_CAS, ft, ptr.id, expected.id, desired.id, b->current_loc, 0);
 		b->proc->insts[b->proc->inst_count - 1].flags =
 			(success_order & FBF_ORDER_MASK) | ((failure_order & FBF_ORDER_MASK) << FBF_FAIL_ORDER_SHIFT);
 		fbValue cas_val = fb_make_value(cas_r, elem);
@@ -484,7 +484,7 @@ gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue 
 		// a & ~b  →  PANDN in SSE2 (b_not = NOT b, result = AND a, b_not)
 		fbType ft = fb_data_type(type);
 		fbValue b_not;
-		b_not.id = fb_inst_emit(b->proc, FB_NOT, ft, b_.id, FB_NOREG, FB_NOREG, 0, 0);
+		b_not.id = fb_inst_emit(b->proc, FB_NOT, ft, b_.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		b_not.type = type;
 		return fb_emit_arith(b, FB_AND, a, b_not, type);
 	}
@@ -493,7 +493,7 @@ gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue 
 		fbValue a = fb_build_expr(b, ce->args[0]);
 		fbType ft = fb_data_type(type);
 		fbValue r;
-		r.id = fb_inst_emit(b->proc, FB_NOT, ft, a.id, FB_NOREG, FB_NOREG, 0, 0);
+		r.id = fb_inst_emit(b->proc, FB_NOT, ft, a.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		r.type = type;
 		return r;
 	}
@@ -518,11 +518,13 @@ gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue 
 			op = is_signed ? FB_ASHR : FB_LSHR;
 		}
 
-		// Try to extract compile-time constant shift amount from the
-		// shift vector argument (handles both scalar and splat vector).
+		// Try to extract compile-time constant shift amount.
+		// Only use the immediate path for scalar integer constants;
+		// compound vector constants (ExactValue_Compound) cannot be
+		// reliably converted to a scalar via exact_value_to_i64.
 		TypeAndValue shift_tv = type_and_value_of_expr(ce->args[1]);
 		i64 shift_amount = -1;
-		if (shift_tv.value.kind != ExactValue_Invalid) {
+		if (shift_tv.value.kind == ExactValue_Integer) {
 			shift_amount = exact_value_to_i64(shift_tv.value);
 		}
 
@@ -531,7 +533,7 @@ gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue 
 			// Constant shift: store in imm field. Lowerer uses PSLLD/PSRLD imm8.
 			// For Odin semantics: if shift >= bit_width, PSLLD already zeros.
 			fbValue r;
-			r.id = fb_inst_emit(b->proc, op, ft, a.id, FB_NOREG, FB_NOREG, 0, shift_amount);
+			r.id = fb_inst_emit(b->proc, op, ft, a.id, FB_NOREG, FB_NOREG, b->current_loc, shift_amount);
 			r.type = type;
 			return r;
 		}
@@ -539,7 +541,7 @@ gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue 
 		// Non-constant: build shift vector, extract lane 0, use as scalar.
 		fbValue b_ = fb_build_expr(b, ce->args[1]);
 		fbValue r;
-		r.id = fb_inst_emit(b->proc, op, ft, a.id, b_.id, FB_NOREG, 0, 0);
+		r.id = fb_inst_emit(b->proc, op, ft, a.id, b_.id, FB_NOREG, b->current_loc, 0);
 		r.type = type;
 		return r;
 	}
@@ -550,10 +552,12 @@ gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue 
 		// Lane index is a compile-time constant
 		TypeAndValue idx_tv = type_and_value_of_expr(ce->args[1]);
 		i64 lane = exact_value_to_i64(idx_tv.value);
-		Type *elem = bt->SimdVector.elem;
+		Type *vec_bt = base_type(type_of_expr(ce->args[0]));
+		GB_ASSERT(vec_bt->kind == Type_SimdVector);
+		Type *elem = vec_bt->SimdVector.elem;
 		fbType ft = fb_data_type(elem);
 		fbValue r;
-		r.id = fb_inst_emit(b->proc, FB_VEXTRACT, ft, vec.id, FB_NOREG, FB_NOREG, 0, lane);
+		r.id = fb_inst_emit(b->proc, FB_VEXTRACT, ft, vec.id, FB_NOREG, FB_NOREG, b->current_loc, lane);
 		r.type = elem;
 		return r;
 	}
@@ -565,7 +569,7 @@ gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue 
 		fbValue val = fb_build_expr(b, ce->args[2]);
 		fbType ft = fb_data_type(type);
 		fbValue r;
-		r.id = fb_inst_emit(b->proc, FB_VINSERT, ft, vec.id, val.id, FB_NOREG, 0, lane);
+		r.id = fb_inst_emit(b->proc, FB_VINSERT, ft, vec.id, val.id, FB_NOREG, b->current_loc, lane);
 		r.type = type;
 		return r;
 	}
@@ -598,7 +602,7 @@ gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue 
 
 		fbType ft = fb_data_type(type);
 		fbValue r;
-		r.id = fb_inst_emit(b->proc, cmp_op, ft, a.id, b_.id, FB_NOREG, 0, 0);
+		r.id = fb_inst_emit(b->proc, cmp_op, ft, a.id, b_.id, FB_NOREG, b->current_loc, 0);
 		r.type = type;
 		return r;
 	}
@@ -612,7 +616,7 @@ gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue 
 		// Horizontal OR reduction: extract to scalar via a new opcode
 		// We use FB_VEXTRACT with lane=-1 as a convention for "reduce_or"
 		fbValue r;
-		r.id = fb_inst_emit(b->proc, FB_VEXTRACT, dst_ft, a.id, FB_NOREG, FB_NOREG, 0, -1);
+		r.id = fb_inst_emit(b->proc, FB_VEXTRACT, dst_ft, a.id, FB_NOREG, FB_NOREG, b->current_loc, -1);
 		r.type = type;
 		return r;
 	}
@@ -622,7 +626,7 @@ gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue 
 		fbType dst_ft = fb_data_type(type);
 		// Horizontal MIN reduction: use lane=-2 convention
 		fbValue r;
-		r.id = fb_inst_emit(b->proc, FB_VEXTRACT, dst_ft, a.id, FB_NOREG, FB_NOREG, 0, -2);
+		r.id = fb_inst_emit(b->proc, FB_VEXTRACT, dst_ft, a.id, FB_NOREG, FB_NOREG, b->current_loc, -2);
 		r.type = type;
 		return r;
 	}
@@ -635,7 +639,7 @@ gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue 
 		fbValue f_val = fb_build_expr(b, ce->args[2]);
 		fbType ft = fb_data_type(type);
 		fbValue r;
-		r.id = fb_inst_emit(b->proc, FB_SELECT, ft, mask.id, t_val.id, f_val.id, 0, 0);
+		r.id = fb_inst_emit(b->proc, FB_SELECT, ft, mask.id, t_val.id, f_val.id, b->current_loc, 0);
 		r.type = type;
 		return r;
 	}
@@ -664,7 +668,7 @@ gb_internal fbValue fb_build_simd_builtin(fbBuilder *b, Ast *expr, TypeAndValue 
 		bool is_float_elem = is_type_float(elem);
 		fbType ft = fb_data_type(type);
 		fbValue r;
-		r.id = fb_inst_emit(b->proc, is_float_elem ? FB_FNEG : FB_NEG, ft, a.id, FB_NOREG, FB_NOREG, 0, 0);
+		r.id = fb_inst_emit(b->proc, is_float_elem ? FB_FNEG : FB_NEG, ft, a.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		r.type = type;
 		return r;
 	}
@@ -914,7 +918,7 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 		fbValue x = fb_build_expr(b, ce->args[0]);
 		x = fb_emit_conv(b, x, type);
 		fbType ft = fb_data_type(type);
-		u32 r = fb_inst_emit(b->proc, FB_SQRT, ft, x.id, FB_NOREG, FB_NOREG, 0, 0);
+		u32 r = fb_inst_emit(b->proc, FB_SQRT, ft, x.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		return fb_make_value(r, type);
 	}
 
@@ -976,7 +980,7 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 
 		// For multi-byte types, byte-swap completes the reversal
 		if (bits > 8) {
-			u32 r = fb_inst_emit(b->proc, FB_BSWAP, ft, x.id, FB_NOREG, FB_NOREG, 0, 0);
+			u32 r = fb_inst_emit(b->proc, FB_BSWAP, ft, x.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 			x = fb_make_value(r, t);
 		}
 		return x;
@@ -1108,15 +1112,15 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 	// ── Control flow / traps ─────────────────────────────────────
 
 	case BuiltinProc_trap:
-		fb_inst_emit(b->proc, FB_TRAP, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+		fb_inst_emit(b->proc, FB_TRAP, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		return fb_value_nil();
 
 	case BuiltinProc_debug_trap:
-		fb_inst_emit(b->proc, FB_DEBUGBREAK, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+		fb_inst_emit(b->proc, FB_DEBUGBREAK, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		return fb_value_nil();
 
 	case BuiltinProc_unreachable:
-		fb_inst_emit(b->proc, FB_UNREACHABLE, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+		fb_inst_emit(b->proc, FB_UNREACHABLE, FB_VOID, FB_NOREG, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		return fb_value_nil();
 
 	// ── Optimization hints ───────────────────────────────────────
@@ -1175,7 +1179,7 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 	case BuiltinProc_byte_swap: {
 		fbValue x = fb_build_expr(b, ce->args[0]);
 		fbType ft = fb_data_type(x.type ? x.type : type);
-		u32 r = fb_inst_emit(b->proc, FB_BSWAP, ft, x.id, FB_NOREG, FB_NOREG, 0, 0);
+		u32 r = fb_inst_emit(b->proc, FB_BSWAP, ft, x.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		fbValue v = {};
 		v.id = r;
 		v.type = type;
@@ -1185,7 +1189,7 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 	case BuiltinProc_count_ones: {
 		fbValue x = fb_build_expr(b, ce->args[0]);
 		fbType ft = fb_data_type(x.type ? x.type : type);
-		u32 r = fb_inst_emit(b->proc, FB_POPCNT, ft, x.id, FB_NOREG, FB_NOREG, 0, 0);
+		u32 r = fb_inst_emit(b->proc, FB_POPCNT, ft, x.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		fbValue v = {};
 		v.id = r;
 		v.type = type;
@@ -1198,7 +1202,7 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 		fbType ft = fb_data_type(x.type ? x.type : type);
 		i32 bits = fb_type_size(ft) * 8;
 
-		u32 pop_r = fb_inst_emit(b->proc, FB_POPCNT, ft, x.id, FB_NOREG, FB_NOREG, 0, 0);
+		u32 pop_r = fb_inst_emit(b->proc, FB_POPCNT, ft, x.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		fbValue pop = {};
 		pop.id = pop_r;
 		pop.type = type;
@@ -1210,7 +1214,7 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 	case BuiltinProc_count_leading_zeros: {
 		fbValue x = fb_build_expr(b, ce->args[0]);
 		fbType ft = fb_data_type(x.type ? x.type : type);
-		u32 r = fb_inst_emit(b->proc, FB_CLZ, ft, x.id, FB_NOREG, FB_NOREG, 0, 0);
+		u32 r = fb_inst_emit(b->proc, FB_CLZ, ft, x.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		fbValue v = {};
 		v.id = r;
 		v.type = type;
@@ -1220,7 +1224,7 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 	case BuiltinProc_count_trailing_zeros: {
 		fbValue x = fb_build_expr(b, ce->args[0]);
 		fbType ft = fb_data_type(x.type ? x.type : type);
-		u32 r = fb_inst_emit(b->proc, FB_CTZ, ft, x.id, FB_NOREG, FB_NOREG, 0, 0);
+		u32 r = fb_inst_emit(b->proc, FB_CTZ, ft, x.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		fbValue v = {};
 		v.id = r;
 		v.type = type;
@@ -1228,7 +1232,7 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 	}
 
 	case BuiltinProc_read_cycle_counter: {
-		u32 r = fb_inst_emit(b->proc, FB_CYCLE, FB_I64, FB_NOREG, FB_NOREG, FB_NOREG, 0, 0);
+		u32 r = fb_inst_emit(b->proc, FB_CYCLE, FB_I64, FB_NOREG, FB_NOREG, FB_NOREG, b->current_loc, 0);
 		fbValue v = {};
 		v.id = r;
 		v.type = t_u64;
@@ -1268,7 +1272,7 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 					fb_aux_push(b->proc, ctx_ptr.id);
 					arg_count = 1;
 				}
-				u32 r = fb_inst_emit(b->proc, FB_CALL, FB_VOID, target.id, aux_start, arg_count, 0, 0);
+				u32 r = fb_inst_emit(b->proc, FB_CALL, FB_VOID, target.id, aux_start, arg_count, b->current_loc, 0);
 				// Mark as Odin CC
 				fbInst *call_inst = &b->proc->insts[b->proc->inst_count - 1];
 				call_inst->flags = FBCC_ODIN;
@@ -1419,7 +1423,7 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 			fbType result_ft = fb_data_type(tv.type);
 			u32 r = fb_inst_emit(b->proc, FB_VSHUFFLE, result_ft,
 				vec.id, FB_NOREG, FB_NOREG,
-				0, cast(i64)aux_base | (cast(i64)index_count << 32));
+				b->current_loc, cast(i64)aux_base | (cast(i64)index_count << 32));
 			return fb_make_value(r, tv.type);
 		}
 

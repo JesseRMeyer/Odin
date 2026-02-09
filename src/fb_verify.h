@@ -80,9 +80,9 @@ gb_global const fbOpSpec fb_op_specs[FB_OP_COUNT] = {
 	[FB_OR]        = { FBO_VALUE,     FBO_VALUE, FBO_NONE,  true,  false },
 	[FB_XOR]       = { FBO_VALUE,     FBO_VALUE, FBO_NONE,  true,  false },
 	[FB_NOT]       = { FBO_VALUE,     FBO_NONE,  FBO_NONE,  true,  false },
-	[FB_SHL]       = { FBO_VALUE,     FBO_VALUE, FBO_NONE,  true,  false },
-	[FB_LSHR]      = { FBO_VALUE,     FBO_VALUE, FBO_NONE,  true,  false },
-	[FB_ASHR]      = { FBO_VALUE,     FBO_VALUE, FBO_NONE,  true,  false },
+	[FB_SHL]       = { FBO_VALUE,     FBO_VALUE_OPT, FBO_NONE,  true,  false }, // SIMD constant shift: b=FB_NOREG, amount in imm
+	[FB_LSHR]      = { FBO_VALUE,     FBO_VALUE_OPT, FBO_NONE,  true,  false },
+	[FB_ASHR]      = { FBO_VALUE,     FBO_VALUE_OPT, FBO_NONE,  true,  false },
 	[FB_ROL]       = { FBO_VALUE,     FBO_VALUE, FBO_NONE,  true,  false },
 	[FB_ROR]       = { FBO_VALUE,     FBO_VALUE, FBO_NONE,  true,  false },
 

@@ -317,7 +317,11 @@ struct fbBuilder {
 //   fb_build_call_expr(fbBuilder*, Ast*)      → fbValue
 //   fb_build_compound_lit(fbBuilder*, Ast*)   → fbAddr
 //
-// Emit helpers:
+// Source locations:
+//   fb_loc_intern(p, file_id, line, col, flags) → u32 (loc table index, deduped)
+//   fb_set_loc(b, node)                        (set b->current_loc from AST node)
+//
+// Emit helpers (all propagate b->current_loc to fbInst.loc):
 //   fb_emit(b, op, type, a, b, c, imm)       → fbValue  (raw instruction)
 //   fb_emit_iconst(b, type, val)              → fbValue
 //   fb_emit_fconst(b, type, val)              → fbValue

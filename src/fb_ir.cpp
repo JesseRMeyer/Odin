@@ -222,6 +222,29 @@ gb_internal u32 fb_inst_emit(fbProc *p, fbOp op, fbType type,
 	return r;
 }
 
+gb_internal u32 fb_loc_intern(fbProc *p, u32 file_id, u32 line, u16 column, u16 flags) {
+	GB_ASSERT(p != nullptr);
+
+	// Dedup: check last entry (common case for sequential statements)
+	if (p->loc_count > 0) {
+		fbLoc *last = &p->locs[p->loc_count - 1];
+		if (last->file_id == file_id && last->line == line &&
+		    last->column == column && last->flags == flags) {
+			return p->loc_count - 1;
+		}
+	}
+
+	if (p->loc_count >= p->loc_cap) {
+		u32 new_cap = p->loc_cap * 2;
+		p->locs = gb_resize_array(heap_allocator(), p->locs, p->loc_cap, new_cap);
+		p->loc_cap = new_cap;
+	}
+
+	u32 idx = p->loc_count++;
+	p->locs[idx] = {file_id, line, column, flags};
+	return idx;
+}
+
 gb_internal u32 fb_block_create(fbProc *p) {
 	if (p->block_count >= p->block_cap) {
 		u32 new_cap = p->block_cap * 2;

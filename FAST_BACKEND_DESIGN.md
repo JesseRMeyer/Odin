@@ -493,6 +493,10 @@ struct fbProc {
     i32 split_returns_index;
     i32 split_returns_count;
 
+    // Single MEMORY-class return (sret): the slot index for the hidden output
+    // pointer parameter. -1 if not used (scalar or split-return).
+    i32 sret_slot_idx;
+
     // XMM parameter ABI (non-Odin CC only): maps SSE-classified float params
     // to XMM0-XMM7. The prologue spills these to stack slots.
     struct fbXmmParamLoc {
@@ -544,8 +548,20 @@ struct fbRodataEntry {
     String name;   // symbol name (e.g. ".L.str.0")
 };
 
-// Abstract symbol index = FB_GLOBAL_SYM_BASE + global_entries index.
+// Abstract symbol index ranges:
+//   [0, procs.count)                                        — procedure symbols
+//   [FB_RODATA_SYM_BASE, FB_RODATA_SYM_BASE+rodata.count)  — rodata symbols
+//   [FB_GLOBAL_SYM_BASE, FB_GLOBAL_SYM_BASE+globals.count) — global variable symbols
+enum : u32 { FB_RODATA_SYM_BASE = 0x20000000 };
 enum : u32 { FB_GLOBAL_SYM_BASE = 0x40000000 };
+
+// Data section relocation (for pointer fields in .data globals, e.g., RTTI).
+struct fbDataReloc {
+    u32         global_idx;      // which global entry contains this pointer
+    u32         offset_in_data;  // byte offset within the global's init_data
+    u32         target_sym;      // abstract symbol index being pointed to
+    i64         addend;          // typically 0
+};
 
 struct fbGlobalEntry {
     Entity *entity;
@@ -584,13 +600,12 @@ struct fbModule {
     Array<fbGlobalEntry>      global_entries;
     PtrMap<Entity *, u32>     global_entity_map;  // Entity* → global_entries index
 
+    // Data relocations (.rela.data — for pointer fields in globals, e.g., RTTI entries)
+    Array<fbDataReloc>        data_relocs;
+
     // Source file registry
     Array<fbSourceFile>        source_files;
     PtrMap<uintptr, u32>       file_id_to_idx;  // AstFile::id → source_files index
-    fbSymbol *type_info_names;
-    fbSymbol *type_info_offsets;
-    fbSymbol *type_info_usings;
-    fbSymbol *type_info_tags;
 };
 ```
 
@@ -1140,36 +1155,51 @@ Similar strategy. S_LOCAL records with `DefRangeFramePointerRelFullScope` (simpl
 
 ```
 src/
-├── fb_ir.h                 // IR types, opcode enum, instruction format, builder/lowering structs (~836 lines)
-├── fb_ir.cpp               // Module lifecycle, type helpers, symbol management (~601 lines)
-├── fb_build.cpp            // AST → IR builder (~4991 lines)
+├── fb_ir.h                 // IR types, opcode enum, instruction format, builder/lowering structs (~859 lines)
+├── fb_ir.cpp               // Module lifecycle, type helpers, symbol management (~614 lines)
+├── fb_build.cpp            // AST → IR builder (~6565 lines)
 │                           //   fb_build_expr(), fb_build_stmt(), fb_build_addr(),
 │                           //   fb_build_call(), fb_build_return(), fb_emit_conv(), etc.
 │                           //   Compound literals: struct, array, union, bitset, slice, SIMD
+│                           //   Map operations: addr_load/store(Map), compound lit, range iteration
 │                           //   Mirrors tilde_expr.cpp + tilde_stmt.cpp + tilde_proc.cpp
-├── fb_abi.cpp              // ABI classification for SysV AMD64 (~172 lines, struct/array decomposition)
-├── fb_lower_x64.cpp        // x86-64 machine code lowering (~3477 lines)
+├── fb_abi.cpp              // ABI classification for SysV AMD64 (~173 lines, struct/array decomposition)
+├── fb_lower_x64.cpp        // x86-64 machine code lowering (~3577 lines)
 │                           //   GP register allocator, XMM scratch/ABI encoding helpers,
 │                           //   float/int/bitmanip lowering, NaN-safe float comparisons,
 │                           //   UI2FP halving trick, FP2UI conditional subtraction,
-│                           //   SIMD: SSE2 packed ops, comparisons, reductions, select
-├── fb_emit_elf.cpp         // ELF object file emission (~712 lines)
+│                           //   SIMD: SSE2 packed ops, comparisons, reductions, select,
+│                           //   VSHUFFLE (PSHUFD special case + general memory round-trip)
+├── fb_emit_elf.cpp         // ELF object file emission (~767 lines)
 │                           //   Self-contained ELF64 types (no system elf.h dependency)
 │                           //   fbBuf growable byte buffer for section construction
-│                           //   .text, .rodata, .data, .bss, .rela.text sections
+│                           //   .text, .rodata, .data, .bss, .rela.text, .rela.data sections
 │                           //   Single-pass symbol table with proper LOCAL/GLOBAL ordering
-├── fb_build_builtin.cpp    // Built-in procedure handling (~1277 lines)
+├── fb_build_builtin.cpp    // Built-in procedure handling (~1503 lines)
 │                           //   len/cap/raw_data for slices, strings, dynamic arrays
 │                           //   min/max (variadic), abs, clamp
 │                           //   ptr_offset, ptr_sub, mem_copy, mem_zero
 │                           //   trap/debug_trap/unreachable, expect, bswap
 │                           //   count_ones/zeros, count_leading/trailing_zeros
 │                           //   read_cycle_counter, cpu_relax
-│                           //   overflow_add/sub, syscall, unaligned_load/store
+│                           //   overflow_add/sub/mul, syscall, unaligned_load/store
 │                           //   17 SIMD builtins (arithmetic, bitwise, compare, reduce, select)
 │                           //   atomic load/store/exchange/add/sub/and/or/xor/cas, fence
-├── fb_build_const.cpp      // (planned) Constant value IR generation
-├── fb_build_type_info.cpp  // (planned) Runtime type info global generation
+│                           //   swizzle (SIMD, small array, large array), fused_mul_add, sqrt
+│                           //   type_map_cell_info, type_map_info, type_hasher_proc, type_equal_proc
+├── fb_type_info.cpp        // Runtime type info generation (~969 lines)
+│                           //   Type_Info serialization for all 28 variants
+│                           //   Member buffers (struct fields, enum values, union variants)
+│                           //   Data relocations for pointer fields
+│                           //   type_table, type_offsets, type_info_names globals
+├── fb_verify.h             // Verification macros and opcode spec table (~238 lines)
+│                           //   FB_VERIFY macro (hard crash, bypasses recovery)
+│                           //   fbOperandRole enum, fbOpSpec per-opcode specification
+│                           //   fb_op_names diagnostic string table
+├── fb_verify.cpp           // Structural verification passes (~321 lines)
+│                           //   fb_verify_proc: per-proc IR integrity (recoverable)
+│                           //   fb_verify_module: post-lowering module checks (hard crash)
+│                           //   fb_verify_regalloc: register↔value_loc consistency (hard crash)
 ├── fb_lower_arm64.cpp      // (planned) ARM64 machine code lowering
 ├── fb_emit_pe.cpp          // (planned) PE/COFF object file + CodeView emission
 └── fb_emit_macho.cpp       // (planned) Mach-O object file + DWARF emission
@@ -1180,12 +1210,15 @@ src/
 **Inclusion order** in `src/main.cpp`:
 ```cpp
 #if ALLOW_FAST_BACKEND
+#include "fb_verify.h"
 #include "fb_ir.cpp"
 #include "fb_abi.cpp"
 #include "fb_build.cpp"
 #include "fb_build_builtin.cpp"
+#include "fb_type_info.cpp"
 #include "fb_lower_x64.cpp"
 #include "fb_emit_elf.cpp"
+#include "fb_verify.cpp"
 #endif
 ```
 
@@ -2053,13 +2086,165 @@ Full SSE2 SIMD support, eliminating all remaining runtime stubs.
 
 **Remaining features (not yet implemented):**
 
-- Runtime type info generation (blocks fmt, print_type)
-- Map operations (depends on type info)
 - SOA addressing
 - Complex/quaternion type support
-- FB_VSHUFFLE lowering (not needed by runtime)
+- Procedure literals (closures)
+- Matrix types and operations
 
-### Phase 9: Debug Info (TODO)
+### Phase 9: Runtime Type Info — RTTI (DONE)
+
+Full type_table generation, data relocations, and supporting features.
+
+**Phase 9a: Data Relocations — `.rela.data` Section (DONE):**
+
+- `fbDataReloc` struct: `{ u32 global_idx; u32 offset_in_data; u32 target_sym; i64 addend; }`
+- `R_X86_64_64` absolute address relocations for pointer fields in `.data` globals
+- `.rela.data` ELF section with proper symbol resolution (procs, rodata, globals)
+- Three-way reloc dispatch paralleling `.rela.text`: proc / rodata / global symbols
+- Needed for RTTI (type info entries contain pointers to other type infos and member buffers)
+  and for string-valued global variables (string struct contains pointer to rodata)
+
+**Phase 9b: Type Info Generation — `fb_type_info.cpp` (DONE):**
+
+New file (969 lines) generating the complete `type_table` used by Odin's runtime type introspection.
+
+- Serializes `Type_Info` entries as raw bytes in `.data` section with `fbDataReloc` for pointer fields
+- All 28 `Type_Info` variants handled: Named, Basic (int/float/bool/string/typeid/any/etc.),
+  Pointer, Multi_Pointer, Array, Enumerated_Array, Dynamic_Array, Slice, Proc, Tuple,
+  Enum, Union, Struct, Map, BitSet, SimdVector, Matrix, BitField, Soa_Pointer
+- Member buffers for struct fields (name, type, offset, tag), enum values (name, value),
+  union variants, proc params/results — allocated as separate global entries with data relocs
+- Correct typeid encoding: uses `type_hash_canonical_type()` (raw hash), not array index
+- Correct union variant tag encoding via `union_variant_index()`
+- `type_info_of` builtin now emits proper pointer arithmetic into type_table instead of stub null
+- Global symbols: `__$type_table`, `__$type_offsets`, `__$type_info_names`, `__$type_info_usings`, `__$type_info_tags`
+
+**Phase 9c: SwizzleLarge Address Support (DONE):**
+
+- `fbAddr_SwizzleLarge` load: allocate temp array, copy elements by large index array
+- `fbAddr_SwizzleLarge` store: scatter-write each element to its swizzle destination
+- `BuiltinProc_swizzle` handling: SIMD vectors (VSHUFFLE), small arrays (up to 4, fbAddr_Swizzle),
+  large arrays (fbAddr_SwizzleLarge)
+
+**Phase 9d: FB_VSHUFFLE Lowering (DONE):**
+
+- 4× i32/f32 special case: `PSHUFD` with computed shuffle control byte
+- General case: memory round-trip with element-by-element copy from source vectors
+  to result spill slot (handles arbitrary lane widths and cross-vector shuffles)
+
+### Phase 10: Map Support (DONE)
+
+Full map infrastructure: type metadata generation, synthesized hashers/equality procs, runtime interop,
+all map operations, and related bug fixes.
+
+**Map infrastructure in `fb_build.cpp`:**
+
+- `Map_Cell_Info` and `Map_Info` globals generated with data relocations for each map type
+- Synthesized hasher procs per key type: `default_hasher` (integer/pointer), `string_hasher`,
+  `cstring_hasher` — inline SplitMix64 seed computation, cell indexing with padding,
+  hash validity checks, capacity extraction
+- Synthesized equality procs per key type: `memcmp`-based byte comparison, with special
+  string path (length check before byte comparison)
+- Runtime call helpers: `fb_emit_call_odin`, `fb_emit_call_contextless`,
+  `fb_lookup_runtime_proc` for lazy discovery of `__dynamic_map_set`, `__dynamic_map_get`,
+  `__dynamic_map_reserve`
+- Map-related runtime procs pre-registered before build pass to ensure stable symbol indices
+- Map type builtins: `type_map_cell_info`, `type_map_info`, `type_hasher_proc`, `type_equal_proc`
+
+**Map operations:**
+
+- `fb_addr_store(Map)`: store value to local, hash key, call `__dynamic_map_set`
+- `fb_addr_load(Map)`: call `__dynamic_map_get`, nil-check, copy value, return lookup result
+  tuple `(value, ok)` or single value
+- `fb_build_addr(IndexExpr)`: map index produces `fbAddr_Map` with deferred operations
+- Map compound literals: allocator setup, `__dynamic_map_reserve`, per-element insert
+- Map range iteration (`for k, v in m`): walks cells array with hash validity filtering
+- Map `len`: loads `len` field from `Raw_Map` at `type_offset_of(Type_Map, "len")`
+
+**String range iteration:** `for ch, idx in s` — byte-by-byte traversal with index binding.
+
+**Single MEMORY-class return (sret):**
+
+- `sret_slot_idx` field on `fbProc` for hidden output pointer parameter
+- Callee-side: receive sret pointer via GP reg, copy result to it on return
+- Bare `return` with named results handled for sret, split-return, and scalar paths
+
+**Bug fixes in this phase:**
+
+- **`fb_addr_store(Default)` aggregate bypass:** Changed from `fb_emit_store` to
+  `fb_emit_copy_value` so aggregate types get MEMCPY instead of invalid scalar STORE.
+  Root cause of `map[K][2]int` corruption — aggregate values bypassed `fb_addr_store(Map)`
+  entirely, memcpy-ing directly onto the map struct.
+- **`fb_build_assign_stmt` routing:** Always route through `fb_addr_store` for all addr kinds,
+  removing scalar/aggregate dispatch that bypassed special address kinds (Map, BitField, etc.)
+- **Shift lowering operand order:** Resolve RCX (shift amount) *before* the shift value to
+  prevent clobbering when the value was already allocated to RCX
+- **`or_return` single-return:** Handle single-return procs and non-boolean error types
+- **Pointer-to-container indexing:** Dereference through pointer for `^[N]T`, `^[]T`,
+  `^[dynamic]T`, `^string`
+- **Compile-time param erasure:** Skip `TypeName`/`Constant` args in call codegen (polymorphic
+  procedure specializations pass type params that don't exist at runtime)
+- **`type_offset_of` for maps:** Added `Type_Map` case for `Raw_Map` field layout
+
+### Phase 11: IR Verification System (DONE)
+
+Three-layer verification infrastructure catching IR and register allocator bugs.
+
+**New files:**
+- `src/fb_verify.h` (238 lines) — `FB_VERIFY` macro, `fbOperandRole` enum, `fbOpSpec`
+  per-opcode specification table (102 entries), `fb_op_names` diagnostic string table
+- `src/fb_verify.cpp` (321 lines) — `fb_verify_proc`, `fb_verify_module`, `fb_verify_regalloc`
+
+**Layer 1: Inline Contracts (18 emit helpers)**
+
+`GB_ASSERT` preconditions in `fb_inst_emit`, `fb_slot_create`, `fb_emit_load`, `fb_emit_store`,
+`fb_emit_arith`, etc. Recoverable — procs with invalid IR get stubbed via the existing
+SIGILL recovery mechanism rather than crashing the compiler.
+
+**Layer 2: Structural Verifier — `fb_verify_proc` (per-proc, after build)**
+
+Uses `GB_ASSERT_MSG` (recoverable). Checks:
+- Block validity: all blocks have been started (`first_inst != UINT32_MAX`)
+- Block contiguity: sorted by `first_inst`, blocks tile the instruction array without gaps
+- Total coverage: sum of block `inst_count` == total `inst_count`
+- SSA single-definition: each value ID defined by exactly one instruction (bitmap check)
+- Per-instruction: valid opcode, valid type, operand roles match `fb_op_specs[]`,
+  result consistency (`has_result` ↔ `r != FB_NOREG`)
+- CALL/TAILCALL aux bounds: `aux[b..b+c)` in range, each arg < `next_value`
+- SWITCH aux bounds: `aux[c..c+imm*2)` in range, block IDs < `block_count`
+- Block termination: last instruction of every block must be a terminator
+
+**Layer 3: Register Allocator Audit — `fb_verify_regalloc` (during lowering)**
+
+Uses `FB_VERIFY` (hard crash — bypasses recovery). Bidirectional consistency check
+at block boundaries:
+- Forward: for each register with a live value, `value_loc[vreg]` must point back to that register
+- Reverse: for each value located in a register, `gp[reg].vreg` must match
+
+**Module Verifier — `fb_verify_module` (post-lowering, pre-ELF emission)**
+
+Uses `FB_VERIFY` (hard crash). Checks:
+- Every non-foreign proc has non-null, non-zero-size machine code
+- All `.rela.text` relocations have valid target symbols (proc/rodata/global ranges)
+- All `.rela.data` relocations have valid global_idx and target symbols
+- Entry point indices in range
+
+**`FB_VERIFY` vs `GB_ASSERT`:** `FB_VERIFY` clears `fb_recovery_active` before trapping,
+so SIGILL propagates to the default handler → core dump. Use `FB_VERIFY` only in code
+that runs *outside* the recovery scope (lowering, ELF emission, module verification).
+Use `GB_ASSERT` in builder code that runs *inside* the recovery scope.
+
+**Opcode spec table (`fb_op_specs[FB_OP_COUNT]`):** Static array declaring per-opcode
+operand roles (`FBO_VALUE`, `FBO_BLOCK`, `FBO_SLOT`, `FBO_AUX`, `FBO_NONE`, `FBO_COUNT`)
+and whether each opcode has a result or is a terminator. Verified against both builder
+and lowerer implementations. Special cases: `FB_SWITCH.c` = `FBO_COUNT` (zero-case switches
+set `c=aux_count`), `FB_CALL.b` = `FBO_COUNT` (zero-arg calls set `b=aux_count`).
+
+**Already caught real bugs:** Invalid LOAD operand (`a=3432793272` with `next_value=20`)
+in `os.error_to_io_error` — was silently producing wrong machine code, now stubbed
+with diagnostic.
+
+### Phase 12: Debug Info (TODO)
 
 - DWARF generation for Linux/macOS
 - `DW_TAG_subprogram` per function
@@ -2068,10 +2253,11 @@ Full SSE2 SIMD support, eliminating all remaining runtime stubs.
 - Type DIEs from Odin `Type*`
 - Lexical block scopes
 
-### Phase 10: Object Format Completion (PARTIAL)
+### Phase 13: Object Format Completion (PARTIAL)
 
 **ELF improvements (DONE):**
 - `.rela.text` emission with proper R_X86_64_PLT32 relocations for cross-procedure calls
+- `.rela.data` emission with R_X86_64_64 absolute relocations for pointer fields in globals
 - Single-pass symbol table algorithm (count → allocate → populate with dual LOCAL/GLOBAL cursors)
 - Batched padding writes (64-byte chunks instead of byte-at-a-time)
 - `fb_buf_append_odin_str()` eliminates per-symbol C-string alloc/copy/free
@@ -2083,9 +2269,8 @@ Full SSE2 SIMD support, eliminating all remaining runtime stubs.
 - PE/COFF emission for Windows (`fb_emit_pe.cpp`)
 - Mach-O emission for macOS (`fb_emit_macho.cpp`)
 - CodeView debug info for Windows
-- `.rela.data` relocations (for globals with symbol-reference initializers)
 
-### Phase 11: Threading & Performance (TODO)
+### Phase 14: Threading & Performance (TODO)
 
 - Per-procedure arena allocation (replace `heap_allocator()` with arena — see §13)
 - Parallel procedure building (thread pool)
