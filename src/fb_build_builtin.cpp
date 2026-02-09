@@ -696,8 +696,14 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 
 	// Type query builtins should all be compile-time constants,
 	// caught by the constant folding at the top of fb_build_expr.
+	// Exception: map-related type builtins return pointers/procs, not constants.
 	if (BuiltinProc__type_begin < id && id < BuiltinProc__type_end) {
-		GB_PANIC("fast backend: type query builtin %d was not constant-folded", id);
+		if (id != BuiltinProc_type_map_cell_info &&
+		    id != BuiltinProc_type_map_info &&
+		    id != BuiltinProc_type_hasher_proc &&
+		    id != BuiltinProc_type_equal_proc) {
+			GB_PANIC("fast backend: type query builtin %d was not constant-folded", id);
+		}
 	}
 
 	switch (id) {
@@ -1455,6 +1461,36 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 		addr.type = tv.type;
 		addr.swizzle_large.indices = indices;
 		return fb_addr_load(b, addr);
+	}
+
+	case BuiltinProc_type_map_cell_info: {
+		Type *type = ce->args[0]->tav.type;
+		u32 gidx = fb_gen_map_cell_info(b->module, type);
+		u32 sym = FB_GLOBAL_SYM_BASE + gidx;
+		fbValue ptr = fb_emit_symaddr(b, sym);
+		ptr.type = alloc_type_pointer(t_map_cell_info);
+		return ptr;
+	}
+
+	case BuiltinProc_type_map_info: {
+		Type *type = ce->args[0]->tav.type;
+		return fb_map_info_ptr(b, type);
+	}
+
+	case BuiltinProc_type_hasher_proc: {
+		Type *type = ce->args[0]->tav.type;
+		u32 proc_idx = fb_gen_hasher_proc(b, type);
+		fbValue ptr = fb_emit_symaddr(b, proc_idx);
+		ptr.type = t_hasher_proc;
+		return ptr;
+	}
+
+	case BuiltinProc_type_equal_proc: {
+		Type *type = ce->args[0]->tav.type;
+		u32 proc_idx = fb_gen_equal_proc(b, type);
+		fbValue ptr = fb_emit_symaddr(b, proc_idx);
+		ptr.type = t_equal_proc;
+		return ptr;
 	}
 
 	default:

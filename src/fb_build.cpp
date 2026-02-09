@@ -11,8 +11,11 @@
 gb_global thread_local sigjmp_buf fb_recovery_buf;
 gb_global thread_local volatile bool fb_recovery_active = false;
 
+gb_global thread_local volatile const char *fb_recovery_proc_name = nullptr;
+gb_global thread_local volatile int fb_recovery_last_line = 0;
 gb_internal void fb_recovery_signal_handler(int sig) {
 	if (fb_recovery_active) {
+		gb_printf_err("  [recovery sig=%d proc=%s last_line=%d]\n", sig, fb_recovery_proc_name ? fb_recovery_proc_name : "?", fb_recovery_last_line);
 		fb_recovery_active = false;
 		siglongjmp(fb_recovery_buf, 1);
 	}
@@ -30,6 +33,18 @@ gb_internal void    fb_emit_defer_stmts(fbBuilder *b, fbDeferExitKind kind, i32 
 // Forward declaration for type info (defined in fb_type_info.cpp)
 gb_internal void    fb_generate_type_info(fbModule *m);
 gb_internal isize   fb_type_info_index(CheckerInfo *info, Type *type, bool err_on_not_found = true);
+
+// Forward declarations for functions used by map support before their definition
+gb_internal void    fb_emit_copy_value(fbBuilder *b, fbValue dst_ptr, fbValue val, Type *type);
+gb_internal fbValue fb_build_source_code_location(fbBuilder *b, String proc_name, TokenPos pos);
+gb_internal u32     fb_gen_map_cell_info(fbModule *m, Type *type);
+gb_internal fbValue fb_map_info_ptr(fbBuilder *b, Type *map_type);
+gb_internal u32     fb_gen_hasher_proc(fbBuilder *b, Type *type);
+gb_internal u32     fb_gen_equal_proc(fbBuilder *b, Type *type);
+gb_internal fbValue fb_map_key_hash(fbBuilder *b, fbValue map_ptr, Type *map_type, fbValue key, fbValue *key_ptr_out);
+gb_internal fbValue fb_dynamic_map_get(fbBuilder *b, fbValue map_ptr, Type *map_type, fbValue hash, fbValue key_ptr);
+gb_internal void    fb_dynamic_map_set(fbBuilder *b, fbValue map_ptr, Type *map_type, fbValue hash, fbValue key_ptr, fbValue val_ptr, Ast *node);
+gb_internal void    fb_dynamic_map_reserve(fbBuilder *b, fbValue map_ptr, Type *map_type, fbValue capacity, Ast *node);
 
 // ───────────────────────────────────────────────────────────────────────
 // Parameter setup: classify params via ABI, create stack slots, record param_locs
@@ -56,7 +71,15 @@ gb_internal void fb_setup_params(fbProc *p) {
 	i32 result_count = results ? cast(i32)results->variables.count : 0;
 	i32 split_count = (is_odin_like && result_count > 1) ? (result_count - 1) : 0;
 
-	u32 max_gp_params = param_count + split_count + (has_context ? 1 : 0);
+	// Single MEMORY-class return needs a hidden output pointer parameter (sret).
+	bool needs_sret = false;
+	if (is_odin_like && result_count == 1 && split_count == 0 && results != nullptr) {
+		Type *ret_type = results->variables[0]->type;
+		fbType ret_ft = fb_data_type(ret_type);
+		if (ret_ft.kind == FBT_VOID) needs_sret = true;
+	}
+
+	u32 max_gp_params = param_count + split_count + (has_context ? 1 : 0) + (needs_sret ? 1 : 0);
 	if (max_gp_params == 0 && param_count == 0) return;
 
 	// Allocate for the hard upper bound on GP register params
@@ -211,6 +234,24 @@ gb_internal void fb_setup_params(fbProc *p) {
 			gp_idx++;
 			p->split_returns_count++;
 		}
+	}
+
+	// Single MEMORY-class return: add hidden output pointer parameter.
+	// This matches the caller-side sret_single aux push in fb_build_call_expr.
+	if (needs_sret) {
+		u32 slot = fb_slot_create(p, 8, 8, nullptr, results->variables[0]->type);
+		if (gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
+			locs[gp_idx].slot_idx   = slot;
+			locs[gp_idx].sub_offset = 0;
+			gp_idx++;
+		} else {
+			stack_locs[stack_idx].slot_idx       = slot;
+			stack_locs[stack_idx].sub_offset      = 0;
+			stack_locs[stack_idx].caller_offset   = stack_offset;
+			stack_idx++;
+			stack_offset += 8;
+		}
+		p->sret_slot_idx = cast(i32)slot;
 	}
 
 	// Odin CC: append context pointer as the last GP parameter
@@ -499,6 +540,14 @@ gb_internal fbValue fb_const_value(fbBuilder *b, Type *type, ExactValue value) {
 			Entity *e = entity_of_node(proc_ast);
 			if (e != nullptr) {
 				u32 *idx = map_get(&fb_entity_proc_map, e);
+				if (idx == nullptr) {
+					// Lazily add proc not discovered during initial scan
+					fbProc *p = fb_proc_create(b->module, e);
+					u32 proc_idx = cast(u32)b->module->procs.count;
+					array_add(&b->module->procs, p);
+					map_set(&fb_entity_proc_map, e, proc_idx);
+					idx = map_get(&fb_entity_proc_map, e);
+				}
 				if (idx != nullptr) {
 					fbValue sym = fb_emit_symaddr(b, *idx);
 					sym.type = type;
@@ -763,13 +812,76 @@ gb_internal fbValue fb_addr_load(fbBuilder *b, fbAddr addr) {
 		return ret;
 	}
 
+	if (addr.kind == fbAddr_Map) {
+		// Map lookup: call __dynamic_map_get, check for nil, copy value.
+		Type *map_type = base_type(addr.map.map_type);
+		GB_ASSERT(map_type->kind == Type_Map);
+
+		Type *lookup_type = map_type->Map.lookup_result_type;
+		fbAddr result = fb_add_local(b, lookup_type, nullptr, true);
+
+		fbValue key_ptr = {};
+		fbValue hash = fb_map_key_hash(b, addr.base, map_type, addr.map.key, &key_ptr);
+		fbValue ptr = fb_dynamic_map_get(b, addr.base, map_type, hash, key_ptr);
+
+		// ok = (ptr != nil)
+		fbValue nil_val = fb_emit_iconst(b, t_rawptr, 0);
+		nil_val.type = t_rawptr;
+		fbValue ok = fb_emit_cmp(b, FB_CMP_NE, ptr, nil_val);
+
+		// Store ok at field 1 of lookup result
+		i64 ptr_size = b->module->target.ptr_size;
+		Type *value_type = map_type->Map.value;
+		i64 ok_offset = type_offset_of(lookup_type, 1);
+		fbValue ok_ptr = fb_emit_member(b, result.base, ok_offset);
+		fb_emit_store(b, ok_ptr, ok);
+
+		// if ok, copy value from ptr to result field 0
+		u32 then_blk = fb_new_block(b);
+		u32 done_blk = fb_new_block(b);
+		fb_emit_branch(b, ok, then_blk, done_blk);
+
+		fb_set_block(b, then_blk);
+		{
+			fbValue val_ptr = ptr;
+			val_ptr.type = alloc_type_pointer(value_type);
+			fbType vft = fb_data_type(value_type);
+			if (vft.kind != FBT_VOID) {
+				fbValue val = fb_emit_load(b, val_ptr, value_type);
+				fb_emit_store(b, result.base, val);
+			} else {
+				i64 vsz = type_size_of(value_type);
+				i64 valign = type_align_of(value_type);
+				if (vsz > 0) {
+					fbValue sz = fb_emit_iconst(b, t_int, vsz);
+					fb_emit_memcpy(b, result.base, val_ptr, sz, valign);
+				}
+			}
+		}
+		fb_emit_jump(b, done_blk);
+		fb_set_block(b, done_blk);
+
+		if (is_type_tuple(addr.map.result_type)) {
+			return fb_addr_load(b, result);
+		} else {
+			// Single value: load field 0
+			fbType vft = fb_data_type(map_type->Map.value);
+			if (vft.kind != FBT_VOID) {
+				return fb_emit_load(b, result.base, map_type->Map.value);
+			}
+			fbValue ret = result.base;
+			ret.type = map_type->Map.value;
+			return ret;
+		}
+	}
+
 	GB_PANIC("TODO fb_addr_load kind=%d", addr.kind);
 	return fb_value_nil();
 }
 
 gb_internal void fb_addr_store(fbBuilder *b, fbAddr addr, fbValue val) {
 	if (addr.kind == fbAddr_Default) {
-		fb_emit_store(b, addr.base, val);
+		fb_emit_copy_value(b, addr.base, val, addr.type);
 		return;
 	}
 
@@ -855,6 +967,23 @@ gb_internal void fb_addr_store(fbBuilder *b, fbAddr addr, fbValue val) {
 			if (dst_idx > 0) dst_ptr = fb_emit_member(b, addr.base, cast(i64)dst_idx * stride);
 			fb_emit_store(b, dst_ptr, elem_val);
 		}
+		return;
+	}
+
+	if (addr.kind == fbAddr_Map) {
+		// Map store: m[key] = val → call __dynamic_map_set
+		Type *map_type = base_type(addr.map.map_type);
+		Type *value_type = map_type->Map.value;
+
+		// Store value to a local and take its address
+		fbAddr val_local = fb_add_local(b, value_type, nullptr, false);
+		fb_emit_copy_value(b, val_local.base, val, value_type);
+		fbValue val_ptr = val_local.base;
+		val_ptr.type = t_rawptr;
+
+		fbValue key_ptr = {};
+		fbValue hash = fb_map_key_hash(b, addr.base, map_type, addr.map.key, &key_ptr);
+		fb_dynamic_map_set(b, addr.base, map_type, hash, key_ptr, val_ptr, nullptr);
 		return;
 	}
 
@@ -961,6 +1090,7 @@ gb_internal u32 fb_ensure_c_proc(fbModule *m, String name) {
 	p->is_foreign = true;
 	p->current_block = FB_NOREG;
 	p->split_returns_index = -1;
+	p->sret_slot_idx = -1;
 
 	u32 idx = cast(u32)m->procs.count;
 	array_add(&m->procs, p);
@@ -983,6 +1113,567 @@ gb_internal fbValue fb_emit_call_c(fbBuilder *b, u32 proc_idx, fbValue *args, u3
 	call_inst->flags = FBCC_C;
 
 	return fb_make_value(r, ret_type);
+}
+
+// ── Map support ───────────────────────────────────────────────────────
+//
+// Maps use the dynamic runtime calls: __dynamic_map_get, __dynamic_map_set,
+// __dynamic_map_reserve. Each map type needs Map_Cell_Info and Map_Info
+// globals, plus synthesized hasher and equal procs for the key type.
+
+// Look up a runtime proc entity by name and return its proc index.
+// If the proc wasn't discovered during initial scanning (e.g. because
+// min_dep_count == 0), lazily create it now.
+gb_internal u32 fb_lookup_runtime_proc(fbModule *m, String name) {
+	Entity *e = scope_lookup_current(m->info->runtime_package->scope, name);
+	GB_ASSERT_MSG(e != nullptr, "runtime proc '%.*s' not found", LIT(name));
+	u32 *idx = map_get(&fb_entity_proc_map, e);
+	if (idx != nullptr) {
+		return *idx;
+	}
+
+	// Lazily create the proc — this happens for runtime procs that have
+	// min_dep_count == 0 because user code doesn't reference them directly,
+	// only the backend's synthesized code does (e.g. __dynamic_map_set).
+	fbProc *p = fb_proc_create(m, e);
+	u32 proc_idx = cast(u32)m->procs.count;
+	array_add(&m->procs, p);
+	map_set(&fb_entity_proc_map, e, proc_idx);
+	return proc_idx;
+}
+
+// Emit a call to a contextless proc: proc "contextless" (args...) -> ret_type
+gb_internal fbValue fb_emit_call_contextless(fbBuilder *b, u32 proc_idx, fbValue *args, u32 arg_count, Type *ret_type) {
+	fbValue target = fb_emit_symaddr(b, proc_idx);
+	u32 aux_start = b->proc->aux_count;
+	for (u32 i = 0; i < arg_count; i++) {
+		fb_aux_push(b->proc, args[i].id);
+	}
+	u32 arg_total = b->proc->aux_count - aux_start;
+	fbType ret_ft = (ret_type != nullptr) ? fb_data_type(ret_type) : FB_VOID;
+	u32 r = fb_inst_emit(b->proc, FB_CALL, ret_ft, target.id, aux_start, arg_total, 0, 0);
+	// Contextless uses Odin CC (no context pointer)
+	fbInst *inst = &b->proc->insts[b->proc->inst_count - 1];
+	inst->flags = FBCC_ODIN;
+	return fb_make_value(r, ret_type);
+}
+
+// Emit a call to an Odin-CC proc, passing context as last arg.
+gb_internal fbValue fb_emit_call_odin(fbBuilder *b, u32 proc_idx, fbValue *args, u32 arg_count, Type *ret_type) {
+	fbValue target = fb_emit_symaddr(b, proc_idx);
+	u32 aux_start = b->proc->aux_count;
+	for (u32 i = 0; i < arg_count; i++) {
+		fb_aux_push(b->proc, args[i].id);
+	}
+	// Context pointer (Odin CC, always last)
+	if (b->context_stack.count == 0) {
+		fbAddr ctx_addr = fb_add_local(b, t_context, nullptr, true);
+		fbContextData *cd = array_add_and_get(&b->context_stack);
+		cd->ctx = ctx_addr;
+		cd->uses_default = false;
+	}
+	fbContextData *ctx = &b->context_stack[b->context_stack.count - 1];
+	fbValue ctx_ptr = fb_addr_load(b, ctx->ctx);
+	fb_aux_push(b->proc, ctx_ptr.id);
+
+	u32 arg_total = b->proc->aux_count - aux_start;
+	fbType ret_ft = (ret_type != nullptr) ? fb_data_type(ret_type) : FB_VOID;
+	u32 r = fb_inst_emit(b->proc, FB_CALL, ret_ft, target.id, aux_start, arg_total, 0, 0);
+	fbInst *inst = &b->proc->insts[b->proc->inst_count - 1];
+	inst->flags = FBCC_ODIN;
+	return fb_make_value(r, ret_type);
+}
+
+// Generate a Map_Cell_Info global for a given element type. Returns global_entries index.
+gb_internal u32 fb_gen_map_cell_info(fbModule *m, Type *type) {
+	u32 *found = map_get(&m->map_cell_info_map, type);
+	if (found) return *found;
+
+	i64 size = 0, len = 0;
+	map_cell_size_and_len(type, &size, &len);
+
+	i64 ptr_size = m->target.ptr_size;
+	u32 global_size = cast(u32)(4 * ptr_size);  // 4 uintptr fields
+	u8 *buf = gb_alloc_array(heap_allocator(), u8, global_size);
+	gb_zero_size(buf, global_size);
+
+	// Map_Cell_Info = {size_of_type, align_of_type, size_of_cell, elements_per_cell}
+	i64 esz = type_size_of(type);
+	i64 eal = type_align_of(type);
+	gb_memmove(buf + 0 * ptr_size, &esz, ptr_size);
+	gb_memmove(buf + 1 * ptr_size, &eal, ptr_size);
+	gb_memmove(buf + 2 * ptr_size, &size, ptr_size);
+	gb_memmove(buf + 3 * ptr_size, &len, ptr_size);
+
+	fbGlobalEntry ge = {};
+	ge.name = str_lit("__$fb_map_cell_info");
+	ge.odin_type = t_map_cell_info;
+	ge.init_data = buf;
+	ge.size = global_size;
+	ge.align = cast(u32)ptr_size;
+	ge.is_foreign = false;
+	ge.is_export = false;
+
+	u32 gidx = cast(u32)m->global_entries.count;
+	array_add(&m->global_entries, ge);
+	map_set(&m->map_cell_info_map, type, gidx);
+	return gidx;
+}
+
+// Generate (or look up) a hasher proc for a key type.
+// Signature: proc "contextless" (data: rawptr, seed: uintptr) -> uintptr
+// For simple-compare types, calls default_hasher(data, seed, sizeof(type)).
+// For strings, calls default_hasher_string(data, seed).
+gb_internal u32 fb_gen_hasher_proc(fbBuilder *b, Type *type) {
+	type = core_type(type);
+	fbModule *m = b->module;
+	u32 *found = map_get(&m->map_hasher_procs, type);
+	if (found) return *found;
+
+	// Synthesize a minimal fbProc that wraps a runtime hasher call.
+	// The proc is contextless(rawptr, uintptr) -> uintptr, so it takes
+	// 2 GP args (RDI=data, RSI=seed), returns 1 GP (RAX).
+	//
+	// For simple-compare types: call default_hasher(data, seed, sizeof(type))
+	// For strings: call default_hasher_string(data, seed)
+	// For cstrings: call default_hasher_cstring(data, seed)
+	// For floats: load value, convert to f64, call default_hasher_f64(f64_val, seed)
+	//
+	// We generate these as regular IR-based procs by building instructions manually.
+
+	fbProc *p = gb_alloc_item(permanent_allocator(), fbProc);
+	gb_zero_item(p);
+	p->name = str_lit("__$fb_hasher");
+	p->is_foreign = false;
+	p->is_export = false;
+	p->current_block = FB_NOREG;
+	p->split_returns_index = -1;
+	p->sret_slot_idx = -1;
+
+	p->inst_cap  = 32;
+	p->insts     = gb_alloc_array(heap_allocator(), fbInst, p->inst_cap);
+	p->block_cap = 2;
+	p->blocks    = gb_alloc_array(heap_allocator(), fbBlock, p->block_cap);
+	p->slot_cap  = 4;
+	p->slots     = gb_alloc_array(heap_allocator(), fbStackSlot, p->slot_cap);
+	p->aux_cap   = 16;
+	p->aux       = gb_alloc_array(heap_allocator(), u32, p->aux_cap);
+	p->loc_cap   = 2;
+	p->locs      = gb_alloc_array(heap_allocator(), fbLoc, p->loc_cap);
+
+	// Set up 2 params: data(rawptr), seed(uintptr)
+	p->param_count = 2;
+	p->param_locs = gb_alloc_array(heap_allocator(), fbProc::fbParamLoc, 2);
+
+	// Slot 0: data (rawptr, 8 bytes)
+	u32 slot0 = fb_slot_create(p, 8, 8, nullptr, t_rawptr);
+	p->param_locs[0] = {slot0, 0};
+
+	// Slot 1: seed (uintptr, 8 bytes)
+	u32 slot1 = fb_slot_create(p, 8, 8, nullptr, t_uintptr);
+	p->param_locs[1] = {slot1, 0};
+
+	u32 entry = fb_block_create(p);
+	fb_block_start(p, entry);
+
+	// Load params from slots
+	u32 data_ptr_id = fb_inst_emit(p, FB_LOAD, {FBT_PTR, 0}, fb_inst_emit(p, FB_ALLOCA, {FBT_PTR, 0}, slot0, 0, 0, 0, 0), 0, 0, 0, 8);
+	u32 seed_id     = fb_inst_emit(p, FB_LOAD, {FBT_I64, 0}, fb_inst_emit(p, FB_ALLOCA, {FBT_PTR, 0}, slot1, 0, 0, 0, 0), 0, 0, 0, 8);
+
+	u32 proc_idx = cast(u32)m->procs.count;
+	array_add(&m->procs, p);
+	map_set(&m->map_hasher_procs, type, proc_idx);
+
+	if (is_type_string(type)) {
+		// Call default_hasher_string(data, seed) -> uintptr
+		u32 target_idx = fb_lookup_runtime_proc(m, str_lit("default_hasher_string"));
+		u32 target_id = fb_inst_emit(p, FB_SYMADDR, {FBT_PTR, 0}, FB_NOREG, 0, 0, 0, cast(i64)target_idx);
+		fb_aux_push(p, data_ptr_id);
+		fb_aux_push(p, seed_id);
+		u32 result = fb_inst_emit(p, FB_CALL, {FBT_I64, 0}, target_id, p->aux_count - 2, 2, 0, 0);
+		p->insts[p->inst_count - 1].flags = FBCC_ODIN;
+		fb_inst_emit(p, FB_RET, FB_VOID, result, FB_NOREG, FB_NOREG, 0, 0);
+	} else if (is_type_cstring(type)) {
+		u32 target_idx = fb_lookup_runtime_proc(m, str_lit("default_hasher_cstring"));
+		u32 target_id = fb_inst_emit(p, FB_SYMADDR, {FBT_PTR, 0}, FB_NOREG, 0, 0, 0, cast(i64)target_idx);
+		fb_aux_push(p, data_ptr_id);
+		fb_aux_push(p, seed_id);
+		u32 result = fb_inst_emit(p, FB_CALL, {FBT_I64, 0}, target_id, p->aux_count - 2, 2, 0, 0);
+		p->insts[p->inst_count - 1].flags = FBCC_ODIN;
+		fb_inst_emit(p, FB_RET, FB_VOID, result, FB_NOREG, FB_NOREG, 0, 0);
+	} else {
+		// Simple-compare or anything else: call default_hasher(data, seed, sizeof(type))
+		u32 target_idx = fb_lookup_runtime_proc(m, str_lit("default_hasher"));
+		u32 target_id = fb_inst_emit(p, FB_SYMADDR, {FBT_PTR, 0}, FB_NOREG, 0, 0, 0, cast(i64)target_idx);
+		u32 size_id = fb_inst_emit(p, FB_ICONST, {FBT_I64, 0}, FB_NOREG, 0, 0, 0, type_size_of(type));
+		fb_aux_push(p, data_ptr_id);
+		fb_aux_push(p, seed_id);
+		fb_aux_push(p, size_id);
+		u32 result = fb_inst_emit(p, FB_CALL, {FBT_I64, 0}, target_id, p->aux_count - 3, 3, 0, 0);
+		p->insts[p->inst_count - 1].flags = FBCC_ODIN;
+		fb_inst_emit(p, FB_RET, FB_VOID, result, FB_NOREG, FB_NOREG, 0, 0);
+	}
+
+	return proc_idx;
+}
+
+// Generate (or look up) an equal proc for a key type.
+// Signature: proc "contextless" (a: rawptr, b: rawptr) -> bool
+gb_internal u32 fb_gen_equal_proc(fbBuilder *b, Type *type) {
+	type = core_type(type);
+	fbModule *m = b->module;
+	u32 *found = map_get(&m->map_equal_procs, type);
+	if (found) return *found;
+
+	fbProc *p = gb_alloc_item(permanent_allocator(), fbProc);
+	gb_zero_item(p);
+	p->name = str_lit("__$fb_equal");
+	p->is_foreign = false;
+	p->is_export = false;
+	p->current_block = FB_NOREG;
+	p->split_returns_index = -1;
+	p->sret_slot_idx = -1;
+
+	p->inst_cap  = 32;
+	p->insts     = gb_alloc_array(heap_allocator(), fbInst, p->inst_cap);
+	p->block_cap = 4;
+	p->blocks    = gb_alloc_array(heap_allocator(), fbBlock, p->block_cap);
+	p->slot_cap  = 4;
+	p->slots     = gb_alloc_array(heap_allocator(), fbStackSlot, p->slot_cap);
+	p->aux_cap   = 16;
+	p->aux       = gb_alloc_array(heap_allocator(), u32, p->aux_cap);
+	p->loc_cap   = 2;
+	p->locs      = gb_alloc_array(heap_allocator(), fbLoc, p->loc_cap);
+
+	// 2 params: a(rawptr), b(rawptr)
+	p->param_count = 2;
+	p->param_locs = gb_alloc_array(heap_allocator(), fbProc::fbParamLoc, 2);
+
+	u32 slot0 = fb_slot_create(p, 8, 8, nullptr, t_rawptr);
+	p->param_locs[0] = {slot0, 0};
+	u32 slot1 = fb_slot_create(p, 8, 8, nullptr, t_rawptr);
+	p->param_locs[1] = {slot1, 0};
+
+	u32 entry = fb_block_create(p);
+	fb_block_start(p, entry);
+
+	u32 a_id = fb_inst_emit(p, FB_LOAD, {FBT_PTR, 0}, fb_inst_emit(p, FB_ALLOCA, {FBT_PTR, 0}, slot0, 0, 0, 0, 0), 0, 0, 0, 8);
+	u32 b_id = fb_inst_emit(p, FB_LOAD, {FBT_PTR, 0}, fb_inst_emit(p, FB_ALLOCA, {FBT_PTR, 0}, slot1, 0, 0, 0, 0), 0, 0, 0, 8);
+
+	u32 proc_idx = cast(u32)m->procs.count;
+	array_add(&m->procs, p);
+	map_set(&m->map_equal_procs, type, proc_idx);
+
+	i64 sz = type_size_of(type);
+
+	if (is_type_string(type)) {
+		// String equal: compare len, then memcmp data
+		// Load a.len, b.len
+		u32 a_len = fb_inst_emit(p, FB_LOAD, {FBT_I64, 0}, fb_inst_emit(p, FB_MEMBER, {FBT_PTR, 0}, a_id, 0, 0, 0, 8), 0, 0, 0, 8);
+		u32 b_len = fb_inst_emit(p, FB_LOAD, {FBT_I64, 0}, fb_inst_emit(p, FB_MEMBER, {FBT_PTR, 0}, b_id, 0, 0, 0, 8), 0, 0, 0, 8);
+		u32 len_eq = fb_inst_emit(p, FB_CMP_EQ, {FBT_I1, 0}, a_len, b_len, 0, 0, 0);
+
+		u32 then_blk = fb_block_create(p);
+		u32 done_blk = fb_block_create(p);
+		fb_inst_emit(p, FB_BRANCH, FB_VOID, len_eq, then_blk, done_blk, 0, 0);
+
+		// then: memcmp data pointers
+		fb_block_start(p, then_blk);
+		u32 a_data = fb_inst_emit(p, FB_LOAD, {FBT_PTR, 0}, a_id, 0, 0, 0, 8);
+		u32 b_data = fb_inst_emit(p, FB_LOAD, {FBT_PTR, 0}, b_id, 0, 0, 0, 8);
+		u32 memcmp_idx = fb_ensure_c_proc(m, str_lit("memcmp"));
+		u32 memcmp_sym = fb_inst_emit(p, FB_SYMADDR, {FBT_PTR, 0}, FB_NOREG, 0, 0, 0, cast(i64)memcmp_idx);
+		fb_aux_push(p, a_data);
+		fb_aux_push(p, b_data);
+		fb_aux_push(p, a_len);
+		u32 cmp_result = fb_inst_emit(p, FB_CALL, {FBT_I32, 0}, memcmp_sym, p->aux_count - 3, 3, 0, 0);
+		p->insts[p->inst_count - 1].flags = FBCC_C;
+		u32 zero32 = fb_inst_emit(p, FB_ICONST, {FBT_I32, 0}, FB_NOREG, 0, 0, 0, 0);
+		u32 bytes_eq = fb_inst_emit(p, FB_CMP_EQ, {FBT_I1, 0}, cmp_result, zero32, 0, 0, 0);
+		fb_inst_emit(p, FB_RET, FB_VOID, bytes_eq, FB_NOREG, FB_NOREG, 0, 0);
+
+		// done: return false (len mismatch)
+		fb_block_start(p, done_blk);
+		u32 false_val = fb_inst_emit(p, FB_ICONST, {FBT_I1, 0}, FB_NOREG, 0, 0, 0, 0);
+		fb_inst_emit(p, FB_RET, FB_VOID, false_val, FB_NOREG, FB_NOREG, 0, 0);
+	} else {
+		// Simple memcmp for simple-compare types (integers, pointers, etc.)
+		u32 memcmp_idx = fb_ensure_c_proc(m, str_lit("memcmp"));
+		u32 memcmp_sym = fb_inst_emit(p, FB_SYMADDR, {FBT_PTR, 0}, FB_NOREG, 0, 0, 0, cast(i64)memcmp_idx);
+		u32 size_id = fb_inst_emit(p, FB_ICONST, {FBT_I64, 0}, FB_NOREG, 0, 0, 0, sz);
+		fb_aux_push(p, a_id);
+		fb_aux_push(p, b_id);
+		fb_aux_push(p, size_id);
+		u32 cmp_result = fb_inst_emit(p, FB_CALL, {FBT_I32, 0}, memcmp_sym, p->aux_count - 3, 3, 0, 0);
+		p->insts[p->inst_count - 1].flags = FBCC_C;
+		u32 zero32 = fb_inst_emit(p, FB_ICONST, {FBT_I32, 0}, FB_NOREG, 0, 0, 0, 0);
+		u32 eq = fb_inst_emit(p, FB_CMP_EQ, {FBT_I1, 0}, cmp_result, zero32, 0, 0, 0);
+		fb_inst_emit(p, FB_RET, FB_VOID, eq, FB_NOREG, FB_NOREG, 0, 0);
+	}
+
+	return proc_idx;
+}
+
+// Generate a Map_Info global for a map type. Returns global_entries index.
+// Map_Info = {ks: ^Map_Cell_Info, vs: ^Map_Cell_Info, key_hasher: proc, key_equal: proc}
+gb_internal u32 fb_gen_map_info(fbBuilder *b, Type *map_type) {
+	map_type = base_type(map_type);
+	GB_ASSERT(map_type->kind == Type_Map);
+
+	fbModule *m = b->module;
+	u32 *found = map_get(&m->map_info_map, map_type);
+	if (found) return *found;
+
+	u32 ks_gidx = fb_gen_map_cell_info(m, map_type->Map.key);
+	u32 vs_gidx = fb_gen_map_cell_info(m, map_type->Map.value);
+	u32 hasher_idx = fb_gen_hasher_proc(b, map_type->Map.key);
+	u32 equal_idx  = fb_gen_equal_proc(b, map_type->Map.key);
+
+	i64 ptr_size = m->target.ptr_size;
+	u32 global_size = cast(u32)(4 * ptr_size);  // 4 pointers
+	u8 *buf = gb_alloc_array(heap_allocator(), u8, global_size);
+	gb_zero_size(buf, global_size);
+
+	fbGlobalEntry ge = {};
+	ge.name = str_lit("__$fb_map_info");
+	ge.odin_type = t_map_info;
+	ge.init_data = buf;
+	ge.size = global_size;
+	ge.align = cast(u32)ptr_size;
+	ge.is_foreign = false;
+	ge.is_export = false;
+
+	u32 gidx = cast(u32)m->global_entries.count;
+	array_add(&m->global_entries, ge);
+	map_set(&m->map_info_map, map_type, gidx);
+
+	// Data relocations for the 4 pointers:
+	// [0] ks → &map_cell_info_global for key type
+	fbDataReloc r0 = {};
+	r0.global_idx = gidx;
+	r0.local_offset = 0;
+	r0.target_sym = FB_GLOBAL_SYM_BASE + ks_gidx;
+	r0.addend = 0;
+	array_add(&m->data_relocs, r0);
+
+	// [1] vs → &map_cell_info_global for value type
+	fbDataReloc r1 = {};
+	r1.global_idx = gidx;
+	r1.local_offset = cast(u32)ptr_size;
+	r1.target_sym = FB_GLOBAL_SYM_BASE + vs_gidx;
+	r1.addend = 0;
+	array_add(&m->data_relocs, r1);
+
+	// [2] key_hasher → hasher proc
+	fbDataReloc r2 = {};
+	r2.global_idx = gidx;
+	r2.local_offset = cast(u32)(2 * ptr_size);
+	r2.target_sym = hasher_idx;  // proc symbol
+	r2.addend = 0;
+	array_add(&m->data_relocs, r2);
+
+	// [3] key_equal → equal proc
+	fbDataReloc r3 = {};
+	r3.global_idx = gidx;
+	r3.local_offset = cast(u32)(3 * ptr_size);
+	r3.target_sym = equal_idx;  // proc symbol
+	r3.addend = 0;
+	array_add(&m->data_relocs, r3);
+
+	return gidx;
+}
+
+// Get ^Map_Info pointer as an fbValue (pointer to the Map_Info global).
+gb_internal fbValue fb_map_info_ptr(fbBuilder *b, Type *map_type) {
+	u32 gidx = fb_gen_map_info(b, map_type);
+	u32 sym = FB_GLOBAL_SYM_BASE + gidx;
+	fbValue ptr = fb_emit_symaddr(b, sym);
+	ptr.type = t_map_info_ptr;
+	return ptr;
+}
+
+// Inline map_seed_from_map_data as SplitMix64:
+//   mix = data + 0x9e3779b97f4a7c15
+//   mix = (mix ^ (mix >> 30)) * 0xbf58476d1ce4e5b9
+//   mix = (mix ^ (mix >> 27)) * 0x94d049bb133111eb
+//   return mix ^ (mix >> 31)
+gb_internal fbValue fb_map_seed(fbBuilder *b, fbValue data_uintptr) {
+	fbValue c1 = fb_emit_iconst(b, t_uintptr, 0x9e3779b97f4a7c15LL);
+	fbValue mix = fb_emit_arith(b, FB_ADD, data_uintptr, c1, t_uintptr);
+
+	fbValue s30 = fb_emit_iconst(b, t_uintptr, 30);
+	fbValue t1 = fb_emit_arith(b, FB_LSHR, mix, s30, t_uintptr);
+	mix = fb_emit_arith(b, FB_XOR, mix, t1, t_uintptr);
+	fbValue c2 = fb_emit_iconst(b, t_uintptr, cast(i64)0xbf58476d1ce4e5b9ULL);
+	mix = fb_emit_arith(b, FB_MUL, mix, c2, t_uintptr);
+
+	fbValue s27 = fb_emit_iconst(b, t_uintptr, 27);
+	fbValue t2 = fb_emit_arith(b, FB_LSHR, mix, s27, t_uintptr);
+	mix = fb_emit_arith(b, FB_XOR, mix, t2, t_uintptr);
+	fbValue c3 = fb_emit_iconst(b, t_uintptr, cast(i64)0x94d049bb133111ebULL);
+	mix = fb_emit_arith(b, FB_MUL, mix, c3, t_uintptr);
+
+	fbValue s31 = fb_emit_iconst(b, t_uintptr, 31);
+	fbValue t3 = fb_emit_arith(b, FB_LSHR, mix, s31, t_uintptr);
+	mix = fb_emit_arith(b, FB_XOR, mix, t3, t_uintptr);
+	return mix;
+}
+
+// Extract the data pointer from a Raw_Map value (mask off lower 6 bits).
+gb_internal fbValue fb_map_data_uintptr(fbBuilder *b, fbValue map_data_field) {
+	fbValue mask = fb_emit_iconst(b, t_uintptr, ~cast(i64)0x3F);
+	return fb_emit_arith(b, FB_AND, map_data_field, mask, t_uintptr);
+}
+
+// Compute map capacity from data field: cap = (data == 0) ? 0 : (1 << (data & 0x3F))
+gb_internal fbValue fb_map_cap(fbBuilder *b, fbValue map_data_field) {
+	fbValue zero = fb_emit_iconst(b, t_uintptr, 0);
+	fbValue one  = fb_emit_iconst(b, t_uintptr, 1);
+	fbValue mask = fb_emit_iconst(b, t_uintptr, 0x3F);
+	fbValue log2_cap = fb_emit_arith(b, FB_AND, map_data_field, mask, t_uintptr);
+	fbValue cap = fb_emit_arith(b, FB_SHL, one, log2_cap, t_uintptr);
+	fbValue is_zero = fb_emit_cmp(b, FB_CMP_EQ, map_data_field, zero);
+	return fb_emit_select(b, is_zero, zero, cap, t_uintptr);
+}
+
+// Index into a map cell array accounting for cache-line padding.
+// cell_index_static(type, base_ptr, index) -> pointer to element
+gb_internal fbValue fb_map_cell_index(fbBuilder *b, Type *type, fbValue cells_ptr, fbValue index) {
+	i64 elem_sz = type_size_of(type);
+	i64 size = 0, len = 0;
+	map_cell_size_and_len(type, &size, &len);
+
+	index = fb_emit_conv(b, index, t_uintptr);
+
+	if (size == len * elem_sz) {
+		// No padding — simple array index
+		return fb_emit_array_access(b, cells_ptr, index, elem_sz);
+	}
+
+	// With padding: cell_idx = index / len, data_idx = index % len
+	// Offset = cell_idx * size + data_idx * elem_sz
+	fbValue cell_idx, data_idx;
+	fbValue size_const = fb_emit_iconst(b, t_uintptr, size);
+	fbValue len_const  = fb_emit_iconst(b, t_uintptr, len);
+
+	if (is_power_of_two(cast(u64)len)) {
+		u64 log2_len = floor_log2(cast(u64)len);
+		if (log2_len == 0) {
+			cell_idx = index;
+		} else {
+			fbValue shift = fb_emit_iconst(b, t_uintptr, cast(i64)log2_len);
+			cell_idx = fb_emit_arith(b, FB_LSHR, index, shift, t_uintptr);
+		}
+		fbValue and_mask = fb_emit_iconst(b, t_uintptr, len - 1);
+		data_idx = fb_emit_arith(b, FB_AND, index, and_mask, t_uintptr);
+	} else {
+		cell_idx = fb_emit_arith(b, FB_UDIV, index, len_const, t_uintptr);
+		data_idx = fb_emit_arith(b, FB_UMOD, index, len_const, t_uintptr);
+	}
+
+	fbValue cell_offset = fb_emit_arith(b, FB_MUL, size_const, cell_idx, t_uintptr);
+	fbValue elem_offset = fb_emit_arith(b, FB_MUL, fb_emit_iconst(b, t_uintptr, elem_sz), data_idx, t_uintptr);
+	fbValue total = fb_emit_arith(b, FB_ADD, cell_offset, elem_offset, t_uintptr);
+
+	// Base is uintptr, add offset and convert back to pointer
+	fbValue base_int = fb_emit_conv(b, cells_ptr, t_uintptr);
+	fbValue result_int = fb_emit_arith(b, FB_ADD, base_int, total, t_uintptr);
+	fbValue result = fb_emit_conv(b, result_int, t_rawptr);
+	result.type = alloc_type_pointer(type);
+	return result;
+}
+
+// Check if a map hash value is valid: (hash != 0) & ((hash >> 63) == 0)
+gb_internal fbValue fb_map_hash_is_valid(fbBuilder *b, fbValue hash) {
+	fbValue zero = fb_emit_iconst(b, t_uintptr, 0);
+	fbValue not_empty = fb_emit_cmp(b, FB_CMP_NE, hash, zero);
+	fbValue shift = fb_emit_iconst(b, t_uintptr, 63);
+	fbValue top = fb_emit_arith(b, FB_LSHR, hash, shift, t_uintptr);
+	fbValue not_deleted = fb_emit_cmp(b, FB_CMP_EQ, top, zero);
+	return fb_emit_arith(b, FB_AND, not_empty, not_deleted, t_bool);
+}
+
+// Hash a key value for a map operation.
+// Returns the hash and sets *key_ptr_out to a rawptr to the key.
+gb_internal fbValue fb_map_key_hash(fbBuilder *b, fbValue map_ptr, Type *map_type, fbValue key, fbValue *key_ptr_out) {
+	Type *key_type = base_type(map_type)->Map.key;
+
+	// Store key to a local and take its address
+	fbAddr key_local = fb_add_local(b, key_type, nullptr, false);
+	fb_emit_copy_value(b, key_local.base, key, key_type);
+	fbValue key_ptr = key_local.base;
+	key_ptr.type = t_rawptr;
+	if (key_ptr_out) *key_ptr_out = key_ptr;
+
+	// Get seed: load map.data (field 0), apply SplitMix64
+	fbValue map_val_data = fb_emit_load(b, map_ptr, t_uintptr);
+	fbValue data_clean = fb_map_data_uintptr(b, map_val_data);
+	fbValue seed = fb_map_seed(b, data_clean);
+
+	// Call hasher proc
+	u32 hasher_idx = fb_gen_hasher_proc(b, key_type);
+	fbValue args[2] = { key_ptr, seed };
+	return fb_emit_call_contextless(b, hasher_idx, args, 2, t_uintptr);
+}
+
+// Call __dynamic_map_get(map_ptr, map_info, hash, key_ptr) -> rawptr
+gb_internal fbValue fb_dynamic_map_get(fbBuilder *b, fbValue map_ptr, Type *map_type, fbValue hash, fbValue key_ptr) {
+	u32 proc_idx = fb_lookup_runtime_proc(b->module, str_lit("__dynamic_map_get"));
+	fbValue info_ptr = fb_map_info_ptr(b, map_type);
+	fbValue args[4] = {
+		fb_emit_conv(b, map_ptr, t_rawptr),  // ^Raw_Map
+		info_ptr,                              // ^Map_Info
+		hash,                                  // Map_Hash
+		key_ptr,                               // rawptr to key
+	};
+	return fb_emit_call_contextless(b, proc_idx, args, 4, t_rawptr);
+}
+
+// Call __dynamic_map_set(map_ptr, map_info, hash, key_ptr, val_ptr, loc) -> rawptr
+gb_internal void fb_dynamic_map_set(fbBuilder *b, fbValue map_ptr, Type *map_type, fbValue hash, fbValue key_ptr, fbValue val_ptr, Ast *node) {
+	u32 proc_idx = fb_lookup_runtime_proc(b->module, str_lit("__dynamic_map_set"));
+	fbValue info_ptr = fb_map_info_ptr(b, map_type);
+
+	// Build source code location for the loc parameter
+	String proc_name = {};
+	if (b->entity != nullptr) {
+		proc_name = b->entity->token.string;
+	}
+	TokenPos pos = {};
+	if (node != nullptr) {
+		pos = ast_token(node).pos;
+	}
+	fbValue loc = fb_build_source_code_location(b, proc_name, pos);
+
+	fbValue args[6] = {
+		fb_emit_conv(b, map_ptr, t_rawptr),  // ^Raw_Map
+		info_ptr,                              // ^Map_Info
+		hash,                                  // Map_Hash
+		fb_emit_conv(b, key_ptr, t_rawptr),   // key rawptr
+		fb_emit_conv(b, val_ptr, t_rawptr),   // value rawptr
+		loc,                                   // Source_Code_Location
+	};
+	fb_emit_call_odin(b, proc_idx, args, 6, t_rawptr);
+}
+
+// Call __dynamic_map_reserve(map_ptr, map_info, capacity, loc) -> Allocator_Error
+gb_internal void fb_dynamic_map_reserve(fbBuilder *b, fbValue map_ptr, Type *map_type, fbValue capacity, Ast *node) {
+	u32 proc_idx = fb_lookup_runtime_proc(b->module, str_lit("__dynamic_map_reserve"));
+	fbValue info_ptr = fb_map_info_ptr(b, map_type);
+
+	String proc_name = {};
+	if (b->entity != nullptr) proc_name = b->entity->token.string;
+	TokenPos pos = {};
+	if (node != nullptr) pos = ast_token(node).pos;
+	fbValue loc = fb_build_source_code_location(b, proc_name, pos);
+
+	fbValue args[4] = {
+		fb_emit_conv(b, map_ptr, t_rawptr),
+		info_ptr,
+		fb_emit_conv(b, capacity, t_uint),
+		loc,
+	};
+	fb_emit_call_odin(b, proc_idx, args, 4, nullptr);
 }
 
 gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
@@ -1114,10 +1805,48 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 
 	case Ast_IndexExpr: {
 		ast_node(ie, IndexExpr, expr);
+		Type *expr_type = base_type(type_of_expr(ie->expr));
+
+		// Dereference pointers to maps/containers
+		if (is_type_pointer(expr_type)) {
+			expr_type = base_type(type_deref(expr_type));
+		}
+
+		if (is_type_map(expr_type)) {
+			// Map index: m[key] → fbAddr_Map
+			fbAddr map_addr = fb_build_addr(b, ie->expr);
+			fbValue key = fb_build_expr(b, ie->index);
+			key = fb_emit_conv(b, key, expr_type->Map.key);
+
+			fbValue map_ptr = map_addr.base;
+			if (is_type_pointer(type_of_expr(ie->expr))) {
+				map_ptr = fb_emit_load(b, map_ptr, t_rawptr);
+				map_ptr.type = alloc_type_pointer(expr_type);
+			}
+
+			Type *result_type = type_of_expr(expr);
+			fbAddr addr = {};
+			addr.kind = fbAddr_Map;
+			addr.base = map_ptr;
+			addr.type = result_type;
+			addr.map.key = key;
+			addr.map.map_type = expr_type;
+			addr.map.result_type = result_type;
+			return addr;
+		}
+
 		fbAddr base_addr = fb_build_addr(b, ie->expr);
 		fbValue index = fb_build_expr(b, ie->index);
 
+		// Dereference pointer-to-container: ^[N]T, ^[]T, etc.
+		// The address gives us a pointer to the pointer; we must load
+		// through it to get the actual container base.
+		bool deref = is_type_pointer(base_type(base_addr.type));
 		Type *bt = base_type(base_addr.type);
+		if (deref) {
+			bt = base_type(type_deref(bt));
+		}
+
 		Type *elem_type = nullptr;
 		i64 stride = 0;
 
@@ -1126,24 +1855,38 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 		if (bt->kind == Type_Array) {
 			elem_type = bt->Array.elem;
 			stride = type_size_of(elem_type);
+			if (deref) {
+				data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+			}
 		} else if (bt->kind == Type_Slice) {
-			// Slice: load .data pointer (field 0, offset 0)
 			elem_type = bt->Slice.elem;
 			stride = type_size_of(elem_type);
-			data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+			if (deref) {
+				data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+			}
+			data_ptr = fb_emit_load(b, data_ptr, t_rawptr);
 		} else if (bt->kind == Type_DynamicArray) {
-			// Dynamic array: load .data pointer (field 0, offset 0)
 			elem_type = bt->DynamicArray.elem;
 			stride = type_size_of(elem_type);
-			data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+			if (deref) {
+				data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+			}
+			data_ptr = fb_emit_load(b, data_ptr, t_rawptr);
 		} else if (is_type_string(bt)) {
-			// String: load .data pointer (field 0, offset 0), element is u8
 			elem_type = t_u8;
 			stride = 1;
-			data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
-		} else if (is_type_pointer(bt) || is_type_multi_pointer(bt)) {
-			elem_type = type_deref(base_addr.type);
+			if (deref) {
+				data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+			}
+			data_ptr = fb_emit_load(b, data_ptr, t_rawptr);
+		} else if (is_type_pointer(bt)) {
+			elem_type = bt->Pointer.elem;
 			stride = type_size_of(elem_type);
+			data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+		} else if (is_type_multi_pointer(bt)) {
+			elem_type = bt->MultiPointer.elem;
+			stride = type_size_of(elem_type);
+			data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
 		} else {
 			elem_type = type_of_expr(expr);
 			stride = type_size_of(elem_type);
@@ -1241,8 +1984,17 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 			// Multi-pointer [^]T: the value itself is a pointer to T
 			data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
 			stride = type_size_of(bt->MultiPointer.elem);
+
+			if (se->high == nullptr) {
+				// p[low:] → pointer arithmetic, result is [^]T
+				fbValue offset = fb_emit_array_access(b, data_ptr, low, stride);
+				Type *mp_type = type_of_expr(expr);
+				fbAddr local = fb_add_local(b, mp_type, nullptr, false);
+				fb_emit_store(b, local.base, offset);
+				return local;
+			}
+
 			result_type = alloc_type_slice(bt->MultiPointer.elem);
-			// No implicit high bound — caller must provide high
 		} else {
 			GB_PANIC("fb_build_addr SliceExpr: unhandled base type %s", type_to_string(bt));
 		}
@@ -1700,8 +2452,9 @@ gb_internal fbAddr fb_build_compound_lit(fbBuilder *b, Ast *expr) {
 	fbAddr v = fb_add_local(b, type, nullptr, true);
 
 	ast_node(cl, CompoundLit, expr);
-	if (cl->elems.count == 0) {
+	if (cl->elems.count == 0 && bt->kind != Type_Map) {
 		// Empty compound literal: zero-init is sufficient
+		// (maps still need allocator setup even when empty)
 		return v;
 	}
 
@@ -1828,6 +2581,70 @@ gb_internal fbAddr fb_build_compound_lit(fbBuilder *b, Ast *expr) {
 			fbValue dst = v.base;
 			if (i > 0) dst = fb_emit_member(b, v.base, i * elem_size);
 			fb_emit_store(b, dst, val);
+		}
+		break;
+	}
+
+	case Type_Map: {
+		// Map compound literal: map[K]V{k1=v1, k2=v2, ...}
+		// 1. Set allocator from context
+		// 2. Reserve capacity
+		// 3. Insert each element
+		i64 ptr_size = b->module->target.ptr_size;
+		i64 elem_count = cl->elems.count;
+
+		// Set allocator: map.allocator = context.allocator
+		// Allocator is at offset 2*ptr_size in Raw_Map (after data and len)
+		// context.allocator is the first field of context (offset 0), and is 16 bytes
+		if (b->context_stack.count > 0) {
+			fbContextData *ctx = &b->context_stack[b->context_stack.count - 1];
+			fbValue ctx_val = fb_addr_load(b, ctx->ctx);
+			// ctx_val is now the context pointer (rawptr/^Context).
+			// For Odin CC procs, this is the passed-in pointer.
+			// For non-Odin procs with auto-created context, this is a pointer to the local.
+			// If the context addr type is a pointer type, ctx_val is the pointer itself.
+			// If it's a struct type (local context), ctx_val is the struct or its address.
+			fbValue ctx_data_ptr;
+			if (is_type_pointer(ctx->ctx.type)) {
+				ctx_data_ptr = ctx_val;
+			} else {
+				// Local context: addr.base is already a pointer to the context data
+				ctx_data_ptr = ctx->ctx.base;
+			}
+			fbValue alloc_dst = fb_emit_member(b, v.base, 2 * ptr_size);
+			i64 alloc_size = type_size_of(t_allocator);
+			fbValue sz = fb_emit_iconst(b, t_int, alloc_size);
+			fb_emit_memcpy(b, alloc_dst, ctx_data_ptr, sz, ptr_size);
+		}
+
+		// Reserve capacity: __dynamic_map_reserve(map_ptr, map_info, 2*count, loc)
+		if (elem_count > 0) {
+			fbValue cap = fb_emit_iconst(b, t_uint, 2 * elem_count);
+			fb_dynamic_map_reserve(b, v.base, bt, cap, expr);
+		}
+
+		// Insert each element
+		for (i64 i = 0; i < elem_count; i++) {
+			Ast *elem = cl->elems[i];
+			GB_ASSERT(elem->kind == Ast_FieldValue);
+			Ast *key_expr = elem->FieldValue.field;
+			Ast *val_expr = elem->FieldValue.value;
+
+			fbValue key = fb_build_expr(b, key_expr);
+			key = fb_emit_conv(b, key, bt->Map.key);
+			fbValue value = fb_build_expr(b, val_expr);
+			value = fb_emit_conv(b, value, bt->Map.value);
+
+			// Store value to local
+			Type *value_type = bt->Map.value;
+			fbAddr val_local = fb_add_local(b, value_type, nullptr, false);
+			fb_emit_copy_value(b, val_local.base, value, value_type);
+			fbValue val_ptr = val_local.base;
+			val_ptr.type = t_rawptr;
+
+			fbValue key_ptr = {};
+			fbValue hash = fb_map_key_hash(b, v.base, bt, key, &key_ptr);
+			fb_dynamic_map_set(b, v.base, bt, hash, key_ptr, val_ptr, expr);
 		}
 		break;
 	}
@@ -2446,6 +3263,9 @@ gb_internal fbValue fb_handle_param_value(fbBuilder *b, Type *param_type, Parame
 		return nil_val.base;
 	}
 
+	case ParameterValue_Value:
+		return fb_build_expr(b, pv.ast_value);
+
 	default:
 		GB_PANIC("fb_handle_param_value: unhandled kind %d", pv.kind);
 		return fb_value_nil();
@@ -2522,8 +3342,22 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	if (total_arg_count > 0) {
 		built_args = gb_alloc_array(heap_allocator(), fbBuiltArg, total_arg_count);
 
-		// Build explicit positional arguments
+		// Build explicit positional arguments.
+		// Compile-time params (TypeName, Constant) are erased — emit nil/const
+		// without evaluating the AST expression (which may be a type literal
+		// like map[K]V that fb_build_expr cannot handle).
 		for_array(i, ce->args) {
+			Entity *e = (params != nullptr && i < param_count) ? params->variables[i] : nullptr;
+			if (e != nullptr && e->kind == Entity_TypeName) {
+				built_args[i].val  = fb_emit_iconst(b, t_rawptr, 0);
+				built_args[i].type = e->type;
+				continue;
+			}
+			if (e != nullptr && e->kind == Entity_Constant) {
+				built_args[i].val  = fb_const_value(b, e->type, e->Constant.value);
+				built_args[i].type = e->type;
+				continue;
+			}
 			built_args[i].val  = fb_build_expr(b, ce->args[i]);
 			built_args[i].type = type_of_expr(ce->args[i]);
 		}
@@ -2779,6 +3613,14 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 		// Procedure reference
 		if (e->kind == Entity_Procedure) {
 			u32 *idx = map_get(&fb_entity_proc_map, e);
+			if (idx == nullptr) {
+				// Lazily add runtime/library procs not discovered during initial scan
+				fbProc *p = fb_proc_create(b->module, e);
+				u32 proc_idx = cast(u32)b->module->procs.count;
+				array_add(&b->module->procs, p);
+				map_set(&fb_entity_proc_map, e, proc_idx);
+				idx = map_get(&fb_entity_proc_map, e);
+			}
 			if (idx != nullptr) {
 				fbValue sym = fb_emit_symaddr(b, *idx);
 				sym.type = type;
@@ -3051,18 +3893,42 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 
 		fbValue last_val = fb_build_expr(b, ore->expr);
 
-		fbValue vals[2];
-		fb_unpack_multi_return(b, last_val, vals, 2);
-		fbValue value = vals[0];
-		fbValue ok    = vals[1];
+		// Determine if the inner expression returns a tuple (multi-return)
+		// or a single value. For single-return or_return (e.g. `foo() or_return`
+		// where foo returns Allocator_Error), the single value IS the rhs
+		// (error) and there is no lhs (value).
+		fbValue value = {};
+		fbValue rhs = {};
+		Type *inner_type = type_of_expr(ore->expr);
+		if (inner_type != nullptr && inner_type->kind == Type_Tuple) {
+			// Multi-return: unpack into value(s) + rhs
+			fbValue vals[2];
+			fb_unpack_multi_return(b, last_val, vals, 2);
+			value = vals[0];
+			rhs   = vals[1];
+		} else {
+			// Single return: the value IS the error/ok
+			rhs = last_val;
+			// value stays empty — or_return yields nothing (Addressing_NoValue)
+		}
 
 		u32 ok_block     = fb_new_block(b);
 		u32 return_block = fb_new_block(b);
 
-		fbValue ok_bool = fb_emit_conv(b, ok, t_bool);
-		fb_emit_branch(b, ok_bool, ok_block, return_block);
+		// Check if rhs indicates success:
+		// - boolean types: true = has value
+		// - other types (enums etc with nil): nil = has value (no error)
+		fbValue has_value;
+		if (is_type_boolean(rhs.type)) {
+			has_value = fb_emit_conv(b, rhs, t_bool);
+		} else {
+			// Compare against nil (zero): rhs == 0 means no error = has value
+			fbValue zero = fb_emit_iconst(b, rhs.type, 0);
+			has_value = fb_emit_cmp(b, FB_CMP_EQ, rhs, zero);
+		}
+		fb_emit_branch(b, has_value, ok_block, return_block);
 
-		// Return block: ok == false, return the error value.
+		// Return block: rhs indicates error, return the error value.
 		// If the enclosing proc has split returns (multi-return), zero
 		// the output pointers so callers see clean zero values.
 		fb_set_block(b, return_block);
@@ -3081,11 +3947,24 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 			}
 		}
 		fb_emit_defer_stmts(b, fbDeferExit_Return, 0);
-		fb_emit_ret(b, ok);
+		// Convert rhs to the caller's last return type before returning
+		{
+			Type *caller_pt = base_type(b->type);
+			Type *caller_results = caller_pt->Proc.results;
+			if (caller_results != nullptr && caller_results->kind == Type_Tuple) {
+				Type *end_type = caller_results->Tuple.variables[caller_results->Tuple.variables.count - 1]->type;
+				rhs = fb_emit_conv(b, rhs, end_type);
+			}
+		}
+		fb_emit_ret(b, rhs);
 
 		// Ok block: return the value
 		fb_set_block(b, ok_block);
-		return fb_emit_conv(b, value, type);
+		if (type != nullptr && value.id != 0) {
+			return fb_emit_conv(b, value, type);
+		}
+		// Single-return or_return: no value to yield
+		return value;
 	}
 
 	case Ast_TernaryIfExpr: {
@@ -3525,8 +4404,62 @@ gb_internal void fb_build_return_stmt(fbBuilder *b, Slice<Ast *> const &results)
 	i32 res_count = res_tuple ? cast(i32)res_tuple->variables.count : 0;
 
 	if (results.count == 0) {
-		// Bare `return` — for named results, store them through split return
-		// pointers.  Implicit named-result returns are handled later.
+		// Bare `return` — copy named results to their output locations.
+		if (proc_type->has_named_results && res_count > 0) {
+			if (is_odin_like && res_count > 1 && b->proc->split_returns_index >= 0) {
+				// Multi-return with split returns: copy first N-1 named
+				// results to split return output pointers, return last
+				// in register.
+				for (i32 i = 0; i < res_count - 1; i++) {
+					Entity *re = res_tuple->variables[i];
+					fbAddr *local = map_get(&b->variable_map, re);
+					if (local == nullptr) continue;
+					fbValue val = fb_addr_load(b, *local);
+					Type *ret_type = re->type;
+					fbType ret_ft = fb_data_type(ret_type);
+					if (ret_ft.kind != FBT_VOID) {
+						val = fb_emit_conv(b, val, ret_type);
+					}
+					fbValue out_ptr = fb_load_split_return_ptr(b, i);
+					fb_emit_copy_value(b, out_ptr, val, ret_type);
+				}
+				Entity *last_re = res_tuple->variables[res_count - 1];
+				fbAddr *last_local = map_get(&b->variable_map, last_re);
+				fbValue last_val = {};
+				if (last_local != nullptr) {
+					last_val = fb_addr_load(b, *last_local);
+					last_val = fb_emit_conv(b, last_val, last_re->type);
+				} else {
+					last_val = fb_emit_iconst(b, last_re->type, 0);
+				}
+				fb_emit_defer_stmts(b, fbDeferExit_Return, 0);
+				fb_emit_ret(b, last_val);
+				return;
+			} else if (b->proc->sret_slot_idx >= 0 && res_count == 1) {
+				// Single MEMORY-class return with sret.
+				Entity *re = res_tuple->variables[0];
+				fbAddr *local = map_get(&b->variable_map, re);
+				if (local != nullptr) {
+					fbValue sret_ptr = fb_emit_alloca_from_slot(b, cast(u32)b->proc->sret_slot_idx);
+					sret_ptr = fb_emit_load(b, sret_ptr, alloc_type_pointer(re->type));
+					i64 sz = type_size_of(re->type);
+					i64 al = type_align_of(re->type);
+					fbValue sz_val = fb_emit_iconst(b, t_uintptr, sz);
+					fb_emit_memcpy(b, sret_ptr, local->base, sz_val, al);
+				}
+			} else if (res_count == 1) {
+				// Single scalar return with named result.
+				Entity *re = res_tuple->variables[0];
+				fbAddr *local = map_get(&b->variable_map, re);
+				if (local != nullptr) {
+					fbValue val = fb_addr_load(b, *local);
+					val = fb_emit_conv(b, val, re->type);
+					fb_emit_defer_stmts(b, fbDeferExit_Return, 0);
+					fb_emit_ret(b, val);
+					return;
+				}
+			}
+		}
 		fb_emit_defer_stmts(b, fbDeferExit_Return, 0);
 		fb_emit_ret_void(b);
 		return;
@@ -3545,7 +4478,20 @@ gb_internal void fb_build_return_stmt(fbBuilder *b, Slice<Ast *> const &results)
 			val = fb_emit_conv(b, val, ret_type);
 		}
 		fb_emit_defer_stmts(b, fbDeferExit_Return, 0);
-		fb_emit_ret(b, val);
+
+		// If the proc uses sret (single MEMORY-class return), copy the result
+		// to the caller's output buffer and return void.
+		if (b->proc->sret_slot_idx >= 0) {
+			fbValue sret_ptr = fb_emit_alloca_from_slot(b, cast(u32)b->proc->sret_slot_idx);
+			sret_ptr = fb_emit_load(b, sret_ptr, alloc_type_pointer(ret_type));
+			i64 sz = type_size_of(ret_type);
+			i64 al = type_align_of(ret_type);
+			fbValue sz_val = fb_emit_iconst(b, t_uintptr, sz);
+			fb_emit_memcpy(b, sret_ptr, val, sz_val, al);
+			fb_emit_ret_void(b);
+		} else {
+			fb_emit_ret(b, val);
+		}
 		return;
 	}
 
@@ -3648,12 +4594,7 @@ gb_internal void fb_build_assign_stmt(fbBuilder *b, AstAssignStmt *as) {
 
 					fbAddr addr = fb_build_addr(b, lhs_expr);
 					fbValue val = fb_emit_conv(b, vals[i], addr.type);
-					fbType addr_ft = fb_data_type(addr.type);
-					if (addr_ft.kind != FBT_VOID) {
-						fb_addr_store(b, addr, val);
-					} else {
-						fb_emit_copy_value(b, addr.base, val, addr.type);
-					}
+					fb_addr_store(b, addr, val);
 				}
 				array_free(&vals);
 				return;
@@ -3674,14 +4615,7 @@ gb_internal void fb_build_assign_stmt(fbBuilder *b, AstAssignStmt *as) {
 
 			fbAddr addr = fb_build_addr(b, lhs_expr);
 			fbValue val = fb_emit_conv(b, rhs_vals[i], addr.type);
-			fbType addr_ft = fb_data_type(addr.type);
-			if (addr_ft.kind != FBT_VOID) {
-				// Scalar: store
-				fb_addr_store(b, addr, val);
-			} else {
-				// Aggregate: memcpy
-				fb_emit_copy_value(b, addr.base, val, addr.type);
-			}
+			fb_addr_store(b, addr, val);
 		}
 
 		array_free(&rhs_vals);
@@ -4073,6 +5007,225 @@ gb_internal void fb_build_range_indexed(fbBuilder *b, AstRangeStmt *rs,
 	fb_scope_close(b, fbDeferExit_Default, 0);
 }
 
+// Map range: for key, value in map_expr
+gb_internal void fb_build_range_map(fbBuilder *b, AstRangeStmt *rs, Scope *scope) {
+	fb_scope_open(b, scope);
+
+	Ast *expr = unparen_expr(rs->expr);
+	Type *expr_type = type_of_expr(expr);
+	Type *map_type = base_type(type_deref(expr_type));
+	GB_ASSERT(map_type->kind == Type_Map);
+
+	Type *key_type = map_type->Map.key;
+	Type *val_type = map_type->Map.value;
+
+	Ast *val0 = rs->vals.count > 0 ? fb_strip_and_prefix(rs->vals[0]) : nullptr;
+	Ast *val1 = rs->vals.count > 1 ? fb_strip_and_prefix(rs->vals[1]) : nullptr;
+
+	// Load map value
+	fbAddr map_addr = fb_build_addr(b, expr);
+	fbValue map_ptr = map_addr.base;
+	if (is_type_pointer(expr_type)) {
+		map_ptr = fb_emit_load(b, map_ptr, t_rawptr);
+		map_ptr.type = alloc_type_pointer(map_type);
+	}
+
+	// Load map.data field and compute capacity
+	fbValue map_data = fb_emit_load(b, map_ptr, t_uintptr);
+	fbValue capacity = fb_map_cap(b, map_data);
+	fbValue ks = fb_map_data_uintptr(b, map_data);
+
+	// Compute vs = cell_index(key_type, ks, capacity) → start of value cells
+	fbValue vs = fb_map_cell_index(b, key_type, ks, capacity);
+	vs = fb_emit_conv(b, vs, t_rawptr);
+
+	// Compute hs = cell_index(val_type, vs, capacity) → start of hash cells
+	fbValue hs = fb_map_cell_index(b, val_type, vs, capacity);
+	hs = fb_emit_conv(b, hs, t_rawptr);
+
+	// Index: start at -1
+	fbAddr index_addr = fb_add_local(b, t_int, nullptr, false);
+	fb_addr_store(b, index_addr, fb_emit_iconst(b, t_int, -1));
+
+	u32 loop_block = fb_new_block(b);
+	u32 hash_check = fb_new_block(b);
+	u32 body_block = fb_new_block(b);
+	u32 done_block = fb_new_block(b);
+
+	// Register label targets
+	if (rs->label != nullptr) {
+		for_array(i, b->branch_regions) {
+			if (b->branch_regions[i].cond == rs->label) {
+				b->branch_regions[i].false_block = done_block;
+				b->branch_regions[i].true_block  = loop_block;
+				break;
+			}
+		}
+	}
+
+	// Set up break/continue targets
+	fbTargetList tl = {};
+	tl.break_block    = done_block;
+	tl.continue_block = loop_block;
+	tl.prev           = b->target_list;
+	b->target_list    = &tl;
+
+	fb_emit_jump(b, loop_block);
+	fb_set_block(b, loop_block);
+
+	// Increment index
+	fbValue idx = fb_addr_load(b, index_addr);
+	fbValue one = fb_emit_iconst(b, t_int, 1);
+	fbValue incr = fb_emit_arith(b, FB_ADD, idx, one, t_int);
+	fb_addr_store(b, index_addr, incr);
+
+	// Check: index < capacity
+	fbValue cap_int = fb_emit_conv(b, capacity, t_int);
+	fbValue in_range = fb_emit_cmp(b, FB_CMP_SLT, incr, cap_int);
+	fb_emit_branch(b, in_range, hash_check, done_block);
+
+	// Hash check: load hash at index, check validity
+	fb_set_block(b, hash_check);
+	// hashes are uintptr, densely packed (no cell padding for uintptr)
+	fbValue hash_ptr = fb_emit_array_access(b, hs, incr, build_context.ptr_size);
+	fbValue hash = fb_emit_load(b, hash_ptr, t_uintptr);
+	fbValue valid = fb_map_hash_is_valid(b, hash);
+	fb_emit_branch(b, valid, body_block, loop_block);
+
+	// Body: load key and value, bind variables
+	fb_set_block(b, body_block);
+	fbValue key_ptr = fb_map_cell_index(b, key_type, ks, incr);
+	fbValue val_ptr = fb_map_cell_index(b, val_type, vs, incr);
+
+	// val0 = key, val1 = value (in Odin: for key, value in m)
+	if (val0 != nullptr && !is_blank_ident(val0)) {
+		Type *v0t = type_of_expr(val0);
+		Entity *e0 = entity_of_node(val0);
+		fbAddr k_addr = fb_add_local(b, v0t, e0, false);
+		fbType kft = fb_data_type(key_type);
+		if (kft.kind != FBT_VOID) {
+			fbValue k = fb_emit_load(b, key_ptr, key_type);
+			k = fb_emit_conv(b, k, v0t);
+			fb_emit_store(b, k_addr.base, k);
+		} else {
+			i64 ksz = type_size_of(key_type);
+			if (ksz > 0) {
+				fbValue sz = fb_emit_iconst(b, t_int, ksz);
+				fb_emit_memcpy(b, k_addr.base, key_ptr, sz, type_align_of(key_type));
+			}
+		}
+	}
+
+	if (val1 != nullptr && !is_blank_ident(val1)) {
+		Type *v1t = type_of_expr(val1);
+		Entity *e1 = entity_of_node(val1);
+		fbAddr v_addr = fb_add_local(b, v1t, e1, false);
+		fbType vft = fb_data_type(val_type);
+		if (vft.kind != FBT_VOID) {
+			fbValue v = fb_emit_load(b, val_ptr, val_type);
+			v = fb_emit_conv(b, v, v1t);
+			fb_emit_store(b, v_addr.base, v);
+		} else {
+			i64 vsz = type_size_of(val_type);
+			if (vsz > 0) {
+				fbValue sz = fb_emit_iconst(b, t_int, vsz);
+				fb_emit_memcpy(b, v_addr.base, val_ptr, sz, type_align_of(val_type));
+			}
+		}
+	}
+
+	// Execute body
+	fb_build_stmt(b, rs->body);
+
+	b->target_list = tl.prev;
+
+	if (!fb_block_is_terminated(b)) {
+		fb_emit_jump(b, loop_block);
+	}
+
+	fb_set_block(b, done_block);
+	fb_scope_close(b, fbDeferExit_Default, 0);
+}
+
+// String range: for rune, idx in string
+gb_internal void fb_build_range_string(fbBuilder *b, AstRangeStmt *rs, Scope *scope) {
+	// For byte strings, iterate byte-by-byte
+	fb_scope_open(b, scope);
+
+	Ast *expr = unparen_expr(rs->expr);
+	fbAddr base_addr = fb_build_addr(b, expr);
+	fbValue data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
+	fbValue length = fb_load_field(b, base_addr.base, build_context.ptr_size, t_int);
+
+	Ast *val0 = rs->vals.count > 0 ? fb_strip_and_prefix(rs->vals[0]) : nullptr;
+	Ast *val1 = rs->vals.count > 1 ? fb_strip_and_prefix(rs->vals[1]) : nullptr;
+
+	fbAddr index_addr = fb_add_local(b, t_int, nullptr, false);
+	fb_addr_store(b, index_addr, fb_emit_iconst(b, t_int, -1));
+
+	u32 loop_block = fb_new_block(b);
+	u32 body_block = fb_new_block(b);
+	u32 done_block = fb_new_block(b);
+
+	if (rs->label != nullptr) {
+		for_array(i, b->branch_regions) {
+			if (b->branch_regions[i].cond == rs->label) {
+				b->branch_regions[i].false_block = done_block;
+				b->branch_regions[i].true_block  = loop_block;
+				break;
+			}
+		}
+	}
+
+	fbTargetList tl = {};
+	tl.break_block    = done_block;
+	tl.continue_block = loop_block;
+	tl.prev           = b->target_list;
+	b->target_list    = &tl;
+
+	fb_emit_jump(b, loop_block);
+	fb_set_block(b, loop_block);
+
+	fbValue idx = fb_addr_load(b, index_addr);
+	fbValue one = fb_emit_iconst(b, t_int, 1);
+	fbValue incr = fb_emit_arith(b, FB_ADD, idx, one, t_int);
+	fb_addr_store(b, index_addr, incr);
+
+	fbValue in_range = fb_emit_cmp(b, FB_CMP_SLT, incr, length);
+	fb_emit_branch(b, in_range, body_block, done_block);
+
+	fb_set_block(b, body_block);
+
+	// val0 = byte value, val1 = index
+	if (val0 != nullptr && !is_blank_ident(val0)) {
+		Entity *e0 = entity_of_node(val0);
+		Type *v0t = type_of_expr(val0);
+		fbAddr ch_addr = fb_add_local(b, v0t, e0, false);
+		fbValue char_ptr = fb_emit_array_access(b, data_ptr, incr, 1);
+		fbValue ch = fb_emit_load(b, char_ptr, t_u8);
+		ch = fb_emit_conv(b, ch, v0t);
+		fb_emit_store(b, ch_addr.base, ch);
+	}
+	if (val1 != nullptr && !is_blank_ident(val1)) {
+		Entity *e1 = entity_of_node(val1);
+		Type *v1t = type_of_expr(val1);
+		fbAddr idx_var = fb_add_local(b, v1t, e1, false);
+		fbValue idx_conv = fb_emit_conv(b, incr, v1t);
+		fb_emit_store(b, idx_var.base, idx_conv);
+	}
+
+	fb_build_stmt(b, rs->body);
+
+	b->target_list = tl.prev;
+
+	if (!fb_block_is_terminated(b)) {
+		fb_emit_jump(b, loop_block);
+	}
+
+	fb_set_block(b, done_block);
+	fb_scope_close(b, fbDeferExit_Default, 0);
+}
+
 // Main range statement dispatch.
 gb_internal void fb_build_range_stmt(fbBuilder *b, Ast *node) {
 	ast_node(rs, RangeStmt, node);
@@ -4094,6 +5247,15 @@ gb_internal void fb_build_range_stmt(fbBuilder *b, Ast *node) {
 	case Type_DynamicArray:
 		fb_build_range_indexed(b, rs, rs->scope);
 		return;
+	case Type_Map:
+		fb_build_range_map(b, rs, rs->scope);
+		return;
+	case Type_Basic:
+		if (is_type_string(et)) {
+			fb_build_range_string(b, rs, rs->scope);
+			return;
+		}
+		break;
 	default:
 		break;
 	}
@@ -4950,7 +6112,7 @@ gb_internal void fb_procedure_begin(fbBuilder *b) {
 			fbAddr ctx_addr = {};
 			ctx_addr.kind = fbAddr_Default;
 			ctx_addr.base = ctx_ptr;
-			ctx_addr.type = t_rawptr; // Context pointer
+			ctx_addr.type = alloc_type_pointer(t_context); // rawptr→^Context for field access
 
 			fbContextData *cd = array_add_and_get(&b->context_stack);
 			cd->ctx = ctx_addr;
@@ -5048,6 +6210,49 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 		map_set(&fb_entity_proc_map, e, proc_idx);
 	}
 
+	// Force-compute type sizes for map-related types.
+	// Some runtime types may not have cached_size set yet, and trying to
+	// compute them during code generation can crash if the Type object is
+	// in read-only memory.
+	if (t_raw_map) type_size_of(t_raw_map);
+	if (t_map_info) type_size_of(t_map_info);
+	if (t_map_cell_info) type_size_of(t_map_cell_info);
+	if (t_allocator) type_size_of(t_allocator);
+	type_size_of(t_rawptr);
+	type_size_of(t_uintptr);
+
+	// Pre-register runtime procs needed by the fast backend that may have
+	// min_dep_count == 0 (not referenced by user code, only by backend-generated IR).
+	// These must be added before the build pass so their types are ready.
+	{
+		String runtime_procs[] = {
+			str_lit("__dynamic_map_get"),
+			str_lit("__dynamic_map_set"),
+			str_lit("__dynamic_map_reserve"),
+			str_lit("map_alloc_dynamic"),
+			str_lit("map_free_dynamic"),
+			str_lit("map_kvh_data_dynamic"),
+			str_lit("map_cell_index_dynamic"),
+			str_lit("map_insert_hash_dynamic"),
+			str_lit("map_reserve_dynamic"),
+			str_lit("default_hasher_string"),
+			str_lit("default_hasher_cstring"),
+			str_lit("default_hasher"),
+			str_lit("panic"),
+		};
+		Scope *rt_scope = info->runtime_package->scope;
+		for (isize i = 0; i < gb_count_of(runtime_procs); i++) {
+			Entity *e = scope_lookup_current(rt_scope, runtime_procs[i]);
+			if (e == nullptr || e->kind != Entity_Procedure) continue;
+			if (map_get(&fb_entity_proc_map, e) != nullptr) continue;
+
+			fbProc *p = fb_proc_create(m, e);
+			u32 proc_idx = cast(u32)m->procs.count;
+			array_add(&m->procs, p);
+			map_set(&fb_entity_proc_map, e, proc_idx);
+		}
+	}
+
 	// Generate __$startup_runtime and __$cleanup_runtime stubs.
 	// The runtime declares these as foreign (signatures only), but every backend
 	// must synthesize implementations. The bodies are just `ret` for now.
@@ -5143,6 +6348,7 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 
 		// Try to generate the procedure; on assertion failure, fall back to stub
 		fb_recovery_active = true;
+		fb_recovery_proc_name = (const char *)p->name.text;
 		if (sigsetjmp(fb_recovery_buf, 1) == 0) {
 			fb_procedure_generate(&b);
 			fb_recovery_active = false;
@@ -5150,6 +6356,7 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 			// Recovery: assertion fired during generation.
 			// Reset the proc to an empty stub.
 			stub_count++;
+			gb_printf_err("  STUB: %.*s (inst_count=%d)\n", LIT(p->name), p->inst_count);
 			p->inst_count = 0;
 			p->block_count = 0;
 			p->slot_count = 0;

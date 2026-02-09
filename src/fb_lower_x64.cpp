@@ -699,11 +699,14 @@ gb_internal void fb_x64_alu_rr(fbLowCtx *ctx, fbInst *inst, u8 opcode) {
 // ───────────────────────────────────────────────────────────────────────
 
 gb_internal void fb_x64_shift_cl(fbLowCtx *ctx, fbInst *inst, u8 ext) {
-	fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, 0);
-	fbX64Reg rb = fb_x64_resolve_gp(ctx, inst->b, (1u << ra));
-
-	// Move shift amount into RCX (handles spill, move, and tracking)
+	// Move shift amount into RCX FIRST, before resolving the shift value.
+	// If we resolved inst->a first and it landed in RCX, the move_value_to_reg
+	// would evict it, leaving ra pointing at a register now holding the shift
+	// amount instead of the shift value.
 	fb_x64_move_value_to_reg(ctx, inst->b, FB_RCX);
+
+	// Now resolve shift value, excluding RCX so it doesn't get clobbered
+	fbX64Reg ra = fb_x64_resolve_gp(ctx, inst->a, (1u << FB_RCX));
 
 	// Allocate dest, excluding both ra and RCX
 	fbX64Reg rd = fb_x64_alloc_gp(ctx, inst->r, cast(u16)((1u << ra) | (1u << FB_RCX)));

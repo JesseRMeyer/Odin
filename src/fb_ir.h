@@ -397,6 +397,10 @@ struct fbProc {
 	i32         split_returns_index;
 	i32         split_returns_count;
 
+	// Single MEMORY-class return: hidden output pointer parameter slot.
+	// The callee receives the caller's output buffer address. -1 if no sret.
+	i32         sret_slot_idx;
+
 	// XMM parameter ABI (non-Odin CC / foreign calls only).
 	// Maps incoming XMM register arguments to stack slots for SSE-classified params.
 	struct fbXmmParamLoc {
@@ -553,6 +557,12 @@ struct fbModule {
 	fbSymbol *type_info_offsets;
 	fbSymbol *type_info_usings;
 	fbSymbol *type_info_tags;
+
+	// Map support: cached Map_Cell_Info and Map_Info global indices per type.
+	PtrMap<Type *, u32>  map_cell_info_map;   // type → global_entries index
+	PtrMap<Type *, u32>  map_info_map;        // map type → global_entries index
+	PtrMap<Type *, u32>  map_hasher_procs;    // key type → procs index
+	PtrMap<Type *, u32>  map_equal_procs;     // key type → procs index
 };
 
 // ───────────────────────────────────────────────────────────────────────

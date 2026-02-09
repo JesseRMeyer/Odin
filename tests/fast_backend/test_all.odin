@@ -1,3 +1,4 @@
+#+feature dynamic-literals
 package test_all
 
 import "base:runtime"
@@ -27,6 +28,7 @@ import "base:runtime"
 //   1600-1649 string comparison
 //   1700-1730 procedure values and indirect calls
 //   1800-1849 RTTI (type_info_of, typeid_of, variant discrimination)
+//   1900-1969 maps (set, get, compound lit, len, range iteration)
 
 foreign import libc "system:c"
 foreign libc {
@@ -1738,6 +1740,8 @@ main :: proc() {
 	test_simd()
 	print_msg("  rtti...\n")
 	test_rtti()
+	print_msg("  maps...\n")
+	test_maps()
 	print_msg("ALL PASS\n")
 	exit(0)
 }
@@ -1848,4 +1852,129 @@ test_rtti :: proc() {
 	// Different types have different typeids
 	check(typeid_of(int) != typeid_of(f64), 1841)
 	check(typeid_of(int) != typeid_of(string), 1842)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Maps (1900-1969)
+// ═══════════════════════════════════════════════════════════════════════
+
+test_maps :: proc() {
+	// --- Basic int→int map: set and get ---
+	m: map[int]int
+	m[10] = 100
+	m[20] = 200
+	m[30] = 300
+
+	check(m[10] == 100, 1900)
+	check(m[20] == 200, 1901)
+	check(m[30] == 300, 1902)
+
+	// len
+	check(len(m) == 3, 1903)
+
+	// overwrite
+	m[10] = 999
+	check(m[10] == 999, 1904)
+	check(len(m) == 3, 1905)
+
+	// get with ok (key exists)
+	v1, ok1 := m[20]
+	check(ok1, 1906)
+	check(v1 == 200, 1907)
+
+	// get with ok (key missing)
+	v2, ok2 := m[99]
+	check(!ok2, 1908)
+	check(v2 == 0, 1909)
+
+	// --- string→int map ---
+	s: map[string]int
+	s["hello"] = 1
+	s["world"] = 2
+
+	check(s["hello"] == 1, 1910)
+	check(s["world"] == 2, 1911)
+	check(len(s) == 2, 1912)
+
+	sv, sok := s["missing"]
+	check(!sok, 1913)
+	check(sv == 0, 1914)
+
+	// --- Compound literal ---
+	cl := map[int]int{1 = 10, 2 = 20, 3 = 30, 4 = 40}
+	check(len(cl) == 4, 1920)
+	check(cl[1] == 10, 1921)
+	check(cl[2] == 20, 1922)
+	check(cl[3] == 30, 1923)
+	check(cl[4] == 40, 1924)
+
+	// --- Range iteration ---
+	sum_keys := 0
+	sum_vals := 0
+	for k, v in cl {
+		sum_keys += k
+		sum_vals += v
+	}
+	check(sum_keys == 1 + 2 + 3 + 4, 1930)
+	check(sum_vals == 10 + 20 + 30 + 40, 1931)
+
+	// Range with only keys
+	count := 0
+	for k in cl {
+		count += 1
+		// Every key should be in 1..4
+		check(k >= 1 && k <= 4, 1932)
+	}
+	check(count == 4, 1933)
+
+	// --- int→string map ---
+	is: map[int]string
+	is[1] = "one"
+	is[2] = "two"
+	check(is[1] == "one", 1940)
+	check(is[2] == "two", 1941)
+	check(len(is) == 2, 1942)
+
+	isv, isok := is[3]
+	check(!isok, 1943)
+	check(isv == "", 1944)
+
+	// --- string→string map ---
+	ss := map[string]string{"a" = "alpha", "b" = "beta"}
+	check(len(ss) == 2, 1950)
+	check(ss["a"] == "alpha", 1951)
+	check(ss["b"] == "beta", 1952)
+
+	ssv, ssok := ss["c"]
+	check(!ssok, 1953)
+	check(ssv == "", 1954)
+
+	// --- Aggregate value map (map[int][2]int) ---
+	// Regression test: aggregate values must route through fb_addr_store(Map),
+	// not bypass it via raw memcpy to the map struct pointer.
+	am: map[int][2]int
+	am[1] = {42, 77}
+	am[2] = {100, 200}
+	check(len(am) == 2, 1960)
+
+	av1 := am[1]
+	check(av1[0] == 42, 1961)
+	check(av1[1] == 77, 1962)
+
+	av2 := am[2]
+	check(av2[0] == 100, 1963)
+	check(av2[1] == 200, 1964)
+
+	// Overwrite aggregate value
+	am[1] = {99, 88}
+	av1b := am[1]
+	check(av1b[0] == 99, 1965)
+	check(av1b[1] == 88, 1966)
+	check(len(am) == 2, 1967)
+
+	// Missing key returns zero aggregate
+	av3, aok := am[99]
+	check(!aok, 1968)
+	check(av3[0] == 0, 1969)
+	check(av3[1] == 0, 1970)
 }
