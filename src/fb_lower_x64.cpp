@@ -3239,9 +3239,98 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				break;
 			}
 
-			case FB_VSHUFFLE:
-				GB_PANIC("fast backend: FB_VSHUFFLE not yet lowered");
+			case FB_VSHUFFLE: {
+				// VSHUFFLE: permute lanes of vector a using compile-time indices.
+				// imm = aux_base (low 32) | index_count (high 32)
+				// aux[aux_base..aux_base+count] = lane indices
+				fbType vt = fb_type_unpack(inst->type_raw);
+				u32 aux_base = cast(u32)(inst->imm & 0xFFFFFFFF);
+				u32 count = cast(u32)((inst->imm >> 32) & 0xFFFFFFFF);
+				u32 *indices = &p->aux[aux_base];
+
+				u32 elem_bytes;
+				switch (vt.kind) {
+				case FBT_I8:  elem_bytes = 1; break;
+				case FBT_I16: elem_bytes = 2; break;
+				case FBT_I32: case FBT_F32: elem_bytes = 4; break;
+				default: elem_bytes = 8; break;
+				}
+
+				// Special case: 4x i32/f32 — use PSHUFD with imm8
+				if ((vt.kind == FBT_I32 || vt.kind == FBT_F32) && count == 4) {
+					u8 shuf_imm = cast(u8)(
+						(indices[0] & 3) |
+						((indices[1] & 3) << 2) |
+						((indices[2] & 3) << 4) |
+						((indices[3] & 3) << 6));
+					fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+					fb_x64_pshufd(ctx, FB_XMM0, FB_XMM0, shuf_imm);
+					fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
+					break;
+				}
+
+				// General case: memory round-trip via spill slots.
+				// Copy source to result spill, then rearrange element-by-element.
+				i32 src_off = fb_x64_spill_offset(ctx, inst->a);
+				// Ensure result has a spill slot
+				fb_x64_simd_load_vreg(ctx, FB_XMM0, inst->a);
+				fb_x64_simd_store_vreg(ctx, FB_XMM0, inst->r);
+				i32 dst_off = fb_x64_spill_offset(ctx, inst->r);
+
+				// Use R11 as scratch to copy each element
+				for (u32 i = 0; i < count; i++) {
+					u32 src_idx = indices[i];
+					i32 s_off = src_off + cast(i32)(src_idx * elem_bytes);
+					i32 d_off = dst_off + cast(i32)(i * elem_bytes);
+
+					switch (elem_bytes) {
+					case 1:
+						// MOVZX r11d, byte [rbp+s_off]
+						fb_x64_rex(ctx, false, FB_R11, 0, FB_RBP);
+						fb_low_emit_byte(ctx, 0x0F);
+						fb_low_emit_byte(ctx, 0xB6);
+						fb_x64_modrm_rbp_disp32(ctx, FB_R11, s_off);
+						// MOV byte [rbp+d_off], r11b
+						fb_x64_rex(ctx, false, FB_R11, 0, FB_RBP);
+						fb_low_emit_byte(ctx, 0x88);
+						fb_x64_modrm_rbp_disp32(ctx, FB_R11, d_off);
+						break;
+					case 2:
+						// MOVZX r11d, word [rbp+s_off]
+						fb_x64_rex(ctx, false, FB_R11, 0, FB_RBP);
+						fb_low_emit_byte(ctx, 0x0F);
+						fb_low_emit_byte(ctx, 0xB7);
+						fb_x64_modrm_rbp_disp32(ctx, FB_R11, s_off);
+						// MOV word [rbp+d_off], r11w
+						fb_low_emit_byte(ctx, 0x66);
+						fb_x64_rex(ctx, false, FB_R11, 0, FB_RBP);
+						fb_low_emit_byte(ctx, 0x89);
+						fb_x64_modrm_rbp_disp32(ctx, FB_R11, d_off);
+						break;
+					case 4:
+						// MOV r11d, dword [rbp+s_off]
+						fb_x64_rex_if_needed(ctx, false, FB_R11, 0, FB_RBP);
+						fb_low_emit_byte(ctx, 0x8B);
+						fb_x64_modrm_rbp_disp32(ctx, FB_R11, s_off);
+						// MOV dword [rbp+d_off], r11d
+						fb_x64_rex_if_needed(ctx, false, FB_R11, 0, FB_RBP);
+						fb_low_emit_byte(ctx, 0x89);
+						fb_x64_modrm_rbp_disp32(ctx, FB_R11, d_off);
+						break;
+					default: // 8
+						// MOV r11, qword [rbp+s_off]
+						fb_x64_rex(ctx, true, FB_R11, 0, FB_RBP);
+						fb_low_emit_byte(ctx, 0x8B);
+						fb_x64_modrm_rbp_disp32(ctx, FB_R11, s_off);
+						// MOV qword [rbp+d_off], r11
+						fb_x64_rex(ctx, true, FB_R11, 0, FB_RBP);
+						fb_low_emit_byte(ctx, 0x89);
+						fb_x64_modrm_rbp_disp32(ctx, FB_R11, d_off);
+						break;
+					}
+				}
 				break;
+			}
 
 			// ── Inline assembly ──
 			case FB_ASM: {

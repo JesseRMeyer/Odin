@@ -474,6 +474,7 @@ gb_internal fbModule *fb_module_create(Checker *c) {
 	array_init(&m->rodata_entries, heap_allocator());
 	array_init(&m->global_entries, heap_allocator());
 	map_init(&m->global_entity_map);
+	array_init(&m->data_relocs, heap_allocator());
 	array_init(&m->source_files, heap_allocator());
 
 	// Register source files

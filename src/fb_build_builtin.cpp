@@ -979,8 +979,40 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 	// ── Type introspection ──────────────────────────────────────
 
 	case BuiltinProc_type_info_of: {
-		// Stub: return nil pointer until runtime type info tables are generated (Phase 9)
-		return fb_emit_iconst(b, t_rawptr, 0);
+		if (build_context.no_rtti) {
+			return fb_emit_iconst(b, t_rawptr, 0);
+		}
+		Ast *arg = ce->args[0];
+		Type *t = type_of_expr(arg);
+		t = default_type(t);
+		isize index = fb_type_info_index(b->module->info, t, false);
+		if (index < 0) {
+			return fb_emit_iconst(b, t_rawptr, 0);
+		}
+		// Load from the type_info pointer table: ti_ptrs[index]
+		// Find the __$fb_ti_ptrs global
+		// We use a SYMADDR + LOAD approach: emit address of ti_ptrs + index*8, load
+		// However, at IR build time we don't have the global symbol index.
+		// Instead, use a global variable lookup approach.
+		// The simplest approach: compute address of type_table.data[index]
+		// type_table is a runtime global whose data field points to ti_ptrs
+		Entity *tt_entity = scope_lookup_current(b->module->info->runtime_package->scope, str_lit("type_table"));
+		if (tt_entity == nullptr) {
+			return fb_emit_iconst(b, t_rawptr, 0);
+		}
+		u32 *gidx = map_get(&b->module->global_entity_map, tt_entity);
+		if (gidx == nullptr) {
+			return fb_emit_iconst(b, t_rawptr, 0);
+		}
+		// Load type_table.data (the pointer to the array of ^Type_Info)
+		fbValue tt_addr = fb_emit_symaddr(b, FB_GLOBAL_SYM_BASE + *gidx);
+		tt_addr.type = t_rawptr;
+		fbValue data_ptr = fb_emit_load(b, tt_addr, t_rawptr);
+		// Index into the pointer array
+		i64 ptr_size = build_context.ptr_size;
+		fbValue elem_ptr = fb_emit_array_access(b, data_ptr, fb_emit_iconst(b, t_int, index), ptr_size);
+		// Load the ^Type_Info pointer
+		return fb_emit_load(b, elem_ptr, t_rawptr);
 	}
 
 	case BuiltinProc_typeid_of: {
@@ -1265,6 +1297,164 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 		result.id = r;
 		result.type = t_uintptr;
 		return result;
+	}
+
+	// ── Complex/Quaternion component access ─────────────────────
+
+	case BuiltinProc_real: {
+		fbValue val = fb_build_expr(b, ce->args[0]);
+		Type *val_type = type_of_expr(ce->args[0]);
+		Type *ft = base_complex_elem_type(val_type);
+		i64 elem_size = type_size_of(ft);
+
+		// val is an aggregate pointer for complex/quaternion
+		fbValue ptr;
+		if (is_type_complex(val_type)) {
+			// Complex layout: {real, imag} — real at offset 0
+			ptr = val;
+		} else {
+			// @QuaternionLayout: {i, j, k, w} — real (w) at index 3
+			ptr = fb_emit_member(b, val, elem_size * 3);
+		}
+		fbValue result = fb_emit_load(b, ptr, ft);
+		return fb_emit_conv(b, result, type);
+	}
+
+	case BuiltinProc_imag: {
+		fbValue val = fb_build_expr(b, ce->args[0]);
+		Type *val_type = type_of_expr(ce->args[0]);
+		Type *ft = base_complex_elem_type(val_type);
+		i64 elem_size = type_size_of(ft);
+
+		fbValue ptr;
+		if (is_type_complex(val_type)) {
+			// Complex layout: {real, imag} — imag at offset elem_size
+			ptr = fb_emit_member(b, val, elem_size);
+		} else {
+			// @QuaternionLayout: {i, j, k, w} — imag (i) at index 0
+			ptr = val;
+		}
+		fbValue result = fb_emit_load(b, ptr, ft);
+		return fb_emit_conv(b, result, type);
+	}
+
+	case BuiltinProc_jmag: {
+		fbValue val = fb_build_expr(b, ce->args[0]);
+		Type *val_type = type_of_expr(ce->args[0]);
+		Type *ft = base_complex_elem_type(val_type);
+		i64 elem_size = type_size_of(ft);
+		// @QuaternionLayout: {i, j, k, w} — j at index 1
+		fbValue ptr = fb_emit_member(b, val, elem_size * 1);
+		fbValue result = fb_emit_load(b, ptr, ft);
+		return fb_emit_conv(b, result, type);
+	}
+
+	case BuiltinProc_kmag: {
+		fbValue val = fb_build_expr(b, ce->args[0]);
+		Type *val_type = type_of_expr(ce->args[0]);
+		Type *ft = base_complex_elem_type(val_type);
+		i64 elem_size = type_size_of(ft);
+		// @QuaternionLayout: {i, j, k, w} — k at index 2
+		fbValue ptr = fb_emit_member(b, val, elem_size * 2);
+		fbValue result = fb_emit_load(b, ptr, ft);
+		return fb_emit_conv(b, result, type);
+	}
+
+	case BuiltinProc_conj: {
+		fbValue val = fb_build_expr(b, ce->args[0]);
+		Type *val_type = type_of_expr(ce->args[0]);
+		Type *ft = base_complex_elem_type(val_type);
+		i64 elem_size = type_size_of(ft);
+
+		// Conjugate: negate the imaginary components
+		fbAddr result = fb_add_local(b, val_type, nullptr, false);
+		fb_emit_copy_value(b, result.base, val, val_type);
+
+		if (is_type_complex(val_type)) {
+			// Negate imag at offset elem_size
+			fbValue imag_ptr = fb_emit_member(b, result.base, elem_size);
+			fbValue imag = fb_emit_load(b, imag_ptr, ft);
+			fbValue neg = fb_emit_arith(b, FB_FNEG, imag, imag, ft);
+			fb_emit_store(b, imag_ptr, neg);
+		} else {
+			// @QuaternionLayout: negate i(0), j(1), k(2)
+			for (i64 i = 0; i < 3; i++) {
+				fbValue comp_ptr = fb_emit_member(b, result.base, elem_size * i);
+				fbValue comp = fb_emit_load(b, comp_ptr, ft);
+				fbValue neg = fb_emit_arith(b, FB_FNEG, comp, comp, ft);
+				fb_emit_store(b, comp_ptr, neg);
+			}
+		}
+
+		result.base.type = val_type;
+		return result.base;
+	}
+
+	case BuiltinProc_swizzle: {
+		isize index_count = ce->args.count - 1;
+
+		if (is_type_simd_vector(tv.type)) {
+			fbValue vec = fb_build_expr(b, ce->args[0]);
+			if (index_count == 0) {
+				return vec;
+			}
+			// Build mask from compile-time indices
+			u32 *mask = gb_alloc_array(permanent_allocator(), u32, index_count);
+			for (isize i = 0; i < index_count; i++) {
+				TypeAndValue itv = type_and_value_of_expr(ce->args[i + 1]);
+				GB_ASSERT(itv.value.kind == ExactValue_Integer);
+				mask[i] = cast(u32)big_int_to_i64(&itv.value.value_integer);
+			}
+			// Store mask in aux array
+			u32 aux_base = b->proc->aux_count;
+			for (isize i = 0; i < index_count; i++) {
+				fb_aux_push(b->proc, mask[i]);
+			}
+			fbType result_ft = fb_data_type(tv.type);
+			u32 r = fb_inst_emit(b->proc, FB_VSHUFFLE, result_ft,
+				vec.id, FB_NOREG, FB_NOREG,
+				0, cast(i64)aux_base | (cast(i64)index_count << 32));
+			return fb_make_value(r, tv.type);
+		}
+
+		// Array swizzle: build addr-based gather
+		fbAddr src_addr = fb_build_addr(b, ce->args[0]);
+		Type *src_type = base_type(type_of_expr(ce->args[0]));
+		GB_ASSERT(src_type->kind == Type_Array);
+		i64 count = src_type->Array.count;
+
+		if (count <= 4 && index_count <= 4) {
+			u8 indices[4] = {};
+			u8 idx_count = 0;
+			for (isize i = 0; i < index_count; i++) {
+				TypeAndValue itv = type_and_value_of_expr(ce->args[i + 1]);
+				GB_ASSERT(itv.value.kind == ExactValue_Integer);
+				indices[idx_count++] = cast(u8)big_int_to_i64(&itv.value.value_integer);
+			}
+			fbAddr addr = {};
+			addr.kind = fbAddr_Swizzle;
+			addr.base = src_addr.base;
+			addr.type = tv.type;
+			addr.swizzle.count = idx_count;
+			addr.swizzle.indices[0] = indices[0];
+			addr.swizzle.indices[1] = indices[1];
+			addr.swizzle.indices[2] = indices[2];
+			addr.swizzle.indices[3] = indices[3];
+			return fb_addr_load(b, addr);
+		}
+
+		auto indices = slice_make<i32>(permanent_allocator(), index_count);
+		for (isize i = 0; i < index_count; i++) {
+			TypeAndValue itv = type_and_value_of_expr(ce->args[i + 1]);
+			GB_ASSERT(itv.value.kind == ExactValue_Integer);
+			indices[i] = cast(i32)big_int_to_i64(&itv.value.value_integer);
+		}
+		fbAddr addr = {};
+		addr.kind = fbAddr_SwizzleLarge;
+		addr.base = src_addr.base;
+		addr.type = tv.type;
+		addr.swizzle_large.indices = indices;
+		return fb_addr_load(b, addr);
 	}
 
 	default:

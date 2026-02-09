@@ -1,5 +1,7 @@
 package test_all
 
+import "base:runtime"
+
 // Unified fast backend test suite.
 // Single file, single build, single run.
 // Exit code indicates which check failed (0 = all pass).
@@ -24,6 +26,7 @@ package test_all
 //   1500-1541 any type switch
 //   1600-1649 string comparison
 //   1700-1730 procedure values and indirect calls
+//   1800-1849 RTTI (type_info_of, typeid_of, variant discrimination)
 
 foreign import libc "system:c"
 foreign libc {
@@ -1733,6 +1736,116 @@ main :: proc() {
 	test_proc_values()
 	print_msg("  simd...\n")
 	test_simd()
+	print_msg("  rtti...\n")
+	test_rtti()
 	print_msg("ALL PASS\n")
 	exit(0)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// RTTI (1800-1849)
+// ═══════════════════════════════════════════════════════════════════════
+
+RTTI_Struct :: struct { x: int, y: f64, z: bool }
+RTTI_Enum :: enum { A, B, C }
+RTTI_Union :: union { int, f64, string }
+
+test_rtti :: proc() {
+	// Basic type info
+	ti_int := type_info_of(int)
+	check(ti_int != nil, 1800)
+	check(ti_int.size == 8, 1801)
+	check(ti_int.align == 8, 1802)
+	check(ti_int.id == typeid_of(int), 1803)
+
+	// Integer variant
+	_, is_int := ti_int.variant.(runtime.Type_Info_Integer)
+	check(is_int, 1804)
+
+	// Float variant
+	ti_f := type_info_of(f64)
+	check(ti_f != nil, 1805)
+	_, is_flt := ti_f.variant.(runtime.Type_Info_Float)
+	check(is_flt, 1806)
+
+	// Boolean variant
+	ti_b := type_info_of(bool)
+	check(ti_b != nil, 1807)
+	_, is_bool := ti_b.variant.(runtime.Type_Info_Boolean)
+	check(is_bool, 1808)
+
+	// String variant
+	ti_s := type_info_of(string)
+	check(ti_s != nil, 1809)
+	_, is_str := ti_s.variant.(runtime.Type_Info_String)
+	check(is_str, 1810)
+
+	// Pointer variant with elem
+	ti_p := type_info_of(^int)
+	check(ti_p != nil, 1811)
+	pv, is_ptr := ti_p.variant.(runtime.Type_Info_Pointer)
+	check(is_ptr, 1812)
+	check(is_ptr && pv.elem != nil && pv.elem.size == 8, 1813)
+
+	// Slice variant with elem
+	ti_sl := type_info_of([]int)
+	check(ti_sl != nil, 1814)
+	slv, is_sl := ti_sl.variant.(runtime.Type_Info_Slice)
+	check(is_sl, 1815)
+	check(is_sl && slv.elem != nil && slv.elem.size == 8, 1816)
+
+	// Array variant
+	ti_arr := type_info_of([4]int)
+	check(ti_arr != nil, 1817)
+	arrv, is_arr := ti_arr.variant.(runtime.Type_Info_Array)
+	check(is_arr, 1818)
+	check(is_arr && arrv.count == 4 && arrv.elem_size == 8, 1819)
+
+	// Named struct → follow base → Struct
+	ti_foo := type_info_of(RTTI_Struct)
+	check(ti_foo != nil, 1820)
+	nv_foo, is_named_foo := ti_foo.variant.(runtime.Type_Info_Named)
+	check(is_named_foo, 1821)
+	check(is_named_foo && nv_foo.name == "RTTI_Struct", 1822)
+	check(is_named_foo && nv_foo.base != nil, 1823)
+	if is_named_foo && nv_foo.base != nil {
+		sv, is_st := nv_foo.base.variant.(runtime.Type_Info_Struct)
+		check(is_st, 1824)
+		check(is_st && sv.field_count == 3, 1825)
+	}
+
+	// Named enum → follow base → Enum
+	ti_bar := type_info_of(RTTI_Enum)
+	check(ti_bar != nil, 1826)
+	nv_bar, is_named_bar := ti_bar.variant.(runtime.Type_Info_Named)
+	check(is_named_bar, 1827)
+	check(is_named_bar && nv_bar.name == "RTTI_Enum", 1828)
+	check(is_named_bar && nv_bar.base != nil, 1829)
+	if is_named_bar && nv_bar.base != nil {
+		ev, is_en := nv_bar.base.variant.(runtime.Type_Info_Enum)
+		check(is_en, 1830)
+		check(is_en && len(ev.values) == 3, 1831)
+	}
+
+	// Named union → follow base → Union
+	ti_u := type_info_of(RTTI_Union)
+	check(ti_u != nil, 1832)
+	nv_u, is_named_u := ti_u.variant.(runtime.Type_Info_Named)
+	check(is_named_u, 1833)
+	check(is_named_u && nv_u.name == "RTTI_Union", 1834)
+	check(is_named_u && nv_u.base != nil, 1835)
+	if is_named_u && nv_u.base != nil {
+		uv, is_un := nv_u.base.variant.(runtime.Type_Info_Union)
+		check(is_un, 1836)
+		check(is_un && len(uv.variants) == 3, 1837)
+	}
+
+	// typeid_of produces non-zero values
+	check(typeid_of(int) != nil, 1838)
+	check(typeid_of(f64) != nil, 1839)
+	check(typeid_of(string) != nil, 1840)
+
+	// Different types have different typeids
+	check(typeid_of(int) != typeid_of(f64), 1841)
+	check(typeid_of(int) != typeid_of(string), 1842)
 }

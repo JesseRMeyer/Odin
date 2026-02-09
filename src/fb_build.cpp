@@ -27,6 +27,10 @@ gb_internal void    fb_build_stmt(fbBuilder *b, Ast *node);
 gb_internal fbAddr  fb_build_compound_lit(fbBuilder *b, Ast *expr);
 gb_internal void    fb_emit_defer_stmts(fbBuilder *b, fbDeferExitKind kind, i32 target_scope_index);
 
+// Forward declaration for type info (defined in fb_type_info.cpp)
+gb_internal void    fb_generate_type_info(fbModule *m);
+gb_internal isize   fb_type_info_index(CheckerInfo *info, Type *type, bool err_on_not_found = true);
+
 // ───────────────────────────────────────────────────────────────────────
 // Parameter setup: classify params via ABI, create stack slots, record param_locs
 // ───────────────────────────────────────────────────────────────────────
@@ -548,11 +552,53 @@ gb_internal fbValue fb_const_value(fbBuilder *b, Type *type, ExactValue value) {
 		return fb_addr_load(b, addr);
 	}
 
-	case ExactValue_Complex:
-	case ExactValue_Quaternion:
-	case ExactValue_Typeid:
-		GB_PANIC("fb_const_value: unhandled ExactValue kind %d", value.kind);
-		return fb_value_nil();
+	case ExactValue_Complex: {
+		type = default_type(type);
+		Type *ft = base_complex_elem_type(type);
+		i64 elem_size = type_size_of(ft);
+
+		fbAddr s = fb_add_local(b, type, nullptr, true);
+
+		f64 real_val = value.value_complex->real;
+		f64 imag_val = value.value_complex->imag;
+
+		// Complex layout: {real, imag}
+		fbValue real = fb_emit_fconst(b, ft, real_val);
+		fb_emit_store(b, s.base, real);
+		fbValue imag = fb_emit_fconst(b, ft, imag_val);
+		fbValue imag_ptr = fb_emit_member(b, s.base, elem_size);
+		fb_emit_store(b, imag_ptr, imag);
+
+		s.base.type = type;
+		return s.base;
+	}
+
+	case ExactValue_Quaternion: {
+		type = default_type(type);
+		Type *ft = base_complex_elem_type(type);
+		i64 elem_size = type_size_of(ft);
+
+		fbAddr s = fb_add_local(b, type, nullptr, true);
+
+		// @QuaternionLayout: memory order = {imag_i, imag_j, imag_k, real_w}
+		f64 imag_i = value.value_quaternion->imag;
+		f64 imag_j = value.value_quaternion->jmag;
+		f64 imag_k = value.value_quaternion->kmag;
+		f64 real_w = value.value_quaternion->real;
+
+		fb_emit_store(b, s.base, fb_emit_fconst(b, ft, imag_i));
+		fb_emit_store(b, fb_emit_member(b, s.base, elem_size * 1), fb_emit_fconst(b, ft, imag_j));
+		fb_emit_store(b, fb_emit_member(b, s.base, elem_size * 2), fb_emit_fconst(b, ft, imag_k));
+		fb_emit_store(b, fb_emit_member(b, s.base, elem_size * 3), fb_emit_fconst(b, ft, real_w));
+
+		s.base.type = type;
+		return s.base;
+	}
+
+	case ExactValue_Typeid: {
+		u64 id = type_hash_canonical_type(value.value_typeid);
+		return fb_emit_iconst(b, type, cast(i64)id);
+	}
 	default:
 		GB_PANIC("fb_const_value: unknown ExactValue kind %d", value.kind);
 		return fb_value_nil();
@@ -689,6 +735,34 @@ gb_internal fbValue fb_addr_load(fbBuilder *b, fbAddr addr) {
 		return ret;
 	}
 
+	if (addr.kind == fbAddr_SwizzleLarge) {
+		Type *result_type = addr.type;
+		Type *array_type = base_type(result_type);
+		GB_ASSERT(array_type->kind == Type_Array);
+		Type *elem_type = array_type->Array.elem;
+		i64 stride = type_size_of(elem_type);
+
+		fbAddr res = fb_add_local(b, result_type, nullptr, false);
+		for_array(i, addr.swizzle_large.indices) {
+			i32 src_idx = addr.swizzle_large.indices[i];
+			fbValue src_ptr = addr.base;
+			if (src_idx > 0) src_ptr = fb_emit_member(b, addr.base, cast(i64)src_idx * stride);
+			fbValue val = fb_emit_load(b, src_ptr, elem_type);
+
+			fbValue dst_ptr = res.base;
+			if (i > 0) dst_ptr = fb_emit_member(b, res.base, cast(i64)i * stride);
+			fb_emit_store(b, dst_ptr, val);
+		}
+
+		fbType ft = fb_data_type(result_type);
+		if (ft.kind != FBT_VOID) {
+			return fb_emit_load(b, res.base, result_type);
+		}
+		fbValue ret = res.base;
+		ret.type = result_type;
+		return ret;
+	}
+
 	GB_PANIC("TODO fb_addr_load kind=%d", addr.kind);
 	return fb_value_nil();
 }
@@ -753,6 +827,26 @@ gb_internal void fb_addr_store(fbBuilder *b, fbAddr addr, fbValue val) {
 		// val is either a scalar (if swizzle produces a scalar) or an aggregate pointer
 		for (u8 i = 0; i < addr.swizzle.count; i++) {
 			u8 dst_idx = addr.swizzle.indices[i];
+			fbValue src_ptr = val;
+			if (i > 0) src_ptr = fb_emit_member(b, val, cast(i64)i * stride);
+			fbValue elem_val = fb_emit_load(b, src_ptr, elem_type);
+
+			fbValue dst_ptr = addr.base;
+			if (dst_idx > 0) dst_ptr = fb_emit_member(b, addr.base, cast(i64)dst_idx * stride);
+			fb_emit_store(b, dst_ptr, elem_val);
+		}
+		return;
+	}
+
+	if (addr.kind == fbAddr_SwizzleLarge) {
+		Type *result_type = addr.type;
+		Type *array_type = base_type(result_type);
+		GB_ASSERT(array_type->kind == Type_Array);
+		Type *elem_type = array_type->Array.elem;
+		i64 stride = type_size_of(elem_type);
+
+		for_array(i, addr.swizzle_large.indices) {
+			i32 dst_idx = addr.swizzle_large.indices[i];
 			fbValue src_ptr = val;
 			if (i > 0) src_ptr = fb_emit_member(b, val, cast(i64)i * stride);
 			fbValue elem_val = fb_emit_load(b, src_ptr, elem_type);
@@ -1167,6 +1261,54 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 	}
 
 	case Ast_CallExpr: {
+		ast_node(ce, CallExpr, expr);
+		TypeAndValue proc_tv = type_and_value_of_expr(ce->proc);
+
+		if (proc_tv.mode == Addressing_Builtin) {
+			Ast *proc_expr = unparen_expr(ce->proc);
+			Entity *e = entity_of_node(proc_expr);
+			if (e != nullptr && cast(BuiltinProcId)e->Builtin.id == BuiltinProc_swizzle) {
+				TypeAndValue tv = expr->tav;
+				if (is_type_array(tv.type)) {
+					isize index_count = ce->args.count - 1;
+					fbAddr src_addr = fb_build_addr(b, ce->args[0]);
+					Type *src_type = base_type(type_of_expr(ce->args[0]));
+					i64 count = src_type->Array.count;
+
+					if (count <= 4 && index_count <= 4) {
+						u8 indices[4] = {};
+						u8 idx_count = 0;
+						for (isize i = 0; i < index_count; i++) {
+							TypeAndValue itv = type_and_value_of_expr(ce->args[i + 1]);
+							indices[idx_count++] = cast(u8)big_int_to_i64(&itv.value.value_integer);
+						}
+						fbAddr addr = {};
+						addr.kind = fbAddr_Swizzle;
+						addr.base = src_addr.base;
+						addr.type = tv.type;
+						addr.swizzle.count = idx_count;
+						addr.swizzle.indices[0] = indices[0];
+						addr.swizzle.indices[1] = indices[1];
+						addr.swizzle.indices[2] = indices[2];
+						addr.swizzle.indices[3] = indices[3];
+						return addr;
+					}
+
+					auto indices = slice_make<i32>(permanent_allocator(), index_count);
+					for (isize i = 0; i < index_count; i++) {
+						TypeAndValue itv = type_and_value_of_expr(ce->args[i + 1]);
+						indices[i] = cast(i32)big_int_to_i64(&itv.value.value_integer);
+					}
+					fbAddr addr = {};
+					addr.kind = fbAddr_SwizzleLarge;
+					addr.base = src_addr.base;
+					addr.type = tv.type;
+					addr.swizzle_large.indices = indices;
+					return addr;
+				}
+			}
+		}
+
 		// Call result needs to be addressable (e.g., for slicing).
 		// Build the call, store to a temp local, return the local's addr.
 		fbValue val = fb_build_expr(b, expr);
@@ -1703,11 +1845,168 @@ gb_internal fbAddr fb_build_compound_lit(fbBuilder *b, Ast *expr) {
 // Step 4: Expression builder
 // ───────────────────────────────────────────────────────────────────────
 
+gb_internal fbValue fb_emit_complex_arith(fbBuilder *b, TokenKind op, fbValue lhs, fbValue rhs, Type *type) {
+	Type *ft = base_complex_elem_type(type);
+	i64 es = type_size_of(ft);
+
+	// Extract components: complex = {real, imag}
+	fbValue a = fb_emit_load(b, lhs, ft);                            // lhs.real
+	fbValue c = fb_emit_load(b, rhs, ft);                            // rhs.real
+	fbValue a_imag = fb_emit_load(b, fb_emit_member(b, lhs, es), ft); // lhs.imag
+	fbValue c_imag = fb_emit_load(b, fb_emit_member(b, rhs, es), ft); // rhs.imag
+
+	fbAddr result = fb_add_local(b, type, nullptr, true);
+	fbValue real, imag;
+
+	switch (op) {
+	case Token_Add:
+		real = fb_emit_arith(b, FB_FADD, a, c, ft);
+		imag = fb_emit_arith(b, FB_FADD, a_imag, c_imag, ft);
+		break;
+	case Token_Sub:
+		real = fb_emit_arith(b, FB_FSUB, a, c, ft);
+		imag = fb_emit_arith(b, FB_FSUB, a_imag, c_imag, ft);
+		break;
+	case Token_Mul: {
+		// (a+bi)(c+di) = (ac-bd) + (ad+bc)i
+		fbValue ac = fb_emit_arith(b, FB_FMUL, a, c, ft);
+		fbValue bd = fb_emit_arith(b, FB_FMUL, a_imag, c_imag, ft);
+		real = fb_emit_arith(b, FB_FSUB, ac, bd, ft);
+		fbValue ad = fb_emit_arith(b, FB_FMUL, a, c_imag, ft);
+		fbValue bc = fb_emit_arith(b, FB_FMUL, a_imag, c, ft);
+		imag = fb_emit_arith(b, FB_FADD, ad, bc, ft);
+		break;
+	}
+	case Token_Quo: {
+		// (a+bi)/(c+di) = ((ac+bd) + (bc-ad)i) / (c²+d²)
+		fbValue cc = fb_emit_arith(b, FB_FMUL, c, c, ft);
+		fbValue dd = fb_emit_arith(b, FB_FMUL, c_imag, c_imag, ft);
+		fbValue denom = fb_emit_arith(b, FB_FADD, cc, dd, ft);
+		fbValue ac = fb_emit_arith(b, FB_FMUL, a, c, ft);
+		fbValue bd = fb_emit_arith(b, FB_FMUL, a_imag, c_imag, ft);
+		fbValue num_r = fb_emit_arith(b, FB_FADD, ac, bd, ft);
+		real = fb_emit_arith(b, FB_FDIV, num_r, denom, ft);
+		fbValue bc = fb_emit_arith(b, FB_FMUL, a_imag, c, ft);
+		fbValue ad = fb_emit_arith(b, FB_FMUL, a, c_imag, ft);
+		fbValue num_i = fb_emit_arith(b, FB_FSUB, bc, ad, ft);
+		imag = fb_emit_arith(b, FB_FDIV, num_i, denom, ft);
+		break;
+	}
+	default: GB_PANIC("invalid complex op"); real = imag = fb_value_nil(); break;
+	}
+
+	fb_emit_store(b, result.base, real);
+	fb_emit_store(b, fb_emit_member(b, result.base, es), imag);
+	result.base.type = type;
+	return result.base;
+}
+
+gb_internal fbValue fb_emit_quaternion_arith(fbBuilder *b, TokenKind op, fbValue lhs, fbValue rhs, Type *type) {
+	Type *ft = base_complex_elem_type(type);
+	i64 es = type_size_of(ft);
+
+	// @QuaternionLayout: {i, j, k, w} at indices {0, 1, 2, 3}
+	fbValue li = fb_emit_load(b, lhs, ft);
+	fbValue lj = fb_emit_load(b, fb_emit_member(b, lhs, es * 1), ft);
+	fbValue lk = fb_emit_load(b, fb_emit_member(b, lhs, es * 2), ft);
+	fbValue lw = fb_emit_load(b, fb_emit_member(b, lhs, es * 3), ft);
+
+	fbValue ri = fb_emit_load(b, rhs, ft);
+	fbValue rj = fb_emit_load(b, fb_emit_member(b, rhs, es * 1), ft);
+	fbValue rk = fb_emit_load(b, fb_emit_member(b, rhs, es * 2), ft);
+	fbValue rw = fb_emit_load(b, fb_emit_member(b, rhs, es * 3), ft);
+
+	fbAddr result = fb_add_local(b, type, nullptr, true);
+	fbValue oi, oj, ok, ow;
+
+	switch (op) {
+	case Token_Add:
+		oi = fb_emit_arith(b, FB_FADD, li, ri, ft);
+		oj = fb_emit_arith(b, FB_FADD, lj, rj, ft);
+		ok = fb_emit_arith(b, FB_FADD, lk, rk, ft);
+		ow = fb_emit_arith(b, FB_FADD, lw, rw, ft);
+		break;
+	case Token_Sub:
+		oi = fb_emit_arith(b, FB_FSUB, li, ri, ft);
+		oj = fb_emit_arith(b, FB_FSUB, lj, rj, ft);
+		ok = fb_emit_arith(b, FB_FSUB, lk, rk, ft);
+		ow = fb_emit_arith(b, FB_FSUB, lw, rw, ft);
+		break;
+	case Token_Mul: {
+		// Hamilton product:
+		// w = lw*rw - li*ri - lj*rj - lk*rk
+		// i = lw*ri + li*rw + lj*rk - lk*rj
+		// j = lw*rj - li*rk + lj*rw + lk*ri
+		// k = lw*rk + li*rj - lj*ri + lk*rw
+		fbValue t0, t1, t2, t3;
+
+		t0 = fb_emit_arith(b, FB_FMUL, lw, rw, ft);
+		t1 = fb_emit_arith(b, FB_FMUL, li, ri, ft);
+		t0 = fb_emit_arith(b, FB_FSUB, t0, t1, ft);
+		t1 = fb_emit_arith(b, FB_FMUL, lj, rj, ft);
+		t0 = fb_emit_arith(b, FB_FSUB, t0, t1, ft);
+		t1 = fb_emit_arith(b, FB_FMUL, lk, rk, ft);
+		ow = fb_emit_arith(b, FB_FSUB, t0, t1, ft);
+
+		t0 = fb_emit_arith(b, FB_FMUL, lw, ri, ft);
+		t1 = fb_emit_arith(b, FB_FMUL, li, rw, ft);
+		t0 = fb_emit_arith(b, FB_FADD, t0, t1, ft);
+		t1 = fb_emit_arith(b, FB_FMUL, lj, rk, ft);
+		t0 = fb_emit_arith(b, FB_FADD, t0, t1, ft);
+		t1 = fb_emit_arith(b, FB_FMUL, lk, rj, ft);
+		oi = fb_emit_arith(b, FB_FSUB, t0, t1, ft);
+
+		t0 = fb_emit_arith(b, FB_FMUL, lw, rj, ft);
+		t1 = fb_emit_arith(b, FB_FMUL, li, rk, ft);
+		t0 = fb_emit_arith(b, FB_FSUB, t0, t1, ft);
+		t1 = fb_emit_arith(b, FB_FMUL, lj, rw, ft);
+		t0 = fb_emit_arith(b, FB_FADD, t0, t1, ft);
+		t1 = fb_emit_arith(b, FB_FMUL, lk, ri, ft);
+		oj = fb_emit_arith(b, FB_FADD, t0, t1, ft);
+
+		t0 = fb_emit_arith(b, FB_FMUL, lw, rk, ft);
+		t1 = fb_emit_arith(b, FB_FMUL, li, rj, ft);
+		t0 = fb_emit_arith(b, FB_FADD, t0, t1, ft);
+		t1 = fb_emit_arith(b, FB_FMUL, lj, ri, ft);
+		t0 = fb_emit_arith(b, FB_FSUB, t0, t1, ft);
+		t1 = fb_emit_arith(b, FB_FMUL, lk, rw, ft);
+		ok = fb_emit_arith(b, FB_FADD, t0, t1, ft);
+		break;
+	}
+	default: GB_PANIC("invalid quaternion op"); oi = oj = ok = ow = fb_value_nil(); break;
+	}
+
+	fb_emit_store(b, result.base, oi);
+	fb_emit_store(b, fb_emit_member(b, result.base, es * 1), oj);
+	fb_emit_store(b, fb_emit_member(b, result.base, es * 2), ok);
+	fb_emit_store(b, fb_emit_member(b, result.base, es * 3), ow);
+	result.base.type = type;
+	return result.base;
+}
+
 gb_internal fbValue fb_build_binary_expr(fbBuilder *b, Ast *expr) {
 	ast_node(be, BinaryExpr, expr);
 
 	TypeAndValue tv = type_and_value_of_expr(expr);
 	Type *type = default_type(tv.type);
+
+	// Complex/quaternion arithmetic (aggregate types with special semantics)
+	if (is_type_complex(type)) {
+		if (be->op.kind == Token_Add || be->op.kind == Token_Sub ||
+		    be->op.kind == Token_Mul || be->op.kind == Token_Quo) {
+			fbValue left  = fb_build_expr(b, be->left);
+			fbValue right = fb_build_expr(b, be->right);
+			return fb_emit_complex_arith(b, be->op.kind, left, right, type);
+		}
+	}
+	if (is_type_quaternion(type)) {
+		if (be->op.kind == Token_Add || be->op.kind == Token_Sub ||
+		    be->op.kind == Token_Mul) {
+			fbValue left  = fb_build_expr(b, be->left);
+			fbValue right = fb_build_expr(b, be->right);
+			return fb_emit_quaternion_arith(b, be->op.kind, left, right, type);
+		}
+	}
 
 	switch (be->op.kind) {
 	case Token_Add:
@@ -4797,6 +5096,9 @@ gb_internal void fb_generate_procedures(fbModule *m) {
 	// entity references to globals can be resolved during expr building.
 	fb_generate_globals(m);
 
+	// Generate Runtime Type Info (RTTI) tables.
+	fb_generate_type_info(m);
+
 	// Install signal handlers for graceful fallback on unsupported features.
 	// SIGILL: from __builtin_trap() in GB_PANIC/GB_ASSERT
 	// SIGSEGV: from null deref after partial IR generation
@@ -4968,10 +5270,48 @@ gb_internal void fb_generate_globals(fbModule *m) {
 			    tav.value.kind != ExactValue_Invalid &&
 			    !is_type_any(e->type)) {
 				entry.init_data = fb_serialize_const_value(tav.value, size);
+
+				// String/cstring globals: fb_serialize_const_value returns nullptr for
+				// ExactValue_String. Serialize manually with a data relocation
+				// for the string data pointer.
+				if (entry.init_data == nullptr && tav.value.kind == ExactValue_String) {
+					String str = tav.value.value_string;
+					i64 ptr_size = m->target.ptr_size;
+					u32 gidx = cast(u32)m->global_entries.count;
+
+					entry.init_data = gb_alloc_array(heap_allocator(), u8, size);
+					gb_zero_size(entry.init_data, size);
+
+					if (is_type_cstring(e->type)) {
+						// cstring: just a pointer (8 bytes)
+						if (str.len > 0) {
+							u32 rodata_sym = fb_module_intern_string_data(m, str);
+							fbDataReloc dr = {};
+							dr.global_idx   = gidx;
+							dr.local_offset = 0;
+							dr.target_sym   = rodata_sym;
+							dr.addend       = 0;
+							array_add(&m->data_relocs, dr);
+						}
+					} else {
+						// Odin string: {data: rawptr, len: int}
+						// Write len at offset ptr_size
+						i64 slen = str.len;
+						gb_memmove(entry.init_data + ptr_size, &slen, ptr_size);
+
+						// Data pointer at offset 0 needs a relocation to rodata
+						if (str.len > 0) {
+							u32 rodata_sym = fb_module_intern_string_data(m, str);
+							fbDataReloc dr = {};
+							dr.global_idx   = gidx;
+							dr.local_offset = 0;
+							dr.target_sym   = rodata_sym;
+							dr.addend       = 0;
+							array_add(&m->data_relocs, dr);
+						}
+					}
+				}
 			}
-			// TODO: when init_data is NULL here, the global has a non-trivial initializer
-			// (e.g. string, compound literal) that fb_serialize_const_value cannot handle.
-			// It will stay zero until __$startup_runtime runs proper init code.
 		}
 
 		u32 global_idx = cast(u32)m->global_entries.count;

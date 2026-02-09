@@ -280,6 +280,7 @@ gb_internal fbType fb_type_unpack(u16 raw) {
 // ───────────────────────────────────────────────────────────────────────
 
 enum fbRelocType : u32 {
+	FB_RELOC_ABS64 = 1,   // R_X86_64_64 (absolute 64-bit address)
 	FB_RELOC_PC32  = 2,   // R_X86_64_PC32
 	FB_RELOC_PLT32 = 4,   // R_X86_64_PLT32
 };
@@ -289,6 +290,15 @@ struct fbReloc {
 	u32         target_sym;    // abstract symbol index (proc, FB_RODATA_SYM_BASE+idx, or FB_GLOBAL_SYM_BASE+idx)
 	i64         addend;        // typically -4
 	fbRelocType reloc_type;
+};
+
+// Data relocation: a pointer fixup within a global variable's init_data.
+// During ELF emission, the actual .data offset = global_data_offsets[global_idx] + local_offset.
+struct fbDataReloc {
+	u32 global_idx;    // index into global_entries
+	u32 local_offset;  // byte offset within that global's init_data
+	u32 target_sym;    // abstract symbol index (same scheme as text relocs)
+	i64 addend;
 };
 
 // ───────────────────────────────────────────────────────────────────────
@@ -525,6 +535,9 @@ struct fbModule {
 	// Abstract symbol index for global entry i = FB_GLOBAL_SYM_BASE + i.
 	Array<fbGlobalEntry>      global_entries;
 	PtrMap<Entity *, u32>     global_entity_map;  // Entity* → global_entries index
+
+	// Data relocations: pointer fixups within .data section global init_data.
+	Array<fbDataReloc>        data_relocs;
 
 	Array<fbSourceFile>        source_files;
 	PtrMap<uintptr, u32>       file_id_to_idx;

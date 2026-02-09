@@ -68,6 +68,7 @@ enum : Elf64_Half {
 
 // Relocation type constants
 enum : Elf64_Word {
+	R_X86_64_64    = 1,
 	R_X86_64_PC32  = 2,
 	R_X86_64_PLT32 = 4,
 };
@@ -206,7 +207,8 @@ enum {
 	FB_ELF_SEC_STRTAB   = 6,
 	FB_ELF_SEC_SHSTRTAB = 7,
 	FB_ELF_SEC_RELATEXT = 8,
-	FB_ELF_SEC_COUNT    = 9,
+	FB_ELF_SEC_RELADATA = 9,
+	FB_ELF_SEC_COUNT    = 10,
 };
 
 gb_internal void fb_file_write_padding(gbFile *f, u64 current, u64 target) {
@@ -458,6 +460,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	u32 shname_strtab    = fb_buf_append_str(&shstrtab, ".strtab");
 	u32 shname_shstrtab  = fb_buf_append_str(&shstrtab, ".shstrtab");
 	u32 shname_relatext  = fb_buf_append_str(&shstrtab, ".rela.text");
+	u32 shname_reladata  = fb_buf_append_str(&shstrtab, ".rela.data");
 
 	// 5. Calculate layout offsets
 	u64 ehdr_size = sizeof(Elf64_Ehdr);
@@ -533,7 +536,43 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		if (relatext_offset % 8 != 0) relatext_offset += 8 - (relatext_offset % 8);
 	}
 
-	u64 shdr_offset = relatext_offset + relatext_size;
+	// 6b. Build .rela.data (absolute address relocations within .data section)
+	fbBuf reladata_buf = {};
+	fb_buf_init(&reladata_buf, 64);
+	for_array(di, m->data_relocs) {
+		fbDataReloc *dr = &m->data_relocs[di];
+		GB_ASSERT(dr->global_idx < global_count);
+		if (global_is_bss && global_is_bss[dr->global_idx]) {
+			GB_PANIC("data reloc in .bss global %u", dr->global_idx);
+		}
+		Elf64_Rela rela = {};
+		rela.r_offset = global_data_offsets[dr->global_idx] + dr->local_offset;
+
+		u32 elf_sym;
+		if (dr->target_sym >= FB_GLOBAL_SYM_BASE) {
+			u32 gidx = dr->target_sym - FB_GLOBAL_SYM_BASE;
+			GB_ASSERT(gidx < global_count);
+			elf_sym = global_sym_elf_idx[gidx];
+		} else if (dr->target_sym >= FB_RODATA_SYM_BASE) {
+			u32 ridx = dr->target_sym - FB_RODATA_SYM_BASE;
+			GB_ASSERT(ridx < rodata_count);
+			elf_sym = rodata_elf_idx[ridx];
+		} else {
+			GB_ASSERT(dr->target_sym < proc_count);
+			elf_sym = proc_elf_idx[dr->target_sym];
+		}
+		rela.r_info   = ELF64_R_INFO(elf_sym, R_X86_64_64);
+		rela.r_addend = dr->addend;
+		fb_buf_append(&reladata_buf, &rela, sizeof(Elf64_Rela));
+	}
+
+	u64 reladata_offset = relatext_offset + relatext_size;
+	u64 reladata_size   = reladata_buf.count;
+	if (reladata_size > 0) {
+		if (reladata_offset % 8 != 0) reladata_offset += 8 - (reladata_offset % 8);
+	}
+
+	u64 shdr_offset = reladata_offset + reladata_size;
 	if (shdr_offset % 8 != 0) shdr_offset += 8 - (shdr_offset % 8);
 
 	// 7. Section headers
@@ -597,6 +636,15 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	shdrs[FB_ELF_SEC_RELATEXT].sh_addralign = 8;
 	shdrs[FB_ELF_SEC_RELATEXT].sh_entsize   = sizeof(Elf64_Rela);
 
+	shdrs[FB_ELF_SEC_RELADATA].sh_name      = shname_reladata;
+	shdrs[FB_ELF_SEC_RELADATA].sh_type      = SHT_RELA;
+	shdrs[FB_ELF_SEC_RELADATA].sh_offset    = reladata_offset;
+	shdrs[FB_ELF_SEC_RELADATA].sh_size      = reladata_size;
+	shdrs[FB_ELF_SEC_RELADATA].sh_link      = FB_ELF_SEC_SYMTAB;
+	shdrs[FB_ELF_SEC_RELADATA].sh_info      = FB_ELF_SEC_DATA;
+	shdrs[FB_ELF_SEC_RELADATA].sh_addralign = 8;
+	shdrs[FB_ELF_SEC_RELADATA].sh_entsize   = sizeof(Elf64_Rela);
+
 	// 8. ELF header
 	Elf64_Ehdr ehdr = {};
 	ehdr.e_ident[0]  = ELFMAG0;
@@ -631,6 +679,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		fb_buf_free(&strtab);
 		fb_buf_free(&shstrtab);
 		fb_buf_free(&rela_buf);
+		fb_buf_free(&reladata_buf);
 		gb_free(heap_allocator(), syms);
 		gb_free(heap_allocator(), proc_text_offsets);
 		if (rodata_offsets) gb_free(heap_allocator(), rodata_offsets);
@@ -675,7 +724,12 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		gb_file_write(&f, rela_buf.data, rela_buf.count);
 	}
 
-	fb_file_write_padding(&f, relatext_offset + relatext_size, shdr_offset);
+	if (reladata_buf.count > 0) {
+		fb_file_write_padding(&f, relatext_offset + relatext_size, reladata_offset);
+		gb_file_write(&f, reladata_buf.data, reladata_buf.count);
+	}
+
+	fb_file_write_padding(&f, reladata_offset + reladata_size, shdr_offset);
 	gb_file_write(&f, shdrs, sizeof(shdrs));
 
 	gb_file_close(&f);
@@ -687,6 +741,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	fb_buf_free(&strtab);
 	fb_buf_free(&shstrtab);
 	fb_buf_free(&rela_buf);
+	fb_buf_free(&reladata_buf);
 	gb_free(heap_allocator(), syms);
 	gb_free(heap_allocator(), proc_text_offsets);
 	if (rodata_offsets) gb_free(heap_allocator(), rodata_offsets);
