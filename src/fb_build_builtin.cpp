@@ -183,6 +183,37 @@ gb_internal fbValue fb_builtin_abs(fbBuilder *b, fbValue x) {
 		return x;
 	}
 
+	// Complex/quaternion abs: call runtime abs_complexN / abs_quaternionN (contextless)
+	// These return a scalar float (the magnitude).
+	if (is_type_quaternion(t)) {
+		i64 sz = 8*type_size_of(t);
+		String name = {};
+		switch (sz) {
+		case 64:  name = str_lit("abs_quaternion64");  break;
+		case 128: name = str_lit("abs_quaternion128"); break;
+		case 256: name = str_lit("abs_quaternion256"); break;
+		default: GB_PANIC("Unknown quaternion type"); break;
+		}
+		Type *ret_type = base_complex_elem_type(t);
+		u32 proc_idx = fb_lookup_runtime_proc(b->module, name);
+		fbValue args[1] = {x};
+		return fb_emit_call_contextless(b, proc_idx, args, 1, ret_type);
+	}
+	if (is_type_complex(t)) {
+		i64 sz = 8*type_size_of(t);
+		String name = {};
+		switch (sz) {
+		case 32:  name = str_lit("abs_complex32");  break;
+		case 64:  name = str_lit("abs_complex64");  break;
+		case 128: name = str_lit("abs_complex128"); break;
+		default: GB_PANIC("Unknown complex type"); break;
+		}
+		Type *ret_type = base_complex_elem_type(t);
+		u32 proc_idx = fb_lookup_runtime_proc(b->module, name);
+		fbValue args[1] = {x};
+		return fb_emit_call_contextless(b, proc_idx, args, 1, ret_type);
+	}
+
 	fbType ft = fb_data_type(t);
 	bool is_float = fb_type_is_float(ft);
 
@@ -1437,19 +1468,20 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 		fbAddr result = fb_add_local(b, val_type, nullptr, false);
 		fb_emit_copy_value(b, result.base, val, val_type);
 
+		fbType fft = fb_data_type(ft);
 		if (is_type_complex(val_type)) {
 			// Negate imag at offset elem_size
 			fbValue imag_ptr = fb_emit_member(b, result.base, elem_size);
 			fbValue imag = fb_emit_load(b, imag_ptr, ft);
-			fbValue neg = fb_emit_arith(b, FB_FNEG, imag, imag, ft);
-			fb_emit_store(b, imag_ptr, neg);
+			u32 neg_r = fb_inst_emit(b->proc, FB_FNEG, fft, imag.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
+			fb_emit_store(b, imag_ptr, fb_make_value(neg_r, ft));
 		} else {
 			// @QuaternionLayout: negate i(0), j(1), k(2)
 			for (i64 i = 0; i < 3; i++) {
 				fbValue comp_ptr = fb_emit_member(b, result.base, elem_size * i);
 				fbValue comp = fb_emit_load(b, comp_ptr, ft);
-				fbValue neg = fb_emit_arith(b, FB_FNEG, comp, comp, ft);
-				fb_emit_store(b, comp_ptr, neg);
+				u32 neg_r = fb_inst_emit(b->proc, FB_FNEG, fft, comp.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
+				fb_emit_store(b, comp_ptr, fb_make_value(neg_r, ft));
 			}
 		}
 

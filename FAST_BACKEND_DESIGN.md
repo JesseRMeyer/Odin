@@ -429,6 +429,7 @@ struct fbStackSlot {
     Entity *entity;       // Odin variable entity (NULL for temporaries)
     Type   *odin_type;    // for DWARF type info
     u32     scope_start;  // first instruction index where this slot is live
+    bool    is_indirect;  // true for MEMORY-class ABI params (slot holds pointer to caller data)
 };
 
 struct fbLoc {
@@ -507,7 +508,27 @@ struct fbProc {
     fbXmmParamLoc *xmm_param_locs;
     u32            xmm_param_count;
 
-    // Machine code output (populated by lowering)
+    // Stack-passed parameter ABI (callee side): when GP registers overflow
+    // (>6 eightbytes), overflow params arrive on the caller's stack frame.
+    struct fbStackParamLoc {
+        u32 slot_idx;
+        i32 sub_offset;       // 0 for first eightbyte, 8 for second
+        i32 caller_offset;    // byte offset from [RBP + 16]
+    };
+    fbStackParamLoc *stack_param_locs;
+    u32              stack_param_count;
+
+    // Parameter entity lookup: maps Entity* → slot_idx for each declared
+    // parameter. Built during fb_setup_params, consumed during parameter
+    // binding to avoid O(params * locs) search across param/xmm/stack arrays.
+    struct fbParamEntityLoc {
+        Entity *entity;
+        u32     slot_idx;
+    };
+    fbParamEntityLoc *param_entity_locs;
+    u32               param_entity_count;
+
+    // Machine code output (populated by lowering — ownership transferred, not copied)
     u8    *machine_code;
     u32    machine_code_size;
     bool   is_foreign;
@@ -1147,7 +1168,7 @@ Similar strategy. S_LOCAL records with `DefRangeFramePointerRelFullScope` (simpl
 
 **Foreign proc optimization.** `fb_proc_create` detects `is_foreign` and skips the 5 heap allocations for instruction/block/slot/aux/loc arrays. All pointers remain NULL, capacities stay 0. `fb_proc_destroy`'s null checks handle cleanup. This is significant because foreign procs can vastly outnumber defined procs.
 
-**Lowering temporaries.** The `fbLowCtx` struct allocates its own code buffer, block offsets, value location tracking, fixups, relocations, and symbol reference arrays per-procedure. These are freed after machine code is copied to the proc.
+**Lowering temporaries.** The `fbLowCtx` struct allocates its own code buffer, block offsets, value location tracking, fixups, relocations, and symbol reference arrays per-procedure. After lowering, the code buffer and relocation array are transferred to `fbProc` via ownership (zero-copy pointer handoff). The remaining context-local arrays (block offsets, value locations, fixups, symbol refs) are freed.
 
 **Future: arena-per-procedure.** The design target is arena allocation where all procedure data is allocated from a per-procedure arena and freed at once after machine code emission. This eliminates individual `free()` calls, prevents fragmentation, and enables natural parallelism (each thread has its own arena).
 
@@ -1748,7 +1769,7 @@ Implemented tagged union support, type assertion expressions, and MEMORY-class a
 
 **Files modified:**
 - `src/fb_build.cpp` — `fb_emit_store_union_variant()` (writes data + tag, handles maybe-pointer, zero-sized variants, memzero of stale data); `fb_emit_conv()` gained union conversion path (value→union via temp alloca); `fb_build_compound_lit()` added `Type_Union` case; two separate type assertion paths: address-of (`&v.(T)`) and value (`v.(T)`), each handling both tuple `(T, bool)` and direct `T` forms with trap-on-mismatch; `fb_build_mutable_value_decl`/`fb_build_assign_stmt` extended to handle aggregate tuple pointers from type assertions (distinct from split-return temps)
-- `src/fb_build.cpp` — MEMORY-class parameters: `fb_setup_params` allocates GP register slots for hidden pointers; procedure begin dereferences MEMORY param pointers via `fb_emit_load`
+- `src/fb_build.cpp` — MEMORY-class parameters: `fb_setup_params` allocates GP register slots for hidden pointers and sets `slot->is_indirect = true`; procedure begin uses `is_indirect` to dereference MEMORY param pointers via `fb_emit_load` (no redundant ABI re-classification)
 - `src/fb_ir.h` — No new types (reuses existing structures)
 - `tests/fast_backend/test_union.odin` — 82 lines of union tests
 
@@ -1768,7 +1789,7 @@ Full SysV AMD64 ABI compliance for C interop: XMM float parameter passing/receiv
 
 **Files modified:**
 - `src/fb_abi.cpp` — Recursive struct/array ABI decomposition: structs ≤16B with all-INTEGER fields classified as 1×/2×INTEGER; small arrays ≤16B similarly decomposed; packed/raw_union structs conservatively go to MEMORY
-- `src/fb_build.cpp` — `fb_setup_params` routes SSE-classified params to `fbXmmParamLoc` slots for non-Odin CC (XMM0-7); `xmm_param_locs`/`xmm_param_count` stored on fbProc; call codegen tracks `sse_mask`/`f64_mask` bitmasks in CALL instruction `imm` field; small struct arguments (≤8B, 1×INTEGER) loaded as scalar before passing
+- `src/fb_build.cpp` — `fb_setup_params` routes SSE-classified params to `fbXmmParamLoc` slots for non-Odin CC (XMM0-7); builds `param_entity_locs` array for O(n) parameter binding; `xmm_param_locs`/`xmm_param_count` stored on fbProc; call codegen tracks `sse_mask`/`f64_mask` bitmasks in CALL instruction `imm` field; small struct arguments (≤8B, 1×INTEGER) loaded as scalar before passing
 - `src/fb_lower_x64.cpp` — Prologue emits `movss`/`movsd` from XMM registers to stack slots; call lowering rewritten for mixed GP/XMM: independent GP and XMM register counting, SSE arg bitmask decoding, GP→XMM transfer via `movd`/`movq`; non-Odin CC SSE return capture from XMM0→GP; `UI2FP` halving trick for full u64 range; `FP2UI` conditional subtraction for full u64 range
 
 **What works:**
@@ -1924,7 +1945,7 @@ Five builtin procedures and Linux syscall instruction lowering, unblocking 4 mor
 - `mem_copy_non_overlapping` — identical to existing `mem_copy` (both emit FB_MEMCPY)
 - `unaligned_load` — scalar types: regular LOAD (x86-64 handles unaligned naturally); aggregates: MEMCPY with align=1 to temp local
 - `unaligned_store` — `fb_emit_copy_value` (handles both scalar STORE and aggregate MEMCPY)
-- `overflow_add` — pure arithmetic overflow detection. Unsigned: `result < a`. Signed: `(a ^ result) & (b ^ result)` has sign bit set. Returns `(T, bool)` tuple via aggregate temp (same pattern as type assertions)
+- `overflow_add` — pure arithmetic overflow detection. Unsigned: `result < a`. Signed: `(a ^ result) & (b ^ result)` has sign bit set. Returns `(T, bool)` tuple via `FB_PACK_RESULT_BOOL` macro (shared with `overflow_sub`/`overflow_mul`)
 - `syscall` — emits `FB_ASM` with `imm=1` discriminator. Args stored in aux pool (same encoding as FB_CALL). Returns `uintptr` in RAX
 
 *FB_ASM syscall lowering in `fb_lower_x64.cpp`:*
@@ -2100,7 +2121,7 @@ Full type_table generation, data relocations, and supporting features.
 - `fbDataReloc` struct: `{ u32 global_idx; u32 offset_in_data; u32 target_sym; i64 addend; }`
 - `R_X86_64_64` absolute address relocations for pointer fields in `.data` globals
 - `.rela.data` ELF section with proper symbol resolution (procs, rodata, globals)
-- Three-way reloc dispatch paralleling `.rela.text`: proc / rodata / global symbols
+- Three-way reloc dispatch via `fb_resolve_elf_sym` helper (shared between `.rela.text` and `.rela.data`): proc / rodata / global symbols
 - Needed for RTTI (type info entries contain pointers to other type infos and member buffers)
   and for string-valued global variables (string struct contains pointer to rodata)
 
@@ -2258,6 +2279,7 @@ with diagnostic.
 **ELF improvements (DONE):**
 - `.rela.text` emission with proper R_X86_64_PLT32 relocations for cross-procedure calls
 - `.rela.data` emission with R_X86_64_64 absolute relocations for pointer fields in globals
+- `fb_resolve_elf_sym` lambda extracts shared abstract→ELF symbol index mapping for both `.rela.text` and `.rela.data`
 - Single-pass symbol table algorithm (count → allocate → populate with dual LOCAL/GLOBAL cursors)
 - Batched padding writes (64-byte chunks instead of byte-at-a-time)
 - `fb_buf_append_odin_str()` eliminates per-symbol C-string alloc/copy/free

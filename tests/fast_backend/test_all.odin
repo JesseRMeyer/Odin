@@ -1737,6 +1737,10 @@ main :: proc() {
 	test_unroll_range()
 	print_msg("  aggregate_multi_return...\n")
 	test_aggregate_multi_return()
+	print_msg("  or_else_map_assertion...\n")
+	test_or_else_map_assertion()
+	print_msg("  quaternion_ops...\n")
+	test_quaternion_ops()
 	print_msg("ALL PASS\n")
 	exit(0)
 }
@@ -2169,4 +2173,72 @@ test_aggregate_multi_return :: proc() {
 	check(code == 42, 2140)
 	check(pair.a == 10, 2141)
 	check(pair.b == 20, 2142)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Or-else with map lookups and type assertions (2160-2179)
+// ═══════════════════════════════════════════════════════════════════════
+
+test_or_else_map_assertion :: proc() {
+	// Union type assertion or_else: nil union → fallback
+	U :: union { int, f64 }
+	u: U
+	v3 := u.(int) or_else 123
+	check(v3 == 123, 2160)
+
+	// Union type assertion or_else: has value
+	u = 55
+	v4 := u.(int) or_else 123
+	check(v4 == 55, 2161)
+
+	// Maybe type or_else: nil → fallback
+	maybe: Maybe(int)
+	v5 := maybe.? or_else 456
+	check(v5 == 456, 2162)
+
+	// Maybe type or_else: has value
+	maybe = 77
+	v6 := maybe.? or_else 456
+	check(v6 == 77, 2163)
+
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Quaternion operations (2180-2199)
+// ═══════════════════════════════════════════════════════════════════════
+
+test_quaternion_ops :: proc() {
+	// Conjugate: negate imaginary parts
+	q1 := quaternion(w=1, x=2, y=3, z=4)
+	qc := conj(q1)
+	check(real(qc) == 1, 2180)
+	check(imag(qc) == -2, 2181)
+
+	// Complex abs: sqrt(3^2 + 4^2) = 5
+	c := complex(3.0, 4.0)
+	cm := abs(c)
+	check(cm > 4.99 && cm < 5.01, 2182)
+
+	// Complex conjugate
+	cc := conj(c)
+	check(real(cc) == 3.0, 2183)
+	check(imag(cc) == -4.0, 2184)
+
+	// Quaternion abs: sqrt(0+0+16+9) = 5
+	q_unit := quaternion(w=3.0, x=0.0, y=0.0, z=4.0)
+	magnitude := abs(q_unit)
+	check(magnitude > 4.99 && magnitude < 5.01, 2185)
+
+	// Quaternion division: q / q should be ~identity (real=1, imag=0)
+	qd := q1 / q1
+	qd_real := real(qd)
+	qd_imag := imag(qd)
+	check(qd_real > 0.99 && qd_real < 1.01, 2186)
+	check(qd_imag > -0.01 && qd_imag < 0.01, 2187)
+
+	// Quaternion division: (2+4i+6j+8k) / (1+2i+3j+4k) = 2+0i+0j+0k
+	q2 := quaternion(w=2, x=4, y=6, z=8)
+	qd2 := q2 / q1
+	check(real(qd2) > 1.99 && real(qd2) < 2.01, 2188)
+	check(abs(imag(qd2)) < 0.01, 2189)
 }

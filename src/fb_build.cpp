@@ -37,6 +37,7 @@ gb_internal isize   fb_type_info_index(CheckerInfo *info, Type *type, bool err_o
 // Forward declarations for functions used before their definition
 gb_internal void    fb_emit_copy_value(fbBuilder *b, fbValue dst_ptr, fbValue val, Type *type);
 gb_internal void    fb_unpack_multi_return(fbBuilder *b, fbValue last_val, fbValue *out_values, i32 out_count);
+gb_internal void    fb_unpack_tuple_values(fbBuilder *b, fbValue last_val, Type *tuple_type, fbValue *out_values, i32 out_count);
 gb_internal fbValue fb_build_source_code_location(fbBuilder *b, String proc_name, TokenPos pos);
 gb_internal u32     fb_gen_map_cell_info(fbModule *m, Type *type);
 gb_internal fbValue fb_map_info_ptr(fbBuilder *b, Type *map_type);
@@ -1205,27 +1206,59 @@ gb_internal u32 fb_lookup_runtime_proc(fbModule *m, String name) {
 }
 
 // Emit a call to a contextless proc: proc "contextless" (args...) -> ret_type
+// Handles sret for aggregate return types automatically.
 gb_internal fbValue fb_emit_call_contextless(fbBuilder *b, u32 proc_idx, fbValue *args, u32 arg_count, Type *ret_type) {
 	fbValue target = fb_emit_symaddr(b, proc_idx);
+	fbType ret_ft = (ret_type != nullptr) ? fb_data_type(ret_type) : FB_VOID;
+
+	// Aggregate return: use hidden output pointer (sret)
+	bool needs_sret = (ret_type != nullptr && ret_ft.kind == FBT_VOID && type_size_of(ret_type) > 0);
+	fbAddr sret_temp = {};
+	if (needs_sret) {
+		sret_temp = fb_add_local(b, ret_type, nullptr, true);
+	}
+
 	u32 aux_start = b->proc->aux_count;
 	for (u32 i = 0; i < arg_count; i++) {
 		fb_aux_push(b->proc, args[i].id);
 	}
+	if (needs_sret) {
+		fb_aux_push(b->proc, sret_temp.base.id);
+	}
 	u32 arg_total = b->proc->aux_count - aux_start;
-	fbType ret_ft = (ret_type != nullptr) ? fb_data_type(ret_type) : FB_VOID;
-	u32 r = fb_inst_emit(b->proc, FB_CALL, ret_ft, target.id, aux_start, arg_total, b->current_loc, 0);
+	u32 r = fb_inst_emit(b->proc, FB_CALL, needs_sret ? FB_VOID : ret_ft, target.id, aux_start, arg_total, b->current_loc, 0);
 	// Contextless uses Odin CC (no context pointer)
 	fbInst *inst = &b->proc->insts[b->proc->inst_count - 1];
 	inst->flags = FBCC_ODIN;
+
+	if (needs_sret) {
+		fbValue result = sret_temp.base;
+		result.type = ret_type;
+		return result;
+	}
 	return fb_make_value(r, ret_type);
 }
 
 // Emit a call to an Odin-CC proc, passing context as last arg.
+// Handles sret for aggregate return types automatically.
 gb_internal fbValue fb_emit_call_odin(fbBuilder *b, u32 proc_idx, fbValue *args, u32 arg_count, Type *ret_type) {
 	fbValue target = fb_emit_symaddr(b, proc_idx);
+	fbType ret_ft = (ret_type != nullptr) ? fb_data_type(ret_type) : FB_VOID;
+
+	// Aggregate return: use hidden output pointer (sret)
+	bool needs_sret = (ret_type != nullptr && ret_ft.kind == FBT_VOID && type_size_of(ret_type) > 0);
+	fbAddr sret_temp = {};
+	if (needs_sret) {
+		sret_temp = fb_add_local(b, ret_type, nullptr, true);
+	}
+
 	u32 aux_start = b->proc->aux_count;
 	for (u32 i = 0; i < arg_count; i++) {
 		fb_aux_push(b->proc, args[i].id);
+	}
+	// sret pointer goes after args, before context
+	if (needs_sret) {
+		fb_aux_push(b->proc, sret_temp.base.id);
 	}
 	// Context pointer (Odin CC, always last)
 	if (b->context_stack.count == 0) {
@@ -1239,10 +1272,15 @@ gb_internal fbValue fb_emit_call_odin(fbBuilder *b, u32 proc_idx, fbValue *args,
 	fb_aux_push(b->proc, ctx_ptr.id);
 
 	u32 arg_total = b->proc->aux_count - aux_start;
-	fbType ret_ft = (ret_type != nullptr) ? fb_data_type(ret_type) : FB_VOID;
-	u32 r = fb_inst_emit(b->proc, FB_CALL, ret_ft, target.id, aux_start, arg_total, b->current_loc, 0);
+	u32 r = fb_inst_emit(b->proc, FB_CALL, needs_sret ? FB_VOID : ret_ft, target.id, aux_start, arg_total, b->current_loc, 0);
 	fbInst *inst = &b->proc->insts[b->proc->inst_count - 1];
 	inst->flags = FBCC_ODIN;
+
+	if (needs_sret) {
+		fbValue result = sret_temp.base;
+		result.type = ret_type;
+		return result;
+	}
 	return fb_make_value(r, ret_type);
 }
 
@@ -2229,8 +2267,8 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 		fbValue rhs = {};
 		Type *inner_type = type_of_expr(be->expr);
 		if (inner_type != nullptr && inner_type->kind == Type_Tuple) {
-			fbValue vals[2];
-			fb_unpack_multi_return(b, last_val, vals, 2);
+			fbValue vals[2] = {};
+			fb_unpack_tuple_values(b, last_val, inner_type, vals, 2);
 			value = vals[0];
 			rhs   = vals[1];
 		} else {
@@ -3202,6 +3240,74 @@ gb_internal fbValue fb_emit_quaternion_arith(fbBuilder *b, TokenKind op, fbValue
 		ok = fb_emit_arith(b, FB_FADD, t0, t1, ft);
 		break;
 	}
+	case Token_Quo: {
+		// Quaternion division: q/r = conj(r)*q / |r|^2
+		// t0 = (r0*q0 + r1*q1 + r2*q2 + r3*q3) / mag2
+		// t1 = (r0*q1 - r1*q0 - r2*q3 + r3*q2) / mag2
+		// t2 = (r0*q2 + r1*q3 - r2*q0 - r3*q1) / mag2
+		// t3 = (r0*q3 - r1*q2 + r2*q1 - r3*q0) / mag2
+		// Where: q0=real(q), q1=imag(q), q2=jmag(q), q3=kmag(q), same for r
+		// @QuaternionLayout: {i, j, k, w} at indices {0, 1, 2, 3}
+		// So: real=w(3), imag=i(0), jmag=j(1), kmag=k(2)
+		fbValue q0 = lw, q1 = li, q2 = lj, q3 = lk;
+		fbValue r0 = rw, r1 = ri, r2 = rj, r3 = rk;
+
+		// mag2 = r0*r0 + r1*r1 + r2*r2 + r3*r3
+		fbValue mag2, t;
+		mag2 = fb_emit_arith(b, FB_FMUL, r0, r0, ft);
+		t = fb_emit_arith(b, FB_FMUL, r1, r1, ft);
+		mag2 = fb_emit_arith(b, FB_FADD, mag2, t, ft);
+		t = fb_emit_arith(b, FB_FMUL, r2, r2, ft);
+		mag2 = fb_emit_arith(b, FB_FADD, mag2, t, ft);
+		t = fb_emit_arith(b, FB_FMUL, r3, r3, ft);
+		mag2 = fb_emit_arith(b, FB_FADD, mag2, t, ft);
+
+		fbValue one = fb_emit_fconst(b, ft, 1.0);
+		fbValue invmag2 = fb_emit_arith(b, FB_FDIV, one, mag2, ft);
+
+		fbValue t0, t1, t2, t3, a0, a1;
+
+		// t0 = (r0*q0 + r1*q1 + r2*q2 + r3*q3) * invmag2
+		a0 = fb_emit_arith(b, FB_FMUL, r0, q0, ft);
+		a1 = fb_emit_arith(b, FB_FMUL, r1, q1, ft);
+		a0 = fb_emit_arith(b, FB_FADD, a0, a1, ft);
+		a1 = fb_emit_arith(b, FB_FMUL, r2, q2, ft);
+		a0 = fb_emit_arith(b, FB_FADD, a0, a1, ft);
+		a1 = fb_emit_arith(b, FB_FMUL, r3, q3, ft);
+		a0 = fb_emit_arith(b, FB_FADD, a0, a1, ft);
+		ow = fb_emit_arith(b, FB_FMUL, a0, invmag2, ft);
+
+		// t1 = (r0*q1 - r1*q0 - r2*q3 + r3*q2) * invmag2
+		a0 = fb_emit_arith(b, FB_FMUL, r0, q1, ft);
+		a1 = fb_emit_arith(b, FB_FMUL, r1, q0, ft);
+		a0 = fb_emit_arith(b, FB_FSUB, a0, a1, ft);
+		a1 = fb_emit_arith(b, FB_FMUL, r2, q3, ft);
+		a0 = fb_emit_arith(b, FB_FSUB, a0, a1, ft);
+		a1 = fb_emit_arith(b, FB_FMUL, r3, q2, ft);
+		oi = fb_emit_arith(b, FB_FADD, a0, a1, ft);
+		oi = fb_emit_arith(b, FB_FMUL, oi, invmag2, ft);
+
+		// t2 = (r0*q2 + r1*q3 - r2*q0 - r3*q1) * invmag2
+		a0 = fb_emit_arith(b, FB_FMUL, r0, q2, ft);
+		a1 = fb_emit_arith(b, FB_FMUL, r1, q3, ft);
+		a0 = fb_emit_arith(b, FB_FADD, a0, a1, ft);
+		a1 = fb_emit_arith(b, FB_FMUL, r2, q0, ft);
+		a0 = fb_emit_arith(b, FB_FSUB, a0, a1, ft);
+		a1 = fb_emit_arith(b, FB_FMUL, r3, q1, ft);
+		oj = fb_emit_arith(b, FB_FSUB, a0, a1, ft);
+		oj = fb_emit_arith(b, FB_FMUL, oj, invmag2, ft);
+
+		// t3 = (r0*q3 - r1*q2 + r2*q1 - r3*q0) * invmag2
+		a0 = fb_emit_arith(b, FB_FMUL, r0, q3, ft);
+		a1 = fb_emit_arith(b, FB_FMUL, r1, q2, ft);
+		a0 = fb_emit_arith(b, FB_FSUB, a0, a1, ft);
+		a1 = fb_emit_arith(b, FB_FMUL, r2, q1, ft);
+		a0 = fb_emit_arith(b, FB_FADD, a0, a1, ft);
+		a1 = fb_emit_arith(b, FB_FMUL, r3, q0, ft);
+		ok = fb_emit_arith(b, FB_FSUB, a0, a1, ft);
+		ok = fb_emit_arith(b, FB_FMUL, ok, invmag2, ft);
+		break;
+	}
 	default: GB_PANIC("invalid quaternion op"); oi = oj = ok = ow = fb_value_nil(); break;
 	}
 
@@ -3230,7 +3336,7 @@ gb_internal fbValue fb_build_binary_expr(fbBuilder *b, Ast *expr) {
 	}
 	if (is_type_quaternion(type)) {
 		if (be->op.kind == Token_Add || be->op.kind == Token_Sub ||
-		    be->op.kind == Token_Mul) {
+		    be->op.kind == Token_Mul || be->op.kind == Token_Quo) {
 			fbValue left  = fb_build_expr(b, be->left);
 			fbValue right = fb_build_expr(b, be->right);
 			return fb_emit_quaternion_arith(b, be->op.kind, left, right, type);
@@ -4219,6 +4325,35 @@ gb_internal void fb_unpack_multi_return(fbBuilder *b, fbValue last_val, fbValue 
 	}
 }
 
+// Unpack a tuple-producing expression into individual values.
+// Handles both call-based split returns (via fb_unpack_multi_return)
+// and aggregate tuple pointers (from type assertions, map lookups, etc.).
+gb_internal void fb_unpack_tuple_values(fbBuilder *b, fbValue last_val, Type *tuple_type, fbValue *out_values, i32 out_count) {
+	if (b->last_call_split_count > 0 || b->last_call_split_temps != nullptr) {
+		fb_unpack_multi_return(b, last_val, out_values, out_count);
+		return;
+	}
+	// Aggregate tuple: last_val is a pointer to the tuple memory.
+	GB_ASSERT(tuple_type != nullptr && tuple_type->kind == Type_Tuple);
+	fbValue tuple_ptr = last_val;
+	tuple_ptr.type = alloc_type_pointer(tuple_type);
+	for (i32 i = 0; i < out_count && i < cast(i32)tuple_type->Tuple.variables.count; i++) {
+		Type *field_type = tuple_type->Tuple.variables[i]->type;
+		i64 offset = type_offset_of(tuple_type, i);
+		fbType ft = fb_data_type(field_type);
+		if (ft.kind != FBT_VOID) {
+			out_values[i] = fb_load_field(b, tuple_ptr, offset, field_type);
+		} else {
+			fbValue field_ptr = tuple_ptr;
+			if (offset != 0) {
+				field_ptr = fb_emit_member(b, tuple_ptr, offset);
+			}
+			field_ptr.type = field_type;
+			out_values[i] = field_ptr;
+		}
+	}
+}
+
 gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 	expr = unparen_expr(expr);
 
@@ -4516,10 +4651,11 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 
 		// Build the LHS: a multi-return (value, ok)
 		fbValue last_val = fb_build_expr(b, oe->x);
+		Type *inner_type = type_of_expr(oe->x);
 
 		// Unpack: first return = value, last return = ok bool
-		fbValue vals[2];
-		fb_unpack_multi_return(b, last_val, vals, 2);
+		fbValue vals[2] = {};
+		fb_unpack_tuple_values(b, last_val, inner_type, vals, 2);
 		fbValue value = vals[0];
 		fbValue ok    = vals[1];
 
@@ -4566,8 +4702,8 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 		Type *inner_type = type_of_expr(ore->expr);
 		if (inner_type != nullptr && inner_type->kind == Type_Tuple) {
 			// Multi-return: unpack into value(s) + rhs
-			fbValue vals[2];
-			fb_unpack_multi_return(b, last_val, vals, 2);
+			fbValue vals[2] = {};
+			fb_unpack_tuple_values(b, last_val, inner_type, vals, 2);
 			value = vals[0];
 			rhs   = vals[1];
 		} else {
