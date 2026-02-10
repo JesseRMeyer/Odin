@@ -711,10 +711,89 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 	}
 
 	switch (id) {
-	case BuiltinProc_DIRECTIVE:
-		// #location, #load etc. - unhandled for now
-		GB_PANIC("fast backend: #directive builtins not yet supported");
+	case BuiltinProc_DIRECTIVE: {
+		ast_node(bd, BasicDirective, ce->proc);
+		String name = bd->name.string;
+		if (name == "location") {
+			String procedure = {};
+			if (b->entity != nullptr) {
+				procedure = b->entity->token.string;
+			}
+			TokenPos pos = ast_token(ce->proc).pos;
+			if (ce->args.count > 0) {
+				Ast *ident = unselector_expr(ce->args[0]);
+				GB_ASSERT(ident->kind == Ast_Ident);
+				Entity *e = entity_of_node(ident);
+				GB_ASSERT(e != nullptr);
+
+				DeclInfo *ppd = e->parent_proc_decl.load(std::memory_order_relaxed);
+				if (ppd != nullptr && ppd->entity != nullptr) {
+					procedure = ppd->entity.load()->token.string;
+				} else {
+					procedure = str_lit("");
+				}
+				pos = e->token.pos;
+			}
+			return fb_build_source_code_location(b, procedure, pos);
+		} else if (name == "load_directory") {
+			LoadDirectoryCache *cache = map_must_get(&b->module->info->load_directory_map, expr);
+			isize count = cache->files.count;
+			i64 ptr_size = b->module->target.ptr_size;
+
+			// Load_Directory_File = {name: string, data: []byte}
+			// string = {data: rawptr, len: int} = 2*ptr_size
+			// []byte = {data: rawptr, len: int} = 2*ptr_size
+			// Total per entry = 4*ptr_size = 32 bytes on 64-bit
+			i64 entry_size = type_size_of(t_load_directory_file);
+
+			// Allocate backing array on the stack
+			Type *array_type = alloc_type_array(t_load_directory_file, count);
+			fbAddr backing = fb_add_local(b, array_type, nullptr, true);
+
+			for_array(i, cache->files) {
+				LoadFileCache *file = cache->files[i];
+				String file_name = filename_without_directory(file->path);
+
+				i64 base_off = cast(i64)i * entry_size;
+				fbValue entry_ptr = (base_off == 0) ? backing.base : fb_emit_member(b, backing.base, base_off);
+
+				// name string at offset 0
+				if (file_name.len > 0) {
+					u32 name_sym = fb_module_intern_string_data(b->module, file_name);
+					fbValue name_ptr = fb_emit_symaddr(b, name_sym);
+					name_ptr.type = t_rawptr;
+					fb_emit_store(b, entry_ptr, name_ptr);
+					fbValue name_len = fb_emit_iconst(b, t_int, file_name.len);
+					fbValue name_len_ptr = fb_emit_member(b, entry_ptr, ptr_size);
+					fb_emit_store(b, name_len_ptr, name_len);
+				}
+
+				// data slice at offset 2*ptr_size
+				fbValue data_field = fb_emit_member(b, entry_ptr, 2 * ptr_size);
+				if (file->data.len > 0) {
+					u32 data_sym = fb_module_intern_string_data(b->module, file->data);
+					fbValue data_ptr = fb_emit_symaddr(b, data_sym);
+					data_ptr.type = t_rawptr;
+					fb_emit_store(b, data_field, data_ptr);
+					fbValue data_len = fb_emit_iconst(b, t_int, file->data.len);
+					fbValue data_len_ptr = fb_emit_member(b, data_field, ptr_size);
+					fb_emit_store(b, data_len_ptr, data_len);
+				}
+			}
+
+			// Build the result slice: {data: ^Load_Directory_File, len: int}
+			fbAddr result = fb_add_local(b, tv.type, nullptr, false);
+			fb_emit_store(b, result.base, backing.base);
+			fbValue len_ptr = fb_emit_member(b, result.base, ptr_size);
+			fb_emit_store(b, len_ptr, fb_emit_iconst(b, t_int, count));
+
+			result.base.type = tv.type;
+			return result.base;
+		} else {
+			GB_PANIC("fast backend: unknown directive: %.*s", LIT(name));
+		}
 		return fb_value_nil();
+	}
 
 	// ── Container introspection ──────────────────────────────────
 
@@ -1112,15 +1191,16 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 	case BuiltinProc_volatile_load: {
 		fbValue ptr = fb_build_expr(b, ce->args[0]);
 		Type *elem = type_deref(type_of_expr(ce->args[0]));
-		// TODO: set volatile flag on the LOAD instruction
-		return fb_emit_load(b, ptr, elem);
+		fbValue result = fb_emit_load(b, ptr, elem);
+		b->proc->insts[b->proc->inst_count - 1].flags |= FBF_VOLATILE;
+		return result;
 	}
 
 	case BuiltinProc_volatile_store: {
 		fbValue ptr = fb_build_expr(b, ce->args[0]);
 		fbValue val = fb_build_expr(b, ce->args[1]);
-		// TODO: set volatile flag on the STORE instruction
 		fb_emit_store(b, ptr, val);
+		b->proc->insts[b->proc->inst_count - 1].flags |= FBF_VOLATILE;
 		return fb_value_nil();
 	}
 
@@ -1472,6 +1552,117 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 		fbValue ptr = fb_emit_symaddr(b, proc_idx);
 		ptr.type = t_equal_proc;
 		return ptr;
+	}
+
+	case BuiltinProc_complex: {
+		fbValue real = fb_build_expr(b, ce->args[0]);
+		fbValue imag = fb_build_expr(b, ce->args[1]);
+		Type *ft = base_complex_elem_type(tv.type);
+		i64 es = type_size_of(ft);
+
+		real = fb_emit_conv(b, real, ft);
+		imag = fb_emit_conv(b, imag, ft);
+
+		fbAddr dst = fb_add_local(b, tv.type, nullptr, true);
+		fb_emit_store(b, dst.base, real);
+		fb_emit_store(b, fb_emit_member(b, dst.base, es), imag);
+
+		fbValue result = dst.base;
+		result.type = tv.type;
+		return result;
+	}
+
+	case BuiltinProc_quaternion: {
+		Type *ft = base_complex_elem_type(tv.type);
+		i64 es = type_size_of(ft);
+		fbValue components[4] = {};
+
+		// @QuaternionLayout: x/imag=0, y/jmag=1, z/kmag=2, w/real=3
+		for (i32 i = 0; i < 4 && i < cast(i32)ce->args.count; i++) {
+			Ast *arg = ce->args[i];
+			GB_ASSERT(arg->kind == Ast_FieldValue);
+			String name = arg->FieldValue.field->Ident.token.string;
+			i32 index = -1;
+			if (name == "x" || name == "imag") index = 0;
+			else if (name == "y" || name == "jmag") index = 1;
+			else if (name == "z" || name == "kmag") index = 2;
+			else if (name == "w" || name == "real") index = 3;
+			GB_ASSERT(index >= 0);
+			components[index] = fb_emit_conv(b, fb_build_expr(b, arg->FieldValue.value), ft);
+		}
+
+		fbAddr dst = fb_add_local(b, tv.type, nullptr, true);
+		for (i32 i = 0; i < 4; i++) {
+			if (components[i].id != 0) {
+				fbValue ptr = (i == 0) ? dst.base : fb_emit_member(b, dst.base, es * i);
+				fb_emit_store(b, ptr, components[i]);
+			}
+		}
+
+		fbValue result = dst.base;
+		result.type = tv.type;
+		return result;
+	}
+
+	case BuiltinProc_matrix_flatten: {
+		fbValue m = fb_build_expr(b, ce->args[0]);
+		Type *result_type = tv.type;
+		if (is_type_array(type_of_expr(ce->args[0]))) {
+			// Already an array — no-op rebrand.
+			m.type = result_type;
+			return m;
+		}
+		// Matrix → array: same memory layout, just memcpy.
+		fbAddr res = fb_add_local(b, result_type, nullptr, true);
+		i64 sz = type_size_of(result_type);
+		i64 al = type_align_of(result_type);
+		fbValue sz_val = fb_emit_iconst(b, t_int, sz);
+		fb_emit_memcpy(b, res.base, m, sz_val, al);
+		res.base.type = result_type;
+		return res.base;
+	}
+
+	case BuiltinProc_valgrind_client_request: {
+		// When valgrind support is not enabled, return the default value (first arg).
+		// Full valgrind inline assembly is not supported in the fast backend.
+		fbValue default_val = fb_build_expr(b, ce->args[0]);
+		return fb_emit_conv(b, default_val, t_uintptr);
+	}
+
+	case BuiltinProc_hadamard_product: {
+		fbValue a = fb_build_expr(b, ce->args[0]);
+		fbValue b_val = fb_build_expr(b, ce->args[1]);
+		Type *result_type = tv.type;
+		Type *bt = base_type(result_type);
+
+		Type *elem_type;
+		i64 total_elems;
+		if (bt->kind == Type_Array) {
+			elem_type = bt->Array.elem;
+			total_elems = bt->Array.count;
+		} else {
+			GB_ASSERT(bt->kind == Type_Matrix);
+			elem_type = bt->Matrix.elem;
+			total_elems = bt->Matrix.row_count * bt->Matrix.column_count;
+		}
+
+		i64 elem_sz = type_size_of(elem_type);
+		bool is_float = is_type_float(elem_type);
+		fbOp mul_op = is_float ? FB_FMUL : FB_MUL;
+
+		fbAddr result = fb_add_local(b, result_type, nullptr, false);
+		for (i64 i = 0; i < total_elems; i++) {
+			i64 off = i * elem_sz;
+			fbValue a_ptr = (off == 0) ? a : fb_emit_member(b, a, off);
+			fbValue b_ptr = (off == 0) ? b_val : fb_emit_member(b, b_val, off);
+			fbValue a_val = fb_emit_load(b, a_ptr, elem_type);
+			fbValue b_v = fb_emit_load(b, b_ptr, elem_type);
+			fbValue prod = fb_emit_arith(b, mul_op, a_val, b_v, elem_type);
+			fbValue dst = (off == 0) ? result.base : fb_emit_member(b, result.base, off);
+			fb_emit_store(b, dst, prod);
+		}
+		result.base.type = result_type;
+		return result.base;
 	}
 
 	default:

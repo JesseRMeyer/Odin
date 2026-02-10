@@ -10,7 +10,13 @@ gb_global thread_local volatile bool fb_recovery_active = false;
 // Returns FB_VOID for aggregate types (structs, arrays, etc.) that live only in memory.
 gb_internal fbType fb_data_type(Type *t) {
 	GB_ASSERT(t != nullptr);
+	t = default_type(t);
 	t = core_type(t);
+	// Untyped nil/uninit survive default_type — handle before type_size_of
+	if (t->kind == Type_Basic) {
+		if (t->Basic.kind == Basic_UntypedNil)    return FB_PTR;
+		if (t->Basic.kind == Basic_UntypedUninit)  return FB_VOID;
+	}
 	i64 sz = type_size_of(t);
 	switch (t->kind) {
 	case Type_Basic:

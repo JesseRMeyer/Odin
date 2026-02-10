@@ -34,8 +34,9 @@ gb_internal void    fb_emit_defer_stmts(fbBuilder *b, fbDeferExitKind kind, i32 
 gb_internal void    fb_generate_type_info(fbModule *m);
 gb_internal isize   fb_type_info_index(CheckerInfo *info, Type *type, bool err_on_not_found = true);
 
-// Forward declarations for functions used by map support before their definition
+// Forward declarations for functions used before their definition
 gb_internal void    fb_emit_copy_value(fbBuilder *b, fbValue dst_ptr, fbValue val, Type *type);
+gb_internal void    fb_unpack_multi_return(fbBuilder *b, fbValue last_val, fbValue *out_values, i32 out_count);
 gb_internal fbValue fb_build_source_code_location(fbBuilder *b, String proc_name, TokenPos pos);
 gb_internal u32     fb_gen_map_cell_info(fbModule *m, Type *type);
 gb_internal fbValue fb_map_info_ptr(fbBuilder *b, Type *map_type);
@@ -71,10 +72,11 @@ gb_internal void fb_setup_params(fbProc *p) {
 	i32 result_count = results ? cast(i32)results->variables.count : 0;
 	i32 split_count = (is_odin_like && result_count > 1) ? (result_count - 1) : 0;
 
-	// Single MEMORY-class return needs a hidden output pointer parameter (sret).
+	// MEMORY-class return needs a hidden output pointer parameter (sret).
+	// For single return: the sole result. For multi-return: the last value.
 	bool needs_sret = false;
-	if (is_odin_like && result_count == 1 && split_count == 0 && results != nullptr) {
-		Type *ret_type = results->variables[0]->type;
+	if (is_odin_like && result_count >= 1 && results != nullptr) {
+		Type *ret_type = results->variables[result_count - 1]->type;
 		fbType ret_ft = fb_data_type(ret_type);
 		if (ret_ft.kind == FBT_VOID) needs_sret = true;
 	}
@@ -934,7 +936,7 @@ gb_internal fbValue fb_addr_load(fbBuilder *b, fbAddr addr) {
 		}
 	}
 
-	GB_PANIC("TODO fb_addr_load kind=%d", addr.kind);
+	GB_PANIC("fb_addr_load: unhandled address kind %d", addr.kind);
 	return fb_value_nil();
 }
 
@@ -1047,7 +1049,7 @@ gb_internal void fb_addr_store(fbBuilder *b, fbAddr addr, fbValue val) {
 		return;
 	}
 
-	GB_PANIC("TODO fb_addr_store kind=%d", addr.kind);
+	GB_PANIC("fb_addr_store: unhandled address kind %d", addr.kind);
 }
 
 // Store a value into a destination pointer. For scalar types, emits a STORE.
@@ -1756,6 +1758,18 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 					return fb_make_global_addr(b, e, *gidx);
 				}
 			}
+
+			// Fallback: build expression and store to a temp local.
+			// Handles procedures, constants, and cross-package entities
+			// accessed through `using` imports.
+			fbValue val = fb_build_expr(b, expr);
+			Type *type = type_of_expr(expr);
+			if (type == nullptr) type = val.type;
+			if (type != nullptr) {
+				fbAddr temp = fb_add_local(b, type, nullptr, false);
+				fb_emit_copy_value(b, temp.base, val, type);
+				return temp;
+			}
 		}
 		GB_PANIC("fb_build_addr Ident: entity not found for '%s'", expr_to_string(expr));
 		break;
@@ -1782,6 +1796,14 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 		fbAddr *found = map_get(&b->variable_map, e);
 		if (found != nullptr) {
 			return *found;
+		}
+
+		// Cross-package references: import names have Addressing_Invalid
+		{
+			TypeAndValue tav = type_and_value_of_expr(se->expr);
+			if (tav.mode == Addressing_Invalid) {
+				return fb_build_addr(b, unparen_expr(se->selector));
+			}
 		}
 
 		if (se->swizzle_count > 0) {
@@ -1823,8 +1845,19 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 				current_type = type_deref(current_type);
 				bt = base_type(current_type);
 			}
+
 			Type *field_type = nullptr;
-			i64 offset = type_offset_of(bt, field_idx, &field_type);
+			i64 offset = 0;
+
+			// Complex/quaternion: fields are sequential elements of the
+			// float component type (not handled by type_offset_of).
+			if (is_type_complex(bt) || is_type_quaternion(bt)) {
+				field_type = base_complex_elem_type(bt);
+				offset = field_idx * type_size_of(field_type);
+			} else {
+				offset = type_offset_of(bt, field_idx, &field_type);
+			}
+
 			if (offset != 0) {
 				base_ptr = fb_emit_member(b, base_ptr, offset);
 			}
@@ -2130,6 +2163,146 @@ gb_internal fbAddr fb_build_addr(fbBuilder *b, Ast *expr) {
 		return temp;
 	}
 
+	case Ast_OrElseExpr:
+	case Ast_OrReturnExpr:
+	case Ast_TypeAssertion:
+	case Ast_TypeCast:
+	case Ast_AutoCast:
+	case Ast_BasicLit:
+	case Ast_TernaryIfExpr:
+	case Ast_TernaryWhenExpr: {
+		// Expression used in address context: build it and store to a temp local.
+		fbValue val = fb_build_expr(b, expr);
+		Type *type = type_of_expr(expr);
+		fbAddr temp = fb_add_local(b, type, nullptr, false);
+		fb_emit_copy_value(b, temp.base, val, type);
+		return temp;
+	}
+
+	case Ast_OrBranchExpr: {
+		ast_node(be, OrBranchExpr, expr);
+
+		// Find target block (break/continue)
+		u32 target_block = 0;
+		i32 target_scope = 0;
+		if (be->label != nullptr) {
+			Entity *label_entity = entity_of_node(be->label);
+			Ast *label_node = (label_entity != nullptr) ? label_entity->Label.node : nullptr;
+			for_array(i, b->branch_regions) {
+				if (b->branch_regions[i].cond == label_node) {
+					switch (be->token.kind) {
+					case Token_or_break:    target_block = b->branch_regions[i].false_block; break;
+					case Token_or_continue: target_block = b->branch_regions[i].true_block;  break;
+					default: break;
+					}
+					break;
+				}
+			}
+			for (fbTargetList *t = b->target_list; t != nullptr; t = t->prev) {
+				if (t->break_block == target_block || t->continue_block == target_block) {
+					target_scope = t->scope_index;
+					break;
+				}
+			}
+		} else {
+			for (fbTargetList *t = b->target_list; t != nullptr; t = t->prev) {
+				if (t->is_block) continue;
+				switch (be->token.kind) {
+				case Token_or_break:    target_block = t->break_block;    break;
+				case Token_or_continue: target_block = t->continue_block; break;
+				default: break;
+				}
+				if (target_block != 0) {
+					target_scope = t->scope_index;
+					break;
+				}
+			}
+		}
+		GB_ASSERT(target_block != 0);
+
+		// Build inner expression and extract value + ok
+		TypeAndValue tv = expr->tav;
+		Type *type = default_type(tv.type);
+
+		fbValue last_val = fb_build_expr(b, be->expr);
+		fbValue value = {};
+		fbValue rhs = {};
+		Type *inner_type = type_of_expr(be->expr);
+		if (inner_type != nullptr && inner_type->kind == Type_Tuple) {
+			fbValue vals[2];
+			fb_unpack_multi_return(b, last_val, vals, 2);
+			value = vals[0];
+			rhs   = vals[1];
+		} else {
+			rhs = last_val;
+		}
+
+		// Check if rhs indicates success
+		fbValue has_value;
+		if (is_type_boolean(rhs.type)) {
+			has_value = fb_emit_conv(b, rhs, t_bool);
+		} else {
+			fbValue zero = fb_emit_iconst(b, rhs.type, 0);
+			has_value = fb_emit_cmp(b, FB_CMP_EQ, rhs, zero);
+		}
+
+		u32 ok_block     = fb_new_block(b);
+		u32 branch_block = fb_new_block(b);
+		fb_emit_branch(b, has_value, ok_block, branch_block);
+
+		// Not ok: emit defers and branch to break/continue target
+		fb_set_block(b, branch_block);
+		fb_emit_defer_stmts(b, fbDeferExit_Branch, target_scope);
+		fb_emit_jump(b, target_block);
+
+		// Ok: continue with the value
+		fb_set_block(b, ok_block);
+		if (value.id != 0 && type != nullptr) {
+			value = fb_emit_conv(b, value, type);
+		}
+
+		fbAddr temp = fb_add_local(b, type, nullptr, false);
+		fb_emit_copy_value(b, temp.base, value, type);
+		return temp;
+	}
+
+	case Ast_MatrixIndexExpr: {
+		ast_node(ie, MatrixIndexExpr, expr);
+		Type *mt = base_type(type_deref(type_of_expr(ie->expr)));
+		bool deref = is_type_pointer(type_of_expr(ie->expr));
+
+		fbAddr base_addr = fb_build_addr(b, ie->expr);
+		fbValue base_ptr = base_addr.base;
+		if (deref) {
+			base_ptr = fb_emit_load(b, base_ptr, type_of_expr(ie->expr));
+		}
+
+		fbValue row = fb_emit_conv(b, fb_build_expr(b, ie->row_index), t_int);
+		fbValue col = fb_emit_conv(b, fb_build_expr(b, ie->column_index), t_int);
+
+		i64 stride_elems = matrix_type_stride_in_elems(mt);
+		Type *elem_type = mt->Matrix.elem;
+		i64 elem_size = type_size_of(elem_type);
+
+		// flat_index = row_major ? col + stride*row : row + stride*col
+		fbValue stride_val = fb_emit_iconst(b, t_int, stride_elems);
+		fbValue flat_index;
+		if (mt->Matrix.is_row_major) {
+			flat_index = fb_emit_arith(b, FB_ADD, col,
+				fb_emit_arith(b, FB_MUL, row, stride_val, t_int), t_int);
+		} else {
+			flat_index = fb_emit_arith(b, FB_ADD, row,
+				fb_emit_arith(b, FB_MUL, col, stride_val, t_int), t_int);
+		}
+
+		fbValue elem_ptr = fb_emit_array_access(b, base_ptr, flat_index, elem_size);
+		fbAddr addr = {};
+		addr.kind = fbAddr_Default;
+		addr.base = elem_ptr;
+		addr.type = elem_type;
+		return addr;
+	}
+
 	default:
 		break;
 	}
@@ -2211,6 +2384,34 @@ gb_internal fbValue fb_emit_conv(fbBuilder *b, fbValue val, Type *dst_type) {
 		fbValue result = temp.base;
 		result.type = dst_type;
 		return result;
+	}
+
+	// ── Untyped nil → zero of destination type ──────────────────
+	if (is_type_untyped_nil(src_type)) {
+		fbType dst_ft = fb_data_type(dst_type);
+		if (dst_ft.kind == FBT_VOID) {
+			fbAddr temp = fb_add_local(b, dst_type, nullptr, true);
+			fbValue result = temp.base;
+			result.type = dst_type;
+			return result;
+		}
+		if (dst_ft.kind == FBT_PTR) {
+			return fb_emit_iconst(b, dst_type, 0);
+		}
+		return fb_emit_iconst(b, dst_type, 0);
+	}
+
+	// ── Untyped uninit → undef of destination type ──────────────
+	if (is_type_untyped_uninit(src_type)) {
+		fbType dst_ft = fb_data_type(dst_type);
+		if (dst_ft.kind == FBT_VOID) {
+			fbAddr temp = fb_add_local(b, dst_type, nullptr, false);
+			fbValue result = temp.base;
+			result.type = dst_type;
+			return result;
+		}
+		u32 r = fb_inst_emit(b->proc, FB_UNDEF, dst_ft, FB_NOREG, FB_NOREG, FB_NOREG, b->current_loc, 0);
+		return fb_make_value(r, dst_type);
 	}
 
 	fbType src_ft = fb_data_type(src_type);
@@ -2592,28 +2793,46 @@ gb_internal fbAddr fb_build_compound_lit(fbBuilder *b, Ast *expr) {
 	}
 
 	case Type_Slice: {
-		// Slice compound literal: []T{a, b, c}
-		// 1. Allocate backing array on stack
-		// 2. Populate elements
-		// 3. Build slice struct {data_ptr, len}
+		// Slice compound literal: []T{a, b, c} or []T{0 = x, 5..=9 = y}
 		Type *elem_type = bt->Slice.elem;
-		i64 elem_count = cl->elems.count;
+		i64 elem_count = gb_max(cl->max_count, cl->elems.count);
 		i64 stride = type_size_of(elem_type);
 		i64 ptr_size = b->module->target.ptr_size;
 
 		Type *backing_type = alloc_type_array(elem_type, elem_count);
 		fbAddr backing = fb_add_local(b, backing_type, nullptr, true);
 
-		for (i64 i = 0; i < elem_count; i++) {
-			Ast *elem_expr = cl->elems[i];
-			if (elem_expr->kind == Ast_FieldValue) {
-				elem_expr = elem_expr->FieldValue.value;
+		for_array(i, cl->elems) {
+			Ast *elem = cl->elems[i];
+			if (elem->kind == Ast_FieldValue) {
+				ast_node(fv, FieldValue, elem);
+				if (is_ast_range(fv->field)) {
+					ast_node(ie, BinaryExpr, fv->field);
+					i64 lo = exact_value_to_i64(ie->left->tav.value);
+					i64 hi = exact_value_to_i64(ie->right->tav.value);
+					if (ie->op.kind != Token_RangeHalf) hi += 1;
+					fbValue val = fb_build_expr(b, fv->value);
+					val = fb_emit_conv(b, val, elem_type);
+					for (i64 k = lo; k < hi; k++) {
+						i64 off = k * stride;
+						fbValue dst = (off == 0) ? backing.base : fb_emit_member(b, backing.base, off);
+						fb_emit_copy_value(b, dst, val, elem_type);
+					}
+				} else {
+					i64 idx = exact_value_to_i64(fv->field->tav.value);
+					fbValue val = fb_build_expr(b, fv->value);
+					val = fb_emit_conv(b, val, elem_type);
+					i64 off = idx * stride;
+					fbValue dst = (off == 0) ? backing.base : fb_emit_member(b, backing.base, off);
+					fb_emit_copy_value(b, dst, val, elem_type);
+				}
+			} else {
+				fbValue val = fb_build_expr(b, elem);
+				val = fb_emit_conv(b, val, elem_type);
+				i64 off = i * stride;
+				fbValue dst = (off == 0) ? backing.base : fb_emit_member(b, backing.base, off);
+				fb_emit_copy_value(b, dst, val, elem_type);
 			}
-			fbValue val = fb_build_expr(b, elem_expr);
-			val = fb_emit_conv(b, val, elem_type);
-			fbValue dst = backing.base;
-			if (i > 0) dst = fb_emit_member(b, backing.base, i * stride);
-			fb_emit_copy_value(b, dst, val, elem_type);
 		}
 
 		// Store data pointer at offset 0
@@ -2705,6 +2924,139 @@ gb_internal fbAddr fb_build_compound_lit(fbBuilder *b, Ast *expr) {
 			fbValue key_ptr = {};
 			fbValue hash = fb_map_key_hash(b, v.base, bt, key, &key_ptr);
 			fb_dynamic_map_set(b, v.base, bt, hash, key_ptr, val_ptr, expr);
+		}
+		break;
+	}
+
+	case Type_Matrix: {
+		Type *elem_type = bt->Matrix.elem;
+		i64 elem_size = type_size_of(elem_type);
+
+		for (i64 i = 0; i < cl->elems.count; i++) {
+			Ast *elem = cl->elems[i];
+			Ast *value_expr = nullptr;
+			i64 elem_index = i;
+
+			if (elem->kind == Ast_FieldValue) {
+				TypeAndValue idx_tav = elem->FieldValue.field->tav;
+				GB_ASSERT(idx_tav.mode == Addressing_Constant);
+				elem_index = exact_value_to_i64(idx_tav.value);
+				value_expr = elem->FieldValue.value;
+			} else {
+				value_expr = elem;
+			}
+
+			fbValue val = fb_build_expr(b, value_expr);
+			val = fb_emit_conv(b, val, elem_type);
+
+			i64 offset = matrix_row_major_index_to_offset(bt, elem_index);
+			i64 byte_off = offset * elem_size;
+			fbValue dst = (byte_off == 0) ? v.base : fb_emit_member(b, v.base, byte_off);
+			fb_emit_copy_value(b, dst, val, elem_type);
+		}
+		break;
+	}
+
+	case Type_DynamicArray: {
+		if (cl->elems.count == 0) break;
+
+		Type *elem_type = bt->DynamicArray.elem;
+		i64 elem_sz = type_size_of(elem_type);
+		i64 elem_al = type_align_of(elem_type);
+		i64 item_count = gb_max(cl->max_count, cl->elems.count);
+
+		String proc_name = {};
+		if (b->entity != nullptr) proc_name = b->entity->token.string;
+		TokenPos pos = ast_token(expr).pos;
+		fbValue loc = fb_build_source_code_location(b, proc_name, pos);
+
+		// Reserve space: __dynamic_array_reserve(array_ptr, elem_size, elem_align, cap, loc)
+		u32 reserve_idx = fb_lookup_runtime_proc(b->module, str_lit("__dynamic_array_reserve"));
+		fbValue reserve_args[5] = {
+			fb_emit_conv(b, v.base, t_rawptr),
+			fb_emit_iconst(b, t_int, elem_sz),
+			fb_emit_iconst(b, t_int, elem_al),
+			fb_emit_iconst(b, t_int, item_count),
+			loc,
+		};
+		fb_emit_call_odin(b, reserve_idx, reserve_args, 5, t_bool);
+
+		// Build temp array of items on the stack.
+		Type *items_type = alloc_type_array(elem_type, item_count);
+		fbAddr items = fb_add_local(b, items_type, nullptr, true);
+		i64 stride = elem_sz;
+
+		for (i64 i = 0; i < cl->elems.count; i++) {
+			Ast *elem = cl->elems[i];
+
+			if (elem->kind == Ast_FieldValue) {
+				ast_node(fv, FieldValue, elem);
+				if (is_ast_range(fv->field)) {
+					// Range field: lo..=hi = value or lo..<hi = value
+					ast_node(ie, BinaryExpr, fv->field);
+					i64 lo = exact_value_to_i64(ie->left->tav.value);
+					i64 hi = exact_value_to_i64(ie->right->tav.value);
+					if (ie->op.kind != Token_RangeHalf) hi += 1;
+					fbValue val = fb_build_expr(b, fv->value);
+					val = fb_emit_conv(b, val, elem_type);
+					for (i64 k = lo; k < hi; k++) {
+						i64 off = k * stride;
+						fbValue dst = (off == 0) ? items.base : fb_emit_member(b, items.base, off);
+						fb_emit_copy_value(b, dst, val, elem_type);
+					}
+				} else {
+					i64 elem_index = exact_value_to_i64(fv->field->tav.value);
+					fbValue val = fb_build_expr(b, fv->value);
+					val = fb_emit_conv(b, val, elem_type);
+					i64 off = elem_index * stride;
+					fbValue dst = (off == 0) ? items.base : fb_emit_member(b, items.base, off);
+					fb_emit_copy_value(b, dst, val, elem_type);
+				}
+			} else {
+				fbValue val = fb_build_expr(b, elem);
+				val = fb_emit_conv(b, val, elem_type);
+				i64 off = i * stride;
+				fbValue dst = (off == 0) ? items.base : fb_emit_member(b, items.base, off);
+				fb_emit_copy_value(b, dst, val, elem_type);
+			}
+		}
+
+		// Append: __dynamic_array_append(array_ptr, elem_size, elem_align, items_ptr, count, loc)
+		u32 append_idx = fb_lookup_runtime_proc(b->module, str_lit("__dynamic_array_append"));
+		fbValue append_args[6] = {
+			fb_emit_conv(b, v.base, t_rawptr),
+			fb_emit_iconst(b, t_int, elem_sz),
+			fb_emit_iconst(b, t_int, elem_al),
+			fb_emit_conv(b, items.base, t_rawptr),
+			fb_emit_iconst(b, t_int, item_count),
+			loc,
+		};
+		fb_emit_call_odin(b, append_idx, append_args, 6, t_int);
+		break;
+	}
+
+	case Type_Basic: {
+		GB_ASSERT(is_type_any(bt));
+		// any type: {data: rawptr, id: typeid}
+		Type *field_types[2] = {t_rawptr, t_typeid};
+		i64 ptr_size = b->module->target.ptr_size;
+
+		for_array(fi, cl->elems) {
+			Ast *elem = cl->elems[fi];
+			isize index = fi;
+			Ast *value_expr = elem;
+
+			if (elem->kind == Ast_FieldValue) {
+				String fname = elem->FieldValue.field->Ident.token.string;
+				if (fname == "id") index = 1;
+				value_expr = elem->FieldValue.value;
+			}
+
+			fbValue val = fb_build_expr(b, value_expr);
+			val = fb_emit_conv(b, val, field_types[index]);
+			i64 off = index * ptr_size;
+			fbValue dst = (off == 0) ? v.base : fb_emit_member(b, v.base, off);
+			fb_emit_store(b, dst, val);
 		}
 		break;
 	}
@@ -3237,8 +3589,13 @@ gb_internal fbValue fb_build_source_code_location(fbBuilder *b, String proc_name
 	i32 column = pos.column;
 
 	switch (build_context.source_code_location_info) {
+	case SourceCodeLocationInfo_Obfuscated:
+		file = obfuscate_string(file, "F");
+		procedure = obfuscate_string(procedure, "P");
+		line = obfuscate_i32(line);
+		column = obfuscate_i32(column);
+		break;
 	case SourceCodeLocationInfo_Normal:
-	case SourceCodeLocationInfo_Obfuscated: // TODO: proper obfuscation
 	case SourceCodeLocationInfo_Filename:
 		break;
 	case SourceCodeLocationInfo_None:
@@ -3427,7 +3784,7 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	// The fast backend IR can't represent multi-register aggregate returns,
 	// so any aggregate return (including small INTEGER×2 structs like Allocator)
 	// must use a hidden output pointer (sret).
-	if (!sret_single && result_count >= 1 && split_count == 0) {
+	if (!sret_single && result_count >= 1) {
 		Type *ret_type = results->variables[result_count - 1]->type;
 		fbType ret_ft = fb_data_type(ret_type);
 		if (ret_ft.kind == FBT_VOID) {
@@ -3471,6 +3828,13 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 			}
 			built_args[i].val  = fb_build_expr(b, ce->args[i]);
 			built_args[i].type = type_of_expr(ce->args[i]);
+			// Resolve untyped arguments (nil, ---, untyped string) to param type
+			// so ABI classification can compute sizes.
+			if (built_args[i].type != nullptr && !is_type_typed(built_args[i].type) &&
+			    e != nullptr && e->kind == Entity_Variable) {
+				built_args[i].val = fb_emit_conv(b, built_args[i].val, e->type);
+				built_args[i].type = e->type;
+			}
 		}
 
 		// Fill default values for any missing parameters
@@ -3631,6 +3995,172 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	// Expose split return temps so the statement-level handler can unpack them
 	b->last_call_split_temps = split_temps;
 	b->last_call_split_count = split_count;
+
+	// Check for deferred procedure on the callee entity
+	{
+		Ast *proc_expr = unparen_expr(ce->proc);
+		Entity *callee_entity = entity_of_node(proc_expr);
+		if (callee_entity != nullptr && entity_has_deferred_procedure(callee_entity)) {
+			DeferredProcedureKind dpk = callee_entity->Procedure.deferred_procedure.kind;
+			Entity *deferred_entity = callee_entity->Procedure.deferred_procedure.entity;
+
+			// Resolve the deferred procedure symbol
+			u32 *didx = map_get(&fb_entity_proc_map, deferred_entity);
+			if (didx == nullptr) {
+				fbProc *dp = fb_proc_create(b->module, deferred_entity);
+				u32 dpi = cast(u32)b->module->procs.count;
+				array_add(&b->module->procs, dp);
+				map_set(&fb_entity_proc_map, deferred_entity, dpi);
+				didx = map_get(&fb_entity_proc_map, deferred_entity);
+			}
+			fbValue deferred_sym = fb_emit_symaddr(b, *didx);
+			deferred_sym.type = deferred_entity->type;
+
+			// Build argument list based on deferred procedure kind
+			fbValue *defer_args = nullptr;
+			i32 defer_arg_count = 0;
+			bool by_ptr = false;
+
+			switch (dpk) {
+			case DeferredProcedure_none:
+				break;
+			case DeferredProcedure_in_by_ptr:
+				by_ptr = true;
+				/*fallthrough*/
+			case DeferredProcedure_in: {
+				// Pass the original input arguments
+				defer_arg_count = cast(i32)ce->args.count;
+				if (defer_arg_count > 0) {
+					defer_args = gb_alloc_array(heap_allocator(), fbValue, defer_arg_count);
+					for (i32 di = 0; di < defer_arg_count; di++) {
+						fbValue arg_val = fb_build_expr(b, ce->args[di]);
+						if (by_ptr) {
+							Type *arg_type = type_of_expr(ce->args[di]);
+							fbAddr temp = fb_add_local(b, arg_type, nullptr, false);
+							fb_emit_copy_value(b, temp.base, arg_val, arg_type);
+							arg_val = temp.base;
+							arg_val.type = alloc_type_pointer(arg_type);
+						}
+						defer_args[di] = arg_val;
+					}
+				}
+				break;
+			}
+			case DeferredProcedure_out_by_ptr:
+				by_ptr = true;
+				/*fallthrough*/
+			case DeferredProcedure_out: {
+				// Pass the result values
+				if (result_count > 1 && split_count > 0) {
+					defer_arg_count = result_count;
+					defer_args = gb_alloc_array(heap_allocator(), fbValue, defer_arg_count);
+					for (i32 di = 0; di < split_count; di++) {
+						fbValue rv = fb_addr_load(b, split_temps[di]);
+						if (by_ptr) {
+							Type *rt = results->variables[di]->type;
+							fbAddr temp = fb_add_local(b, rt, nullptr, false);
+							fb_emit_copy_value(b, temp.base, rv, rt);
+							rv = temp.base;
+							rv.type = alloc_type_pointer(rt);
+						}
+						defer_args[di] = rv;
+					}
+					// Last result from register
+					fbValue rv = last_val;
+					if (by_ptr) {
+						Type *rt = results->variables[result_count - 1]->type;
+						fbAddr temp = fb_add_local(b, rt, nullptr, false);
+						fb_emit_copy_value(b, temp.base, rv, rt);
+						rv = temp.base;
+						rv.type = alloc_type_pointer(rt);
+					}
+					defer_args[result_count - 1] = rv;
+				} else if (result_count == 1) {
+					defer_arg_count = 1;
+					defer_args = gb_alloc_array(heap_allocator(), fbValue, 1);
+					fbValue rv = last_val;
+					if (by_ptr) {
+						Type *rt = results->variables[0]->type;
+						fbAddr temp = fb_add_local(b, rt, nullptr, false);
+						fb_emit_copy_value(b, temp.base, rv, rt);
+						rv = temp.base;
+						rv.type = alloc_type_pointer(rt);
+					}
+					defer_args[0] = rv;
+				}
+				break;
+			}
+			case DeferredProcedure_in_out_by_ptr:
+				by_ptr = true;
+				/*fallthrough*/
+			case DeferredProcedure_in_out: {
+				i32 in_count = cast(i32)ce->args.count;
+				i32 out_count = result_count;
+				defer_arg_count = in_count + out_count;
+				if (defer_arg_count > 0) {
+					defer_args = gb_alloc_array(heap_allocator(), fbValue, defer_arg_count);
+					// Input args
+					for (i32 di = 0; di < in_count; di++) {
+						fbValue arg_val = fb_build_expr(b, ce->args[di]);
+						if (by_ptr) {
+							Type *arg_type = type_of_expr(ce->args[di]);
+							fbAddr temp = fb_add_local(b, arg_type, nullptr, false);
+							fb_emit_copy_value(b, temp.base, arg_val, arg_type);
+							arg_val = temp.base;
+							arg_val.type = alloc_type_pointer(arg_type);
+						}
+						defer_args[di] = arg_val;
+					}
+					// Output results
+					if (out_count > 1 && split_count > 0) {
+						for (i32 di = 0; di < split_count; di++) {
+							fbValue rv = fb_addr_load(b, split_temps[di]);
+							if (by_ptr) {
+								Type *rt = results->variables[di]->type;
+								fbAddr temp = fb_add_local(b, rt, nullptr, false);
+								fb_emit_copy_value(b, temp.base, rv, rt);
+								rv = temp.base;
+								rv.type = alloc_type_pointer(rt);
+							}
+							defer_args[in_count + di] = rv;
+						}
+						fbValue rv = last_val;
+						if (by_ptr) {
+							Type *rt = results->variables[result_count - 1]->type;
+							fbAddr temp = fb_add_local(b, rt, nullptr, false);
+							fb_emit_copy_value(b, temp.base, rv, rt);
+							rv = temp.base;
+							rv.type = alloc_type_pointer(rt);
+						}
+						defer_args[in_count + out_count - 1] = rv;
+					} else if (out_count == 1) {
+						fbValue rv = last_val;
+						if (by_ptr) {
+							Type *rt = results->variables[0]->type;
+							fbAddr temp = fb_add_local(b, rt, nullptr, false);
+							fb_emit_copy_value(b, temp.base, rv, rt);
+							rv = temp.base;
+							rv.type = alloc_type_pointer(rt);
+						}
+						defer_args[in_count] = rv;
+					}
+				}
+				break;
+			}
+			}
+
+			// Push deferred procedure call onto the defer stack
+			fbDefer d = {};
+			d.kind = fbDefer_Proc;
+			d.scope_index = b->scope_index;
+			d.block = b->current_block;
+			d.proc.deferred = deferred_sym;
+			d.proc.args = defer_args;
+			d.proc.arg_count = defer_arg_count;
+			d.proc.pos = callee_entity->token.pos;
+			array_add(&b->defer_stack, d);
+		}
+	}
 
 	return last_val;
 }
@@ -3938,14 +4468,31 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 	case Ast_IndexExpr:
 	case Ast_DerefExpr:
 	case Ast_SliceExpr:
+	case Ast_OrBranchExpr:
+	case Ast_MatrixIndexExpr:
 		return fb_addr_load(b, fb_build_addr(b, expr));
 
 	case Ast_Implicit:
 		return fb_addr_load(b, fb_build_addr(b, expr));
 
 	case Ast_Uninit: {
-		u32 r = fb_inst_emit(b->proc, FB_UNDEF, fb_data_type(type), FB_NOREG, FB_NOREG, FB_NOREG, b->current_loc, 0);
-		return fb_make_value(r, type);
+		Type *t = default_type(type);
+		if (is_type_untyped_uninit(t)) {
+			// Untyped uninit: emit a dummy undef. fb_emit_conv will
+			// produce the correctly-typed undef for the destination.
+			u32 r = fb_inst_emit(b->proc, FB_UNDEF, FB_I64, FB_NOREG, FB_NOREG, FB_NOREG, b->current_loc, 0);
+			return fb_make_value(r, t);
+		}
+		fbType ft = fb_data_type(t);
+		if (ft.kind == FBT_VOID) {
+			// Aggregate uninit: allocate uninitialized local
+			fbAddr temp = fb_add_local(b, t, nullptr, false);
+			fbValue result = temp.base;
+			result.type = t;
+			return result;
+		}
+		u32 r = fb_inst_emit(b->proc, FB_UNDEF, ft, FB_NOREG, FB_NOREG, FB_NOREG, b->current_loc, 0);
+		return fb_make_value(r, t);
 	}
 
 	case Ast_CompoundLit: {
@@ -4198,13 +4745,12 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 		ast_node(ta, TypeAssertion, expr);
 
 		fbValue e = fb_build_expr(b, ta->expr);
-		Type *union_type = e.type;
+		Type *src_raw_type = e.type;
 
-		// Get the union pointer. Aggregates (unions) are passed as pointers
-		// tagged with the aggregate type in the fast backend.
-		fbValue union_ptr = e;
-		union_ptr.type = alloc_type_pointer(union_type);
-		Type *src_type = base_type(union_type);
+		// Aggregates are passed as pointers tagged with the aggregate type.
+		fbValue src_ptr = e;
+		src_ptr.type = alloc_type_pointer(src_raw_type);
+		Type *src_type = base_type(src_raw_type);
 
 		bool is_tuple = is_type_tuple(type);
 		Type *tuple = type;
@@ -4228,24 +4774,46 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 			}
 			if (!do_type_check) {
 				// No check: just load the data and return it.
-				fbValue data_ptr = union_ptr;
-				data_ptr.type = alloc_type_pointer(dst_type);
-				fbType dst_ft = fb_data_type(dst_type);
-				if (dst_ft.kind != FBT_VOID) {
-					return fb_emit_load(b, data_ptr, dst_type);
+				if (is_type_any(src_type)) {
+					// any: data pointer is the first field
+					fbValue data_ptr = fb_emit_load(b, src_ptr, t_rawptr);
+					data_ptr.type = alloc_type_pointer(dst_type);
+					fbType dst_ft = fb_data_type(dst_type);
+					if (dst_ft.kind != FBT_VOID) {
+						return fb_emit_load(b, data_ptr, dst_type);
+					} else {
+						fbValue r = data_ptr;
+						r.type = dst_type;
+						return r;
+					}
 				} else {
-					fbValue r = data_ptr;
-					r.type = dst_type;
-					return r;
+					fbValue data_ptr = src_ptr;
+					data_ptr.type = alloc_type_pointer(dst_type);
+					fbType dst_ft = fb_data_type(dst_type);
+					if (dst_ft.kind != FBT_VOID) {
+						return fb_emit_load(b, data_ptr, dst_type);
+					} else {
+						fbValue r = data_ptr;
+						r.type = dst_type;
+						return r;
+					}
 				}
 			}
 		}
 
-		// Compare tag to determine if the variant matches.
+		// Compare tag/typeid to determine if the variant matches.
 		fbValue cond;
-		if (is_type_union_maybe_pointer(src_type)) {
+		if (is_type_any(src_type)) {
+			// any type: compare typeid field against expected typeid
+			i64 ptr_sz = build_context.ptr_size;
+			fbValue id_ptr = fb_emit_member(b, src_ptr, ptr_sz);
+			fbValue any_id = fb_emit_load(b, id_ptr, t_typeid);
+			u64 expected_id = type_hash_canonical_type(dst_type);
+			fbValue expected = fb_emit_iconst(b, t_typeid, cast(i64)expected_id);
+			cond = fb_emit_cmp(b, FB_CMP_EQ, any_id, expected);
+		} else if (is_type_union_maybe_pointer(src_type)) {
 			// Maybe-pointer union: compare data against nil.
-			fbValue data = fb_emit_load(b, union_ptr, dst_type);
+			fbValue data = fb_emit_load(b, src_ptr, dst_type);
 			fbValue nil_val = fb_emit_iconst(b, t_rawptr, 0);
 			fbValue data_as_ptr = data;
 			data_as_ptr.type = t_rawptr;
@@ -4254,7 +4822,7 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 			type_size_of(src_type); // ensure layout cached
 			i64 tag_offset = src_type->Union.variant_block_size.load(std::memory_order_relaxed);
 			Type *tag_type = union_tag_type(src_type);
-			fbValue tag_ptr = fb_emit_member(b, union_ptr, tag_offset);
+			fbValue tag_ptr = fb_emit_member(b, src_ptr, tag_offset);
 			fbValue src_tag = fb_emit_load(b, tag_ptr, tag_type);
 			fbValue dst_tag = fb_emit_iconst(b, tag_type, union_variant_index(src_type, dst_type));
 			cond = fb_emit_cmp(b, FB_CMP_EQ, src_tag, dst_tag);
@@ -4266,9 +4834,15 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 
 		fb_set_block(b, ok_block);
 		{
-			// Load variant data from the union and store into result tuple[0].
-			fbValue data_ptr = union_ptr;
-			data_ptr.type = alloc_type_pointer(dst_type);
+			fbValue data_ptr;
+			if (is_type_any(src_type)) {
+				// any: data pointer is the first field (rawptr), cast it
+				data_ptr = fb_emit_load(b, src_ptr, t_rawptr);
+				data_ptr.type = alloc_type_pointer(dst_type);
+			} else {
+				data_ptr = src_ptr;
+				data_ptr.type = alloc_type_pointer(dst_type);
+			}
 			fbType dst_ft = fb_data_type(dst_type);
 			if (dst_ft.kind != FBT_VOID) {
 				fbValue data = fb_emit_load(b, data_ptr, dst_type);
@@ -4321,6 +4895,11 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 		return result;
 	}
 
+	case Ast_FieldValue:
+		// Named argument in function call or compound literal context.
+		// The field name is already resolved; just build the value.
+		return fb_build_expr(b, expr->FieldValue.value);
+
 	default:
 		GB_PANIC("TODO fb_build_expr %.*s", LIT(ast_strings[expr->kind]));
 		break;
@@ -4343,8 +4922,71 @@ gb_internal void fb_build_defer_stmt(fbBuilder *b, fbDefer const &d) {
 	if (fb_block_is_terminated(b)) return;
 	if (d.kind == fbDefer_Node) {
 		fb_build_stmt(b, d.stmt);
+	} else if (d.kind == fbDefer_Proc) {
+		// Emit a call to the deferred procedure with captured arguments
+		Type *proc_type = base_type(d.proc.deferred.type);
+		bool is_odin_like = proc_type != nullptr && proc_type->kind == Type_Proc &&
+			is_calling_convention_odin(proc_type->Proc.calling_convention);
+		bool has_context = proc_type != nullptr && proc_type->kind == Type_Proc &&
+			proc_type->Proc.calling_convention == ProcCC_Odin;
+
+		u32 aux_start = b->proc->aux_count;
+
+		// Push captured arguments with ABI decomposition
+		for (i32 i = 0; i < d.proc.arg_count; i++) {
+			fbValue arg = d.proc.args[i];
+			Type *arg_type = arg.type;
+
+			fbABIParamInfo abi = {};
+			if (arg_type != nullptr) {
+				abi = fb_abi_classify_type_sysv(default_type(arg_type));
+			}
+
+			if (abi.num_classes == 2 && abi.classes[0] == FB_ABI_INTEGER && abi.classes[1] == FB_ABI_INTEGER) {
+				i64 ptr_size = b->module->target.ptr_size;
+				fbValue lo = fb_emit_load(b, arg, t_rawptr);
+				fbValue hi_ptr = fb_emit_member(b, arg, ptr_size);
+				fbValue hi = fb_emit_load(b, hi_ptr, t_int);
+				fb_aux_push(b->proc, lo.id);
+				fb_aux_push(b->proc, hi.id);
+			} else if (abi.num_classes == 1 && abi.classes[0] == FB_ABI_INTEGER &&
+			           arg_type != nullptr && fb_data_type(default_type(arg_type)).kind == FBT_VOID) {
+				i64 agg_sz = type_size_of(core_type(default_type(arg_type)));
+				Type *load_type;
+				if (agg_sz <= 1) load_type = t_u8;
+				else if (agg_sz <= 2) load_type = t_u16;
+				else if (agg_sz <= 4) load_type = t_u32;
+				else load_type = t_u64;
+				fbValue val = fb_emit_load(b, arg, load_type);
+				fb_aux_push(b->proc, val.id);
+			} else {
+				fb_aux_push(b->proc, arg.id);
+			}
+		}
+
+		// Context pointer (Odin CC)
+		if (has_context && b->context_stack.count > 0) {
+			fbContextData *ctx = &b->context_stack[b->context_stack.count - 1];
+			fbValue ctx_ptr = fb_addr_load(b, ctx->ctx);
+			fb_aux_push(b->proc, ctx_ptr.id);
+		}
+
+		u32 arg_count = b->proc->aux_count - aux_start;
+		u8 cc_flag = is_odin_like ? FBCC_ODIN : FBCC_C;
+
+		// Set source location for the deferred call
+		if (d.proc.pos.line > 0) {
+			b->current_loc = fb_loc_intern(b->proc,
+				cast(u32)d.proc.pos.file_id, cast(u32)d.proc.pos.line,
+				cast(u16)d.proc.pos.column, FBL_IS_STMT);
+		}
+
+		u32 r = fb_inst_emit(b->proc, FB_CALL, FB_VOID,
+			d.proc.deferred.id, aux_start, arg_count, b->current_loc, 0);
+		(void)r;
+		fbInst *call_inst = &b->proc->insts[b->proc->inst_count - 1];
+		call_inst->flags = cc_flag;
 	}
-	// fbDefer_Proc: deferred procedure calls not yet implemented
 }
 
 // Emit deferred statements according to the exit kind.
@@ -4674,9 +5316,17 @@ gb_internal void fb_build_return_stmt(fbBuilder *b, Slice<Ast *> const &results)
 	fbType last_ft = fb_data_type(last_type);
 	if (last_ft.kind != FBT_VOID) {
 		fb_emit_ret(b, last_val);
+	} else if (b->proc->sret_slot_idx >= 0) {
+		// Aggregate last return via sret: copy through hidden output pointer
+		fbValue sret_ptr = fb_emit_alloca_from_slot(b, cast(u32)b->proc->sret_slot_idx);
+		sret_ptr = fb_emit_load(b, sret_ptr, alloc_type_pointer(last_type));
+		i64 sz = type_size_of(last_type);
+		i64 al = type_align_of(last_type);
+		fbValue sz_val = fb_emit_iconst(b, t_uintptr, sz);
+		fb_emit_memcpy(b, sret_ptr, last_val, sz_val, al);
+		fb_emit_ret_void(b);
 	} else {
-		// Aggregate last return: would need sret (not yet implemented)
-		GB_PANIC("fast backend: aggregate last return value not yet supported (needs sret)");
+		GB_PANIC("fast backend: aggregate last return value with no sret slot");
 	}
 }
 
@@ -5021,6 +5671,11 @@ gb_internal void fb_build_range_indexed(fbBuilder *b, AstRangeStmt *rs,
 		count = fb_emit_load(b, fb_emit_member(b, base_addr.base, build_context.ptr_size), t_int);
 		data_ptr = fb_emit_load(b, base_addr.base, t_rawptr);
 		break;
+	case Type_EnumeratedArray:
+		elem_type = et->EnumeratedArray.elem;
+		stride = type_size_of(elem_type);
+		count = fb_emit_iconst(b, t_int, et->EnumeratedArray.count);
+		break;
 	default:
 		GB_PANIC("fb_build_range_indexed: unsupported type %s", type_to_string(expr_type));
 		return;
@@ -5097,8 +5752,16 @@ gb_internal void fb_build_range_indexed(fbBuilder *b, AstRangeStmt *rs,
 		Entity *e1 = entity_of_node(val1);
 		fbAddr val1_addr = fb_add_local(b, val1_type, e1, false);
 		fbValue idx_val = cur_idx;
+		// EnumeratedArray: offset index by min_value to get enum value
+		if (et->kind == Type_EnumeratedArray) {
+			i64 min_val = exact_value_to_i64(*et->EnumeratedArray.min_value);
+			if (min_val != 0) {
+				idx_val = fb_emit_arith(b, FB_ADD, idx_val,
+					fb_emit_iconst(b, t_int, min_val), t_int);
+			}
+		}
 		if (val1_type != t_int) {
-			idx_val = fb_emit_conv(b, cur_idx, val1_type);
+			idx_val = fb_emit_conv(b, idx_val, val1_type);
 		}
 		fb_addr_store(b, val1_addr, idx_val);
 	}
@@ -5343,6 +6006,214 @@ gb_internal void fb_build_range_string(fbBuilder *b, AstRangeStmt *rs, Scope *sc
 	fb_scope_close(b, fbDeferExit_Default, 0);
 }
 
+// Bit set range: iterates set bits using CTZ + bit clearing
+gb_internal void fb_build_range_bit_set(fbBuilder *b, AstRangeStmt *rs, Scope *scope) {
+	fb_scope_open(b, scope);
+
+	Ast *expr = unparen_expr(rs->expr);
+	Type *expr_type = type_of_expr(expr);
+	Type *et = base_type(type_deref(expr_type));
+	GB_ASSERT(et->kind == Type_BitSet);
+
+	Ast *val0 = rs->vals.count > 0 ? fb_strip_and_prefix(rs->vals[0]) : nullptr;
+	Ast *val1 = rs->vals.count > 1 ? fb_strip_and_prefix(rs->vals[1]) : nullptr;
+	Type *val0_type = nullptr;
+	Type *val1_type = nullptr;
+	if (val0 != nullptr && !is_blank_ident(val0)) {
+		val0_type = type_of_expr(val0);
+	}
+	if (val1 != nullptr && !is_blank_ident(val1)) {
+		val1_type = type_of_expr(val1);
+	}
+
+	Type *mask_type = bit_set_to_int(et);
+	i64 lower = et->BitSet.lower;
+
+	// Load the bit_set value
+	fbValue the_set;
+	if (is_type_pointer(expr_type)) {
+		fbValue ptr = fb_build_expr(b, expr);
+		the_set = fb_emit_load(b, ptr, et);
+	} else {
+		fbAddr addr = fb_build_addr(b, expr);
+		the_set = fb_addr_load(b, addr);
+	}
+	the_set = fb_emit_conv(b, the_set, mask_type);
+
+	// Store remaining mask in a local
+	fbAddr remaining = fb_add_local(b, mask_type, nullptr, false);
+	fb_addr_store(b, remaining, the_set);
+
+	// Index counter for val1
+	fbAddr index_addr = {};
+	if (val1_type != nullptr) {
+		index_addr = fb_add_local(b, val1_type, entity_of_node(val1), false);
+		fb_addr_store(b, index_addr, fb_emit_iconst(b, val1_type, 0));
+	}
+
+	u32 loop_block = fb_new_block(b);
+	u32 body_block = fb_new_block(b);
+	u32 done_block = fb_new_block(b);
+
+	// Register label targets
+	if (rs->label != nullptr) {
+		for_array(i, b->branch_regions) {
+			if (b->branch_regions[i].cond == rs->label) {
+				b->branch_regions[i].false_block = done_block;
+				b->branch_regions[i].true_block  = loop_block;
+				break;
+			}
+		}
+	}
+
+	fb_emit_jump(b, loop_block);
+	fb_set_block(b, loop_block);
+
+	// Check if remaining != 0
+	fbValue mask_val = fb_addr_load(b, remaining);
+	fbValue zero = fb_emit_iconst(b, mask_type, 0);
+	fbValue has_bits = fb_emit_cmp(b, FB_CMP_NE, mask_val, zero);
+	fb_emit_branch(b, has_bits, body_block, done_block);
+
+	fb_set_block(b, body_block);
+
+	// bit_index = ctz(remaining)
+	fbType mask_ft = fb_data_type(mask_type);
+	fbValue bit_index = fb_emit(b, FB_CTZ, mask_ft, mask_val.id, FB_NOREG, FB_NOREG, 0);
+	bit_index.type = mask_type;
+
+	// Clear lowest set bit: remaining &= (remaining - 1)
+	fbValue one = fb_emit_iconst(b, mask_type, 1);
+	fbValue reduced = fb_emit_arith(b, FB_SUB, mask_val, one, mask_type);
+	fbValue new_mask = fb_emit_arith(b, FB_AND, mask_val, reduced, mask_type);
+	fb_addr_store(b, remaining, new_mask);
+
+	// val0 = bit_index + lower (the enum/element value)
+	if (val0_type != nullptr) {
+		Entity *e0 = entity_of_node(val0);
+		fbAddr val0_addr = fb_add_local(b, val0_type, e0, false);
+		fbValue elem_val = bit_index;
+		if (lower != 0) {
+			elem_val = fb_emit_arith(b, FB_ADD, elem_val,
+				fb_emit_iconst(b, mask_type, lower), mask_type);
+		}
+		elem_val = fb_emit_conv(b, elem_val, val0_type);
+		fb_addr_store(b, val0_addr, elem_val);
+	}
+
+	// val1 = iteration index
+	if (val1_type != nullptr) {
+		// Already bound above; increment happens at end of body
+	}
+
+	// Push break/continue targets
+	fbTargetList tl = {};
+	tl.prev = b->target_list;
+	tl.break_block = done_block;
+	tl.continue_block = loop_block;
+	tl.scope_index = b->scope_index;
+	tl.is_block = false;
+	b->target_list = &tl;
+
+	fb_build_stmt(b, rs->body);
+
+	b->target_list = tl.prev;
+
+	// Increment index counter
+	if (val1_type != nullptr) {
+		fbValue idx = fb_addr_load(b, index_addr);
+		fbValue next = fb_emit_arith(b, FB_ADD, idx, fb_emit_iconst(b, val1_type, 1), val1_type);
+		fb_addr_store(b, index_addr, next);
+	}
+
+	if (!fb_block_is_terminated(b)) {
+		fb_emit_jump(b, loop_block);
+	}
+
+	fb_set_block(b, done_block);
+	fb_scope_close(b, fbDeferExit_Default, 0);
+}
+
+// Iterator protocol range: for val in iterator() where iterator returns (T..., bool)
+gb_internal void fb_build_range_tuple(fbBuilder *b, AstRangeStmt *rs, Scope *scope) {
+	Ast *expr = unparen_expr(rs->expr);
+	Type *expr_type = type_of_expr(expr);
+	Type *et = base_type(type_deref(expr_type));
+	GB_ASSERT(et->kind == Type_Tuple);
+
+	i32 value_count = cast(i32)et->Tuple.variables.count;
+
+	fb_scope_open(b, scope);
+
+	u32 loop_block = fb_new_block(b);
+	u32 body_block = fb_new_block(b);
+	u32 done_block = fb_new_block(b);
+
+	// Register label targets.
+	if (rs->label != nullptr) {
+		for_array(i, b->branch_regions) {
+			if (b->branch_regions[i].cond == rs->label) {
+				b->branch_regions[i].false_block = done_block;
+				b->branch_regions[i].true_block  = loop_block;
+				break;
+			}
+		}
+	}
+
+	fb_emit_jump(b, loop_block);
+	fb_set_block(b, loop_block);
+
+	// Call the iterator expression — returns a tuple.
+	fbValue last_val = fb_build_expr(b, expr);
+
+	// Unpack all tuple values.
+	fbValue *values = gb_alloc_array(temporary_allocator(), fbValue, value_count);
+	fb_unpack_multi_return(b, last_val, values, value_count);
+
+	// Last value is the bool condition.
+	i32 cond_index = value_count - 1;
+	fbValue cond = values[cond_index];
+	cond = fb_emit_conv(b, cond, t_bool);
+	fb_emit_branch(b, cond, body_block, done_block);
+
+	fb_set_block(b, body_block);
+
+	// Bind loop variables from the tuple values.
+	GB_ASSERT(rs->vals.count <= value_count);
+	for (isize i = 0; i < rs->vals.count; i++) {
+		Ast *val = rs->vals[i];
+		if (val == nullptr) continue;
+		val = fb_strip_and_prefix(val);
+		if (is_blank_ident(val)) continue;
+
+		Type *val_type = type_of_expr(val);
+		Entity *e = entity_of_node(val);
+		fbAddr addr = fb_add_local(b, val_type, e, false);
+		fbValue v = fb_emit_conv(b, values[i], val_type);
+		fb_addr_store(b, addr, v);
+	}
+
+	// Push break/continue targets.
+	fbTargetList tl = {};
+	tl.prev = b->target_list;
+	tl.break_block = done_block;
+	tl.continue_block = loop_block;
+	tl.scope_index = b->scope_index;
+	tl.is_block = false;
+	b->target_list = &tl;
+
+	fb_build_stmt(b, rs->body);
+
+	b->target_list = tl.prev;
+
+	if (!fb_block_is_terminated(b)) {
+		fb_emit_jump(b, loop_block);
+	}
+
+	fb_set_block(b, done_block);
+	fb_scope_close(b, fbDeferExit_Default, 0);
+}
+
 // Main range statement dispatch.
 gb_internal void fb_build_range_stmt(fbBuilder *b, Ast *node) {
 	ast_node(rs, RangeStmt, node);
@@ -5362,10 +6233,17 @@ gb_internal void fb_build_range_stmt(fbBuilder *b, Ast *node) {
 	case Type_Array:
 	case Type_Slice:
 	case Type_DynamicArray:
+	case Type_EnumeratedArray:
 		fb_build_range_indexed(b, rs, rs->scope);
 		return;
 	case Type_Map:
 		fb_build_range_map(b, rs, rs->scope);
+		return;
+	case Type_BitSet:
+		fb_build_range_bit_set(b, rs, rs->scope);
+		return;
+	case Type_Tuple:
+		fb_build_range_tuple(b, rs, rs->scope);
 		return;
 	case Type_Basic:
 		if (is_type_string(et)) {
@@ -6070,6 +6948,120 @@ gb_internal void fb_build_stmt(fbBuilder *b, Ast *node) {
 		d->scope_index = b->scope_index;
 		d->block = b->current_block;
 		d->stmt = ds->stmt;
+		break;
+	}
+
+	case Ast_UnrollRangeStmt: {
+		ast_node(rs, UnrollRangeStmt, node);
+		Ast *expr = unparen_expr(rs->expr);
+		Ast *val0 = rs->val0;
+		Ast *val1 = rs->val1;
+		Type *val0_type = (val0 != nullptr && !is_blank_ident(val0)) ? type_of_expr(val0) : nullptr;
+		Type *val1_type = (val1 != nullptr && !is_blank_ident(val1)) ? type_of_expr(val1) : nullptr;
+
+		fbAddr val0_addr = {};
+		fbAddr val1_addr = {};
+		if (val0_type) val0_addr = fb_add_local(b, val0_type, entity_of_node(val0), false);
+		if (val1_type) val1_addr = fb_add_local(b, val1_type, entity_of_node(val1), false);
+
+		if (is_ast_range(expr)) {
+			// Constant range unrolling
+			TokenKind op = expr->BinaryExpr.op.kind;
+			Ast *start_expr = expr->BinaryExpr.left;
+			Ast *end_expr   = expr->BinaryExpr.right;
+			GB_ASSERT(start_expr->tav.mode == Addressing_Constant);
+			GB_ASSERT(end_expr->tav.mode == Addressing_Constant);
+
+			ExactValue start = start_expr->tav.value;
+			ExactValue end   = end_expr->tav.value;
+			TokenKind cmp_op = (op == Token_RangeHalf) ? Token_Lt : Token_LtEq;
+			ExactValue idx = exact_value_i64(0);
+			for (ExactValue v = start;
+			     compare_exact_values(cmp_op, v, end);
+			     v = exact_value_increment_one(v), idx = exact_value_increment_one(idx)) {
+				if (val0_type) fb_addr_store(b, val0_addr, fb_const_value(b, val0_type, v));
+				if (val1_type) fb_addr_store(b, val1_addr, fb_const_value(b, val1_type, idx));
+				fb_build_stmt(b, rs->body);
+				if (fb_block_is_terminated(b)) break;
+			}
+		} else {
+			TypeAndValue tav = type_and_value_of_expr(expr);
+
+			if (tav.mode == Addressing_Type) {
+				// Enum type unrolling: #unroll for elem, idx in MyEnum
+				Type *et = type_deref(tav.type);
+				Type *bet = base_type(et);
+				GB_ASSERT(bet->kind == Type_Enum);
+				for_array(i, bet->Enum.fields) {
+					Entity *field = bet->Enum.fields[i];
+					GB_ASSERT(field->kind == Entity_Constant);
+					if (val0_type) fb_addr_store(b, val0_addr, fb_const_value(b, val0_type, field->Constant.value));
+					if (val1_type) fb_addr_store(b, val1_addr, fb_const_value(b, val1_type, exact_value_i64(i)));
+					fb_build_stmt(b, rs->body);
+					if (fb_block_is_terminated(b)) break;
+				}
+			} else {
+				Type *et = base_type(default_type(tav.type));
+
+				if (et->kind == Type_Basic && is_type_string(et)) {
+					// String unrolling: decode runes at compile time
+					GB_ASSERT(tav.mode == Addressing_Constant);
+					ExactValue value = tav.value;
+					GB_ASSERT(value.kind == ExactValue_String);
+					String str = value.value_string;
+					Rune codepoint = 0;
+					isize offset = 0;
+					do {
+						isize width = utf8_decode(str.text + offset, str.len - offset, &codepoint);
+						if (val0_type) fb_addr_store(b, val0_addr, fb_const_value(b, val0_type, exact_value_i64(codepoint)));
+						if (val1_type) fb_addr_store(b, val1_addr, fb_const_value(b, val1_type, exact_value_i64(offset)));
+						fb_build_stmt(b, rs->body);
+						if (fb_block_is_terminated(b)) break;
+						offset += width;
+					} while (offset < str.len);
+				} else {
+					// Array/EnumeratedArray unrolling
+					fbAddr array_addr = fb_build_addr(b, expr);
+					i64 count = 0;
+					Type *elem_type = nullptr;
+					i64 stride = 0;
+					ExactValue min_val = exact_value_i64(0);
+
+					switch (et->kind) {
+					case Type_Array:
+						count = et->Array.count;
+						elem_type = et->Array.elem;
+						stride = type_size_of(elem_type);
+						break;
+					case Type_EnumeratedArray:
+						count = et->EnumeratedArray.count;
+						elem_type = et->EnumeratedArray.elem;
+						stride = type_size_of(elem_type);
+						min_val = *et->EnumeratedArray.min_value;
+						break;
+					default:
+						GB_PANIC("fast backend: #unroll range for %s", type_to_string(tav.type));
+						break;
+					}
+
+					for (i64 i = 0; i < count; i++) {
+						if (val0_type) {
+							fbValue idx_val = fb_emit_iconst(b, t_int, i);
+							fbValue elem_ptr = fb_emit_array_access(b, array_addr.base, idx_val, stride);
+							fbValue elem = fb_emit_load(b, elem_ptr, elem_type);
+							elem = fb_emit_conv(b, elem, val0_type);
+							fb_addr_store(b, val0_addr, elem);
+						}
+						if (val1_type) {
+							ExactValue idx = exact_value_add(exact_value_i64(i), min_val);
+							fb_addr_store(b, val1_addr, fb_const_value(b, val1_type, idx));
+						}
+						fb_build_stmt(b, rs->body);
+						if (fb_block_is_terminated(b)) break;
+					}
+				}
+			}
+		}
 		break;
 	}
 

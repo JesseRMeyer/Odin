@@ -648,8 +648,13 @@ struct fbDefer {
 	i32         scope_index;
 	u32         block;
 	union {
-		Ast    *stmt;
-		Entity *proc_entity;
+		Ast *stmt;                          // fbDefer_Node
+		struct {                            // fbDefer_Proc
+			fbValue   deferred;             // procedure symbol to call
+			fbValue  *args;                 // captured argument values
+			i32       arg_count;            // number of arguments
+			TokenPos  pos;                  // source position for diagnostics
+		} proc;
 	};
 };
 

@@ -3015,22 +3015,11 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				break;
 			}
 
-			// ── Wide arithmetic ──
-			case FB_ADDPAIR: {
-				// ADDPAIR: r = lo+lo2 (with carry into aux hi+hi2)
-				// a=lo, b=lo2, c encodes the hi operands via aux
-				// For now: emit ADD + ADC sequence
-				// TODO: implement when needed by user code
-				GB_PANIC("fast backend: ADDPAIR not yet lowered");
+			// ── Wide arithmetic (never emitted by current builder) ──
+			case FB_ADDPAIR:
+			case FB_MULPAIR:
+				GB_PANIC("fast backend: %s not yet lowered (opcode %d)", fb_op_names[inst->op], inst->op);
 				break;
-			}
-
-			case FB_MULPAIR: {
-				// MULPAIR: 128-bit result in RDX:RAX from MUL
-				// TODO: implement when needed by user code
-				GB_PANIC("fast backend: MULPAIR not yet lowered");
-				break;
-			}
 
 			// ── Bit manipulation ──────────────────────────────
 			case FB_BSWAP: {
@@ -3476,14 +3465,8 @@ gb_internal void fb_lower_proc_x64(fbLowCtx *ctx) {
 				break;
 			}
 
-			case FB_TAILCALL:
-				// TODO: proper tail call with frame teardown
-				// For now, fall through to regular call semantics
-				GB_PANIC("fast backend: TAILCALL not yet lowered");
-				break;
-
-			case FB_VA_START: case FB_PREFETCH: case FB_PHI:
-				GB_PANIC("fast backend: operation not yet lowered (opcode %d)", inst->op);
+			case FB_TAILCALL: case FB_VA_START: case FB_PREFETCH: case FB_PHI:
+				GB_PANIC("fast backend: %s not yet lowered (opcode %d)", fb_op_names[inst->op], inst->op);
 				break;
 
 			default:

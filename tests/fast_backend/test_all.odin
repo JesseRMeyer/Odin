@@ -1721,6 +1721,22 @@ main :: proc() {
 	test_rtti()
 	print_msg("  maps...\n")
 	test_maps()
+	print_msg("  or_branch...\n")
+	test_or_branch()
+	print_msg("  enum_array_range...\n")
+	test_enum_array_range()
+	print_msg("  bit_set_range...\n")
+	test_bit_set_range()
+	print_msg("  matrix_index...\n")
+	test_matrix_index()
+	print_msg("  complex_quat...\n")
+	test_complex_quat()
+	print_msg("  any_assertion...\n")
+	test_any_assertion()
+	print_msg("  unroll_range...\n")
+	test_unroll_range()
+	print_msg("  aggregate_multi_return...\n")
+	test_aggregate_multi_return()
 	print_msg("ALL PASS\n")
 	exit(0)
 }
@@ -1956,4 +1972,201 @@ test_maps :: proc() {
 	check(!aok, 1968)
 	check(av3[0] == 0, 1969)
 	check(av3[1] == 0, 1970)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// or_branch expressions (2000-2019)
+// ═══════════════════════════════════════════════════════════════════════
+
+maybe_val :: proc(x: int) -> (int, bool) {
+	if x > 0 {
+		return x * 10, true
+	}
+	return 0, false
+}
+
+test_or_branch :: proc() {
+	// or_break in a loop
+	total := 0
+	data := [?]int{3, 7, -1, 99}
+	for d in data {
+		v := maybe_val(d) or_break
+		total += v
+	}
+	check(total == 100, 2000) // 30 + 70
+
+	// or_continue in a loop
+	sum := 0
+	data2 := [?]int{5, -2, 8, -3, 1}
+	for d in data2 {
+		v := maybe_val(d) or_continue
+		sum += v
+	}
+	check(sum == 140, 2001) // 50 + 80 + 10
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Enumerated array range (2020-2039)
+// ═══════════════════════════════════════════════════════════════════════
+
+Dir4 :: enum { North, South, East, West }
+
+test_enum_array_range :: proc() {
+	speeds: [Dir4]int
+	speeds[.North] = 10
+	speeds[.South] = 20
+	speeds[.East]  = 30
+	speeds[.West]  = 40
+
+	total := 0
+	count := 0
+	for val, dir in speeds {
+		total += val
+		count += 1
+		// Verify enum values are correct
+		if dir == .North { check(val == 10, 2020) }
+		if dir == .South { check(val == 20, 2021) }
+		if dir == .East  { check(val == 30, 2022) }
+		if dir == .West  { check(val == 40, 2023) }
+	}
+	check(total == 100, 2024)
+	check(count == 4, 2025)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Bit set range (2040-2059)
+// ═══════════════════════════════════════════════════════════════════════
+
+test_bit_set_range :: proc() {
+	s: bit_set[0..<8; u8] = {1, 3, 5, 7}
+	total := 0
+	count := 0
+	for val in s {
+		total += val
+		count += 1
+	}
+	check(total == 16, 2040) // 1 + 3 + 5 + 7
+	check(count == 4, 2041)
+
+	// Enum bit set
+	ds: bit_set[Dir4] = {.North, .East, .West}
+	dcount := 0
+	for d in ds {
+		dcount += 1
+		check(d == .North || d == .East || d == .West, 2042)
+	}
+	check(dcount == 3, 2043)
+
+	// Empty bit set
+	empty: bit_set[0..<8; u8]
+	ecount := 0
+	for _ in empty {
+		ecount += 1
+	}
+	check(ecount == 0, 2044)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Matrix index expressions (2060-2079)
+// ═══════════════════════════════════════════════════════════════════════
+
+test_matrix_index :: proc() {
+	m := matrix[2, 3]int{1, 2, 3, 4, 5, 6}
+	// Row 0: 1, 2, 3
+	// Row 1: 4, 5, 6
+	check(m[0, 0] == 1, 2060)
+	check(m[0, 1] == 2, 2061)
+	check(m[0, 2] == 3, 2062)
+	check(m[1, 0] == 4, 2063)
+	check(m[1, 1] == 5, 2064)
+	check(m[1, 2] == 6, 2065)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Complex and quaternion constructors (2080-2099)
+// ═══════════════════════════════════════════════════════════════════════
+
+test_complex_quat :: proc() {
+	c := complex(3.0, 4.0)
+	check(real(c) == 3.0, 2080)
+	check(imag(c) == 4.0, 2081)
+
+	q := quaternion(w = 1.0, x = 2.0, y = 3.0, z = 4.0)
+	check(q.w == 1.0, 2082)
+	check(q.x == 2.0, 2083)
+	check(q.y == 3.0, 2084)
+	check(q.z == 4.0, 2085)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Any-type assertion (2100-2119)
+// ═══════════════════════════════════════════════════════════════════════
+
+test_any_assertion :: proc() {
+	x: any = 42
+	val, ok := x.(int)
+	check(ok, 2100)
+	check(val == 42, 2101)
+
+	// Wrong type
+	_, ok2 := x.(f64)
+	check(!ok2, 2102)
+
+	// String in any
+	s: any = "hello"
+	sv, sok := s.(string)
+	check(sok, 2103)
+	check(sv == "hello", 2104)
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// #unroll range (2120-2139)
+// ═══════════════════════════════════════════════════════════════════════
+
+test_unroll_range :: proc() {
+	// Constant range unrolling
+	total := 0
+	#unroll for i in 1..=5 {
+		total += i
+	}
+	check(total == 15, 2120) // 1+2+3+4+5
+
+	// Half-open range
+	total2 := 0
+	#unroll for i in 0..<4 {
+		total2 += i
+	}
+	check(total2 == 6, 2121) // 0+1+2+3
+
+	// Array unrolling
+	arr := [4]int{10, 20, 30, 40}
+	sum := 0
+	#unroll for val in arr {
+		sum += val
+	}
+	check(sum == 100, 2122)
+
+	// Array unrolling with index
+	idx_sum := 0
+	#unroll for _, i in arr {
+		idx_sum += i
+	}
+	check(idx_sum == 6, 2123) // 0+1+2+3
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Aggregate multi-return (2140-2159)
+// ═══════════════════════════════════════════════════════════════════════
+
+SmallPair :: struct { a, b: int }
+
+returns_pair_and_error :: proc() -> (int, SmallPair) {
+	return 42, SmallPair{10, 20}
+}
+
+test_aggregate_multi_return :: proc() {
+	code, pair := returns_pair_and_error()
+	check(code == 42, 2140)
+	check(pair.a == 10, 2141)
+	check(pair.b == 20, 2142)
 }
