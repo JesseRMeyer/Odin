@@ -1080,36 +1080,37 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 			return fb_emit_iconst(b, t_rawptr, 0);
 		}
 		Ast *arg = ce->args[0];
-		Type *t = type_of_expr(arg);
-		t = default_type(t);
-		isize index = fb_type_info_index(b->module->info, t, false);
-		if (index < 0) {
-			return fb_emit_iconst(b, t_rawptr, 0);
+		TypeAndValue tav = type_and_value_of_expr(arg);
+
+		if (tav.mode == Addressing_Type) {
+			// Compile-time type: resolve directly via table index
+			Type *t = default_type(type_of_expr(arg));
+			isize index = fb_type_info_index(b->module->info, t, false);
+			if (index < 0) {
+				return fb_emit_iconst(b, t_rawptr, 0);
+			}
+			Entity *tt_entity = scope_lookup_current(b->module->info->runtime_package->scope, str_lit("type_table"));
+			if (tt_entity == nullptr) {
+				return fb_emit_iconst(b, t_rawptr, 0);
+			}
+			u32 *gidx = map_get(&b->module->global_entity_map, tt_entity);
+			if (gidx == nullptr) {
+				return fb_emit_iconst(b, t_rawptr, 0);
+			}
+			fbValue tt_addr = fb_emit_symaddr(b, FB_GLOBAL_SYM_BASE + *gidx);
+			tt_addr.type = t_rawptr;
+			fbValue data_ptr = fb_emit_load(b, tt_addr, t_rawptr);
+			i64 ptr_size = build_context.ptr_size;
+			fbValue elem_ptr = fb_emit_array_access(b, data_ptr, fb_emit_iconst(b, t_int, index), ptr_size);
+			return fb_emit_load(b, elem_ptr, t_rawptr);
 		}
-		// Load from the type_info pointer table: ti_ptrs[index]
-		// Find the __$fb_ti_ptrs global
-		// We use a SYMADDR + LOAD approach: emit address of ti_ptrs + index*8, load
-		// However, at IR build time we don't have the global symbol index.
-		// Instead, use a global variable lookup approach.
-		// The simplest approach: compute address of type_table.data[index]
-		// type_table is a runtime global whose data field points to ti_ptrs
-		Entity *tt_entity = scope_lookup_current(b->module->info->runtime_package->scope, str_lit("type_table"));
-		if (tt_entity == nullptr) {
-			return fb_emit_iconst(b, t_rawptr, 0);
-		}
-		u32 *gidx = map_get(&b->module->global_entity_map, tt_entity);
-		if (gidx == nullptr) {
-			return fb_emit_iconst(b, t_rawptr, 0);
-		}
-		// Load type_table.data (the pointer to the array of ^Type_Info)
-		fbValue tt_addr = fb_emit_symaddr(b, FB_GLOBAL_SYM_BASE + *gidx);
-		tt_addr.type = t_rawptr;
-		fbValue data_ptr = fb_emit_load(b, tt_addr, t_rawptr);
-		// Index into the pointer array
-		i64 ptr_size = build_context.ptr_size;
-		fbValue elem_ptr = fb_emit_array_access(b, data_ptr, fb_emit_iconst(b, t_int, index), ptr_size);
-		// Load the ^Type_Info pointer
-		return fb_emit_load(b, elem_ptr, t_rawptr);
+
+		// Runtime typeid value: call __type_info_of
+		GB_ASSERT(is_type_typeid(tav.type));
+		u32 proc_idx = fb_lookup_runtime_proc(b->module, str_lit("__type_info_of"));
+		fbValue id_val = fb_build_expr(b, arg);
+		fbValue call_args[1] = { id_val };
+		return fb_emit_call_contextless(b, proc_idx, call_args, 1, t_rawptr);
 	}
 
 	case BuiltinProc_typeid_of: {

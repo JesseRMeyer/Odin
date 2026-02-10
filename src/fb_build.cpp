@@ -408,7 +408,11 @@ gb_internal fbValue fb_emit_fconst(fbBuilder *b, Type *type, f64 val) {
 gb_internal fbValue fb_emit_load(fbBuilder *b, fbValue ptr, Type *elem_type) {
 	GB_ASSERT(ptr.id != FB_NOREG);
 	fbType ft = fb_data_type(elem_type);
-	if (ft.kind == FBT_VOID) ft = FB_I64; // aggregate: load as i64
+	if (ft.kind == FBT_VOID) {
+		// Aggregate: return pointer unchanged. In the fast backend IR,
+		// aggregates are always represented as pointers to their data.
+		return {ptr.id, elem_type};
+	}
 	u32 r = fb_inst_emit(b->proc, FB_LOAD, ft, ptr.id, FB_NOREG, FB_NOREG, b->current_loc, 0);
 	return fb_make_value(r, elem_type);
 }
@@ -591,8 +595,19 @@ gb_internal fbValue fb_const_value(fbBuilder *b, Type *type, ExactValue value) {
 		return fb_emit_iconst(b, type, cast(i64)fval);
 	}
 
-	case ExactValue_Pointer:
+	case ExactValue_Pointer: {
+		fbType ft = fb_data_type(type);
+		if (ft.kind == FBT_VOID && value.value_pointer == 0) {
+			// Null pointer to aggregate type (nil slice/string/etc.):
+			// allocate a zero-initialized local so downstream code has
+			// a valid source pointer for memcpy.
+			fbAddr temp = fb_add_local(b, type, nullptr, true);
+			fbValue result = temp.base;
+			result.type = type;
+			return result;
+		}
 		return fb_emit_iconst(b, type, value.value_pointer);
+	}
 
 	case ExactValue_Procedure: {
 		Ast *proc_ast = value.value_procedure;
@@ -3904,16 +3919,174 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	// expressions may contain nested calls which push their own aux entries.
 	TypeTuple *params = nullptr;
 	isize param_count = 0;
-	if (proc_type != nullptr && proc_type->kind == Type_Proc && proc_type->Proc.params != nullptr) {
-		params = &proc_type->Proc.params->Tuple;
-		param_count = params->variables.count;
+	TypeProc *pt = nullptr;
+	if (proc_type != nullptr && proc_type->kind == Type_Proc) {
+		pt = &proc_type->Proc;
+		if (pt->params != nullptr) {
+			params = &pt->params->Tuple;
+			param_count = params->variables.count;
+		}
 	}
 
-	struct fbBuiltArg { fbValue val; Type *type; };
+	bool is_variadic = (pt != nullptr && pt->variadic && !pt->c_vararg);
+	bool vari_expand = (ce->ellipsis.pos.line != 0);
+
+	struct fbBuiltArg { fbValue val; Type *type; bool filled; };
 	isize arg_expr_count = ce->args.count;
 	isize total_arg_count = gb_max(arg_expr_count, param_count);
 	fbBuiltArg *built_args = nullptr;
-	if (total_arg_count > 0) {
+
+	if (is_variadic && ce->split_args != nullptr && param_count > 0) {
+		// ── Variadic call: use split_args for correct positional/named separation ──
+		total_arg_count = param_count;
+		built_args = gb_alloc_array(heap_allocator(), fbBuiltArg, total_arg_count);
+		gb_zero_size(built_args, total_arg_count * gb_size_of(fbBuiltArg));
+
+		Slice<Ast*> positional = ce->split_args->positional;
+
+		// Step 1: Build positional args, with variadic collection at variadic_index
+		for (isize i = 0; i < positional.count && i < param_count; i++) {
+			Entity *e = params->variables[i];
+			if (e->kind == Entity_TypeName) {
+				built_args[i].val  = fb_emit_iconst(b, t_rawptr, 0);
+				built_args[i].type = e->type;
+				built_args[i].filled = true;
+				continue;
+			}
+			if (e->kind == Entity_Constant) {
+				built_args[i].val  = fb_const_value(b, e->type, e->Constant.value);
+				built_args[i].type = e->type;
+				built_args[i].filled = true;
+				continue;
+			}
+
+			if (cast(i32)i == pt->variadic_index) {
+				// Collect remaining positional args into a variadic slice
+				auto var_exprs = slice(positional, pt->variadic_index, positional.count);
+				Type *slice_type = e->type;
+				GB_ASSERT(slice_type->kind == Type_Slice);
+				Type *elem_type = slice_type->Slice.elem;
+
+				if (vari_expand) {
+					// '..' expansion: single arg is already a slice
+					GB_ASSERT(var_exprs.count == 1);
+					fbValue arg = fb_build_expr(b, var_exprs[0]);
+					arg = fb_emit_conv(b, arg, slice_type);
+					built_args[i].val  = arg;
+					built_args[i].type = slice_type;
+				} else if (var_exprs.count == 0) {
+					// No variadic args: nil slice
+					fbAddr nil_slice = fb_add_local(b, slice_type, nullptr, true);
+					nil_slice.base.type = slice_type;
+					built_args[i].val  = nil_slice.base;
+					built_args[i].type = slice_type;
+				} else {
+					// Normal variadic: build each arg, store in backing array, create slice
+					isize var_count = var_exprs.count;
+					fbValue *var_vals = gb_alloc_array(heap_allocator(), fbValue, var_count);
+					for (isize j = 0; j < var_count; j++) {
+						var_vals[j] = fb_build_expr(b, var_exprs[j]);
+					}
+
+					Type *arr_type = alloc_type_array(elem_type, var_count);
+					fbAddr arr_addr = fb_add_local(b, arr_type, nullptr, true);
+					i64 elem_size = type_size_of(elem_type);
+
+					for (isize j = 0; j < var_count; j++) {
+						fbValue conv = fb_emit_conv(b, var_vals[j], elem_type);
+						fbValue dst = arr_addr.base;
+						if (j > 0) {
+							dst = fb_emit_member(b, arr_addr.base, j * elem_size);
+						}
+						fb_emit_copy_value(b, dst, conv, elem_type);
+					}
+
+					// Build slice struct: {data: rawptr, len: int}
+					fbAddr slice_addr = fb_add_local(b, slice_type, nullptr, true);
+					i64 ptr_size = b->module->target.ptr_size;
+
+					fbValue arr_ptr = arr_addr.base;
+					arr_ptr.type = t_rawptr;
+					fb_emit_store(b, fb_emit_member(b, slice_addr.base, 0), arr_ptr);
+					fb_emit_store(b, fb_emit_member(b, slice_addr.base, ptr_size),
+						fb_emit_iconst(b, t_int, var_count));
+
+					slice_addr.base.type = slice_type;
+					built_args[i].val  = slice_addr.base;
+					built_args[i].type = slice_type;
+
+					gb_free(heap_allocator(), var_vals);
+				}
+				built_args[i].filled = true;
+				break; // Remaining positional args consumed by variadic
+			}
+
+			// Normal positional arg
+			built_args[i].val  = fb_build_expr(b, positional[i]);
+			built_args[i].type = type_of_expr(positional[i]);
+			built_args[i].filled = true;
+			if (built_args[i].type != nullptr && !is_type_typed(built_args[i].type) &&
+			    e->kind == Entity_Variable) {
+				built_args[i].val = fb_emit_conv(b, built_args[i].val, e->type);
+				built_args[i].type = e->type;
+			}
+		}
+
+		// Step 2: Handle named arguments
+		for_array(ni, ce->split_args->named) {
+			Ast *arg = ce->split_args->named[ni];
+			ast_node(fv, FieldValue, arg);
+			GB_ASSERT(fv->field->kind == Ast_Ident);
+			String name = fv->field->Ident.token.string;
+			isize param_index = lookup_procedure_parameter(pt, name);
+			if (param_index < 0 || param_index >= param_count) continue;
+
+			Entity *e = params->variables[param_index];
+			if (e->kind == Entity_TypeName) {
+				built_args[param_index].val  = fb_emit_iconst(b, t_rawptr, 0);
+				built_args[param_index].type = e->type;
+			} else if (e->kind == Entity_Constant) {
+				built_args[param_index].val  = fb_const_value(b, e->type, e->Constant.value);
+				built_args[param_index].type = e->type;
+			} else {
+				built_args[param_index].val  = fb_build_expr(b, fv->value);
+				built_args[param_index].type = type_of_expr(fv->value);
+			}
+			built_args[param_index].filled = true;
+		}
+
+		// Step 3: Fill defaults for any unfilled parameters
+		for (isize i = 0; i < param_count; i++) {
+			if (built_args[i].filled) continue;
+			Entity *e = params->variables[i];
+
+			if (is_variadic && cast(i32)i == pt->variadic_index) {
+				// Unfilled variadic param: nil slice
+				Type *slice_type = e->type;
+				fbAddr nil_slice = fb_add_local(b, slice_type, nullptr, true);
+				nil_slice.base.type = slice_type;
+				built_args[i].val  = nil_slice.base;
+				built_args[i].type = slice_type;
+			} else if (e->kind == Entity_Variable && has_parameter_value(e->Variable.param_value)) {
+				built_args[i].val  = fb_handle_param_value(b, e->type, e->Variable.param_value, expr);
+				built_args[i].type = e->type;
+			} else if (e->kind == Entity_Constant) {
+				built_args[i].val  = fb_const_value(b, e->type, e->Constant.value);
+				built_args[i].type = e->type;
+			} else if (e->kind == Entity_TypeName) {
+				built_args[i].val  = fb_emit_iconst(b, t_rawptr, 0);
+				built_args[i].type = e->type;
+			} else {
+				fbAddr nil_val = fb_add_local(b, e->type, nullptr, true);
+				nil_val.base.type = e->type;
+				built_args[i].val  = nil_val.base;
+				built_args[i].type = e->type;
+			}
+			built_args[i].filled = true;
+		}
+
+	} else if (total_arg_count > 0) {
+		// ── Non-variadic call: use original ce->args-based approach ──
 		built_args = gb_alloc_array(heap_allocator(), fbBuiltArg, total_arg_count);
 
 		// Build explicit positional arguments.
@@ -3965,7 +4138,7 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 			}
 		}
 	}
-	arg_expr_count = total_arg_count;
+	arg_expr_count = is_variadic ? param_count : total_arg_count;
 
 	// Phase 2: Push arguments into aux pool. No nested calls occur here,
 	// so aux_start accurately marks the beginning of this call's args.
@@ -4380,9 +4553,17 @@ gb_internal fbValue fb_build_expr(fbBuilder *b, Ast *expr) {
 		GB_ASSERT_MSG(e != nullptr, "%s in %.*s", expr_to_string(expr), LIT(b->entity->token.string));
 
 		if (e->kind == Entity_Nil) {
-			// Nil may have untyped nil type — use rawptr as a safe
-			// pointer-sized zero regardless.
 			Type *nil_type = (type != nullptr && is_type_typed(type)) ? type : t_rawptr;
+			fbType ft = fb_data_type(nil_type);
+			if (ft.kind == FBT_VOID) {
+				// Aggregate nil: allocate a zero-initialized local so that
+				// downstream code (fb_emit_copy_value) has a valid source
+				// pointer for memcpy rather than a scalar 0.
+				fbAddr temp = fb_add_local(b, nil_type, nullptr, true);
+				fbValue result = temp.base;
+				result.type = nil_type;
+				return result;
+			}
 			return fb_emit_iconst(b, nil_type, 0);
 		}
 
@@ -5425,9 +5606,11 @@ gb_internal void fb_build_return_stmt(fbBuilder *b, Slice<Ast *> const &results)
 		fbType ret_ft = fb_data_type(ret_type);
 
 		// Convert value to the expected return type.
-		// Skip conversion for aggregates (FBT_VOID) — val is already a
-		// pointer to the data and fb_emit_conv can't handle that.
-		if (ret_ft.kind != FBT_VOID) {
+		// Skip only when both val and ret are aggregates (val is already
+		// a pointer to data). When val is a scalar but ret is aggregate
+		// (e.g. nil literal), conversion materializes a zero-init local.
+		fbType val_ft = fb_data_type(val.type);
+		if (!(ret_ft.kind == FBT_VOID && val_ft.kind == FBT_VOID)) {
 			val = fb_emit_conv(b, val, ret_type);
 		}
 
