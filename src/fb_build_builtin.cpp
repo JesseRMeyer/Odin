@@ -767,6 +767,21 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 
 	// ── Overflow arithmetic ─────────────────────────────────────
 
+	// Pack (result, bool) into a two-field tuple local and return the base pointer.
+	#define FB_PACK_RESULT_BOOL(b, tuple_type, result, flag) \
+		([&]() -> fbValue { \
+			fbAddr res_ = fb_add_local((b), (tuple_type), nullptr, false); \
+			i64 off0_ = type_offset_of((tuple_type), 0); \
+			i64 off1_ = type_offset_of((tuple_type), 1); \
+			fbValue ptr0_ = res_.base; \
+			if (off0_ != 0) ptr0_ = fb_emit_member((b), res_.base, off0_); \
+			fb_emit_store((b), ptr0_, (result)); \
+			fb_emit_store((b), fb_emit_member((b), res_.base, off1_), (flag)); \
+			fbValue ret_ = res_.base; \
+			ret_.type = (tuple_type); \
+			return ret_; \
+		}())
+
 	case BuiltinProc_overflow_add: {
 		Type *main_type = tv.type;
 		Type *elem_type = main_type;
@@ -800,21 +815,7 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 			overflow = fb_emit_cmp(b, FB_CMP_SLT, sign, zero);
 		}
 
-		// Pack into aggregate tuple (same pattern as type assertions)
-		fbAddr res = fb_add_local(b, main_type, nullptr, false);
-		i64 off0 = type_offset_of(main_type, 0);
-		i64 off1 = type_offset_of(main_type, 1);
-
-		fbValue ptr0 = res.base;
-		if (off0 != 0) ptr0 = fb_emit_member(b, res.base, off0);
-		fb_emit_store(b, ptr0, result);
-
-		fbValue ptr1 = fb_emit_member(b, res.base, off1);
-		fb_emit_store(b, ptr1, overflow);
-
-		fbValue ret = res.base;
-		ret.type = main_type;
-		return ret;
+		return FB_PACK_RESULT_BOOL(b, main_type, result, overflow);
 	}
 
 	case BuiltinProc_overflow_sub: {
@@ -848,20 +849,7 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 			overflow = fb_emit_cmp(b, FB_CMP_SLT, sign, zero);
 		}
 
-		fbAddr res = fb_add_local(b, main_type, nullptr, false);
-		i64 off0 = type_offset_of(main_type, 0);
-		i64 off1 = type_offset_of(main_type, 1);
-
-		fbValue ptr0 = res.base;
-		if (off0 != 0) ptr0 = fb_emit_member(b, res.base, off0);
-		fb_emit_store(b, ptr0, result);
-
-		fbValue ptr1 = fb_emit_member(b, res.base, off1);
-		fb_emit_store(b, ptr1, overflow);
-
-		fbValue ret = res.base;
-		ret.type = main_type;
-		return ret;
+		return FB_PACK_RESULT_BOOL(b, main_type, result, overflow);
 	}
 
 	case BuiltinProc_overflow_mul: {
@@ -896,21 +884,10 @@ gb_internal fbValue fb_build_builtin_proc(fbBuilder *b, Ast *expr, TypeAndValue 
 		fbValue false_val = fb_emit_iconst(b, t_bool, 0);
 		fbValue overflow = fb_emit_select(b, y_nonzero, mismatch, false_val, t_bool);
 
-		fbAddr res = fb_add_local(b, main_type, nullptr, false);
-		i64 off0 = type_offset_of(main_type, 0);
-		i64 off1 = type_offset_of(main_type, 1);
-
-		fbValue ptr0 = res.base;
-		if (off0 != 0) ptr0 = fb_emit_member(b, res.base, off0);
-		fb_emit_store(b, ptr0, result);
-
-		fbValue ptr1 = fb_emit_member(b, res.base, off1);
-		fb_emit_store(b, ptr1, overflow);
-
-		fbValue ret = res.base;
-		ret.type = main_type;
-		return ret;
+		return FB_PACK_RESULT_BOOL(b, main_type, result, overflow);
 	}
+
+	#undef FB_PACK_RESULT_BOOL
 
 	// ── Math builtins ───────────────────────────────────────────
 

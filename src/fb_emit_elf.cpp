@@ -496,6 +496,25 @@ gb_internal String fb_emit_elf(fbModule *m) {
 	u64 shstrtab_offset = strtab_offset + strtab_size;
 	u64 shstrtab_size   = shstrtab.count;
 
+	// Map abstract symbol index → ELF symbol index.
+	// Ranges: [0, FB_RODATA_SYM_BASE) = procs,
+	//         [FB_RODATA_SYM_BASE, FB_GLOBAL_SYM_BASE) = rodata,
+	//         [FB_GLOBAL_SYM_BASE, ...) = globals.
+	auto fb_resolve_elf_sym = [&](u32 abstract_sym) -> u32 {
+		if (abstract_sym >= FB_GLOBAL_SYM_BASE) {
+			u32 gidx = abstract_sym - FB_GLOBAL_SYM_BASE;
+			FB_VERIFY(gidx < global_count);
+			return global_sym_elf_idx[gidx];
+		} else if (abstract_sym >= FB_RODATA_SYM_BASE) {
+			u32 ridx = abstract_sym - FB_RODATA_SYM_BASE;
+			FB_VERIFY(ridx < rodata_count);
+			return rodata_elf_idx[ridx];
+		} else {
+			FB_VERIFY(abstract_sym < proc_count);
+			return proc_elf_idx[abstract_sym];
+		}
+	};
+
 	// 6. Build .rela.text
 	fbBuf rela_buf = {};
 	fb_buf_init(&rela_buf, 256);
@@ -507,24 +526,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 			Elf64_Rela rela = {};
 			rela.r_offset = proc_text_offsets[pi] + rel->code_offset;
 			Elf64_Word elf_type = (rel->reloc_type == FB_RELOC_PLT32) ? R_X86_64_PLT32 : R_X86_64_PC32;
-			// Map abstract symbol index to ELF symbol index.
-			// Ranges: [0, FB_RODATA_SYM_BASE) = procs,
-			//         [FB_RODATA_SYM_BASE, FB_GLOBAL_SYM_BASE) = rodata,
-			//         [FB_GLOBAL_SYM_BASE, ...) = globals.
-			u32 elf_sym;
-			if (rel->target_sym >= FB_GLOBAL_SYM_BASE) {
-				u32 gidx = rel->target_sym - FB_GLOBAL_SYM_BASE;
-				FB_VERIFY(gidx < global_count);
-				elf_sym = global_sym_elf_idx[gidx];
-			} else if (rel->target_sym >= FB_RODATA_SYM_BASE) {
-				u32 ridx = rel->target_sym - FB_RODATA_SYM_BASE;
-				FB_VERIFY(ridx < rodata_count);
-				elf_sym = rodata_elf_idx[ridx];
-			} else {
-				FB_VERIFY(rel->target_sym < proc_count);
-				elf_sym = proc_elf_idx[rel->target_sym];
-			}
-			rela.r_info   = ELF64_R_INFO(elf_sym, elf_type);
+			rela.r_info   = ELF64_R_INFO(fb_resolve_elf_sym(rel->target_sym), elf_type);
 			rela.r_addend = rel->addend;
 			fb_buf_append(&rela_buf, &rela, sizeof(Elf64_Rela));
 		}
@@ -548,20 +550,7 @@ gb_internal String fb_emit_elf(fbModule *m) {
 		Elf64_Rela rela = {};
 		rela.r_offset = global_data_offsets[dr->global_idx] + dr->local_offset;
 
-		u32 elf_sym;
-		if (dr->target_sym >= FB_GLOBAL_SYM_BASE) {
-			u32 gidx = dr->target_sym - FB_GLOBAL_SYM_BASE;
-			FB_VERIFY(gidx < global_count);
-			elf_sym = global_sym_elf_idx[gidx];
-		} else if (dr->target_sym >= FB_RODATA_SYM_BASE) {
-			u32 ridx = dr->target_sym - FB_RODATA_SYM_BASE;
-			FB_VERIFY(ridx < rodata_count);
-			elf_sym = rodata_elf_idx[ridx];
-		} else {
-			FB_VERIFY(dr->target_sym < proc_count);
-			elf_sym = proc_elf_idx[dr->target_sym];
-		}
-		rela.r_info   = ELF64_R_INFO(elf_sym, R_X86_64_64);
+		rela.r_info   = ELF64_R_INFO(fb_resolve_elf_sym(dr->target_sym), R_X86_64_64);
 		rela.r_addend = dr->addend;
 		fb_buf_append(&reladata_buf, &rela, sizeof(Elf64_Rela));
 	}

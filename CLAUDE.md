@@ -261,7 +261,7 @@ Misc:        FB_VA_START FB_PREFETCH FB_CYCLE FB_ASM
 ### fbProc, fbBlock, fbValue, fbAddr
 ```cpp
 struct fbBlock { u32 first_inst; u32 inst_count; };
-struct fbStackSlot { u32 size, align; i32 frame_offset; Entity *entity; Type *odin_type; };
+struct fbStackSlot { u32 size, align; i32 frame_offset; Entity *entity; Type *odin_type; bool is_indirect; };
 struct fbProc {
     Entity *entity; Type *odin_type; String name;
     fbInst *insts;      u32 inst_count, inst_cap;    // contiguous instruction array
@@ -274,6 +274,7 @@ struct fbProc {
     i32 split_returns_index, split_returns_count;      // Odin CC multi-return
     fbXmmParamLoc *xmm_param_locs; u32 xmm_param_count; // ABI XMM param layout (C calls)
     fbStackParamLoc *stack_param_locs; u32 stack_param_count; // ABI stack overflow params
+    fbParamEntityLoc *param_entity_locs; u32 param_entity_count; // Entity→slot lookup
     fbReloc *relocs;    u32 reloc_count, reloc_cap;
     u8 *machine_code;   u32 machine_code_size;         // lowering output
     bool is_foreign, is_export;

@@ -3546,7 +3546,11 @@ gb_internal void fb_lower_all(fbModule *m) {
 		} else {
 			// Recovery: lowering failed. Emit a minimal stub (just ret).
 			stub_count++;
-			ctx.code_count = 0;
+			// Free partially-filled buffers from the failed attempt
+			if (ctx.code)   gb_free(heap_allocator(), ctx.code);
+			if (ctx.relocs) gb_free(heap_allocator(), ctx.relocs);
+			ctx.relocs = nullptr;
+			ctx.reloc_count = 0;
 			// Emit a minimal function: push rbp; mov rbp, rsp; pop rbp; ret
 			u8 stub_code[] = {
 				0x55,                   // push rbp
@@ -3557,30 +3561,19 @@ gb_internal void fb_lower_all(fbModule *m) {
 			ctx.code_count = sizeof(stub_code);
 			ctx.code = gb_alloc_array(heap_allocator(), u8, ctx.code_count);
 			gb_memmove(ctx.code, stub_code, ctx.code_count);
-			// Clear relocations since they may be stale
-			ctx.reloc_count = 0;
 		}
 
+		// Transfer ownership of machine code and relocations (zero-copy)
 		p->machine_code_size = ctx.code_count;
-		if (ctx.code_count > 0) {
-			p->machine_code = gb_alloc_array(heap_allocator(), u8, ctx.code_count);
-			gb_memmove(p->machine_code, ctx.code, ctx.code_count);
-		}
+		p->machine_code      = ctx.code;        ctx.code = nullptr;
+		p->reloc_count       = ctx.reloc_count;
+		p->reloc_cap         = ctx.reloc_count;
+		p->relocs            = ctx.relocs;       ctx.relocs = nullptr;
 
-		// Copy relocations from lowering context to proc
-		p->reloc_count = ctx.reloc_count;
-		p->reloc_cap   = ctx.reloc_count;
-		if (ctx.reloc_count > 0) {
-			p->relocs = gb_alloc_array(heap_allocator(), fbReloc, ctx.reloc_count);
-			gb_memmove(p->relocs, ctx.relocs, sizeof(fbReloc) * ctx.reloc_count);
-		}
-
-		if (ctx.code)           gb_free(heap_allocator(), ctx.code);
 		if (ctx.block_offsets)  gb_free(heap_allocator(), ctx.block_offsets);
 		if (ctx.value_loc)      gb_free(heap_allocator(), ctx.value_loc);
 		if (ctx.value_sym)      gb_free(heap_allocator(), ctx.value_sym);
 		if (ctx.fixups)         gb_free(heap_allocator(), ctx.fixups);
-		if (ctx.relocs)         gb_free(heap_allocator(), ctx.relocs);
 	}
 
 	sigaction(SIGILL, &sa_old_ill, nullptr);

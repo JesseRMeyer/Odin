@@ -93,6 +93,10 @@ gb_internal void fb_setup_params(fbProc *p) {
 	u32 max_stack_params = cast(u32)(param_count * 2 + split_count + 1);
 	auto *stack_locs = gb_alloc_array(heap_allocator(), fbProc::fbStackParamLoc, max_stack_params);
 
+	// Entity → slot_idx lookup (one entry per declared parameter with an entity)
+	auto *entity_locs = gb_alloc_array(heap_allocator(), fbProc::fbParamEntityLoc, param_count);
+	u32 entity_loc_count = 0;
+
 	u32 gp_idx = 0;
 	u32 xmm_idx = 0;
 	u32 stack_idx = 0;
@@ -111,26 +115,30 @@ gb_internal void fb_setup_params(fbProc *p) {
 			continue;
 		}
 
-		if (abi.classes[0] == FB_ABI_MEMORY) {
+		bool is_memory = (abi.classes[0] == FB_ABI_MEMORY);
+		u32 entity_slot = 0; // will be set to the slot for this entity
+
+		if (is_memory) {
 			// MEMORY class: pass as a hidden pointer in a GP register.
 			// The caller copies the value to a temp and passes the temp's address.
 			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) {
 				u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+				p->slots[slot].is_indirect = true;
 				stack_locs[stack_idx].slot_idx       = slot;
 				stack_locs[stack_idx].sub_offset      = 0;
 				stack_locs[stack_idx].caller_offset   = stack_offset;
 				stack_idx++;
 				stack_offset += 8;
-				continue;
+				entity_slot = slot;
+			} else {
+				u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+				p->slots[slot].is_indirect = true;
+				locs[gp_idx].slot_idx   = slot;
+				locs[gp_idx].sub_offset = 0;
+				gp_idx++;
+				entity_slot = slot;
 			}
-			u32 slot = fb_slot_create(p, 8, 8, e, param_type);
-			locs[gp_idx].slot_idx   = slot;
-			locs[gp_idx].sub_offset = 0;
-			gp_idx++;
-			continue;
-		}
-
-		if (abi.classes[0] == FB_ABI_SSE) {
+		} else if (abi.classes[0] == FB_ABI_SSE) {
 			if (!is_odin_like && xmm_idx < 8) {
 				// Non-Odin CC (C/foreign): SSE params arrive in XMM0-7.
 				// Create a stack slot and record XMM param location so
@@ -141,6 +149,7 @@ gb_internal void fb_setup_params(fbProc *p) {
 				xmm_locs[xmm_idx].xmm_idx     = cast(u8)xmm_idx;
 				xmm_locs[xmm_idx].float_kind   = ft.kind;
 				xmm_idx++;
+				entity_slot = slot;
 			} else {
 				// Odin CC: route SSE through GP registers (internal convention)
 				if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) {
@@ -150,63 +159,72 @@ gb_internal void fb_setup_params(fbProc *p) {
 					stack_locs[stack_idx].caller_offset   = stack_offset;
 					stack_idx++;
 					stack_offset += 8;
+					entity_slot = slot;
 				} else {
 					u32 slot = fb_slot_create(p, 8, 8, e, param_type);
 					locs[gp_idx].slot_idx   = slot;
 					locs[gp_idx].sub_offset = 0;
 					gp_idx++;
+					entity_slot = slot;
 				}
 			}
-			continue;
+		} else {
+			// INTEGER class: each eightbyte consumes one GP register.
+			// Two-eightbyte params (string, slice) get a single 16-byte slot;
+			// single-eightbyte params get an 8-byte slot.
+			if (abi.num_classes == 2 && abi.classes[0] == FB_ABI_INTEGER && abi.classes[1] == FB_ABI_INTEGER) {
+				// The caller decomposes each eightbyte into a separate aux entry
+				// and assigns them independently to registers or stack. Match that:
+				// each eightbyte that doesn't fit in a register goes on the stack.
+				u32 slot = fb_slot_create(p, 16, 8, e, param_type);
+				// First eightbyte
+				if (gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
+					locs[gp_idx].slot_idx   = slot;
+					locs[gp_idx].sub_offset = 0;
+					gp_idx++;
+				} else {
+					stack_locs[stack_idx].slot_idx       = slot;
+					stack_locs[stack_idx].sub_offset      = 0;
+					stack_locs[stack_idx].caller_offset   = stack_offset;
+					stack_idx++;
+					stack_offset += 8;
+				}
+				// Second eightbyte
+				if (gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
+					locs[gp_idx].slot_idx   = slot;
+					locs[gp_idx].sub_offset = 8;
+					gp_idx++;
+				} else {
+					stack_locs[stack_idx].slot_idx       = slot;
+					stack_locs[stack_idx].sub_offset      = 8;
+					stack_locs[stack_idx].caller_offset   = stack_offset;
+					stack_idx++;
+					stack_offset += 8;
+				}
+				entity_slot = slot;
+			} else {
+				if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) {
+					u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+					stack_locs[stack_idx].slot_idx       = slot;
+					stack_locs[stack_idx].sub_offset      = 0;
+					stack_locs[stack_idx].caller_offset   = stack_offset;
+					stack_idx++;
+					stack_offset += 8;
+					entity_slot = slot;
+				} else {
+					u32 slot = fb_slot_create(p, 8, 8, e, param_type);
+					locs[gp_idx].slot_idx   = slot;
+					locs[gp_idx].sub_offset = 0;
+					gp_idx++;
+					entity_slot = slot;
+				}
+			}
 		}
 
-		// INTEGER class: each eightbyte consumes one GP register.
-		// Two-eightbyte params (string, slice) get a single 16-byte slot;
-		// single-eightbyte params get an 8-byte slot.
-		if (abi.num_classes == 2 && abi.classes[0] == FB_ABI_INTEGER && abi.classes[1] == FB_ABI_INTEGER) {
-			// The caller decomposes each eightbyte into a separate aux entry
-			// and assigns them independently to registers or stack. Match that:
-			// each eightbyte that doesn't fit in a register goes on the stack.
-			u32 slot = fb_slot_create(p, 16, 8, e, param_type);
-			// First eightbyte
-			if (gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
-				locs[gp_idx].slot_idx   = slot;
-				locs[gp_idx].sub_offset = 0;
-				gp_idx++;
-			} else {
-				stack_locs[stack_idx].slot_idx       = slot;
-				stack_locs[stack_idx].sub_offset      = 0;
-				stack_locs[stack_idx].caller_offset   = stack_offset;
-				stack_idx++;
-				stack_offset += 8;
-			}
-			// Second eightbyte
-			if (gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
-				locs[gp_idx].slot_idx   = slot;
-				locs[gp_idx].sub_offset = 8;
-				gp_idx++;
-			} else {
-				stack_locs[stack_idx].slot_idx       = slot;
-				stack_locs[stack_idx].sub_offset      = 8;
-				stack_locs[stack_idx].caller_offset   = stack_offset;
-				stack_idx++;
-				stack_offset += 8;
-			}
-		} else {
-			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) {
-				u32 slot = fb_slot_create(p, 8, 8, e, param_type);
-				stack_locs[stack_idx].slot_idx       = slot;
-				stack_locs[stack_idx].sub_offset      = 0;
-				stack_locs[stack_idx].caller_offset   = stack_offset;
-				stack_idx++;
-				stack_offset += 8;
-			} else {
-				u32 slot = fb_slot_create(p, 8, 8, e, param_type);
-				locs[gp_idx].slot_idx   = slot;
-				locs[gp_idx].sub_offset = 0;
-				gp_idx++;
-			}
-		}
+		// Record entity → slot mapping for fast lookup during parameter binding
+		entity_locs[entity_loc_count].entity   = e;
+		entity_locs[entity_loc_count].slot_idx = entity_slot;
+		entity_loc_count++;
 	}
 
 	// Odin CC multi-return: hidden output pointer params for values 0..N-2.
@@ -290,6 +308,13 @@ gb_internal void fb_setup_params(fbProc *p) {
 		p->stack_param_count = stack_idx;
 	} else {
 		gb_free(heap_allocator(), stack_locs);
+	}
+
+	if (entity_loc_count > 0) {
+		p->param_entity_locs  = entity_locs;
+		p->param_entity_count = entity_loc_count;
+	} else {
+		gb_free(heap_allocator(), entity_locs);
 	}
 }
 
@@ -6098,81 +6123,27 @@ gb_internal void fb_procedure_begin(fbBuilder *b) {
 	// Set up parameter receiving
 	fb_setup_params(b->proc);
 
-	// Register parameter entities in the variable_map
-	TypeTuple *params = proc_type->params ? &proc_type->params->Tuple : nullptr;
-	if (params != nullptr) {
-		for_array(i, params->variables) {
-			Entity *param_e = params->variables[i];
-			if (param_e == nullptr || param_e->kind != Entity_Variable) continue;
+	// Register parameter entities in the variable_map using the compact
+	// entity→slot lookup built during fb_setup_params (avoids O(n*m) search).
+	for (u32 ei = 0; ei < b->proc->param_entity_count; ei++) {
+		Entity *param_e = b->proc->param_entity_locs[ei].entity;
+		u32 slot_idx    = b->proc->param_entity_locs[ei].slot_idx;
+		fbStackSlot *slot = &b->proc->slots[slot_idx];
 
-			// Find this entity's slot in param_locs
-			bool found = false;
-			for (u32 pi = 0; pi < b->proc->param_count; pi++) {
-				u32 slot_idx = b->proc->param_locs[pi].slot_idx;
-				fbStackSlot *slot = &b->proc->slots[slot_idx];
-				if (slot->entity == param_e) {
-					fbValue ptr = fb_emit_alloca_from_slot(b, slot_idx);
+		fbValue ptr = fb_emit_alloca_from_slot(b, slot_idx);
 
-					// For MEMORY class params (unions, large structs), the slot
-					// holds a pointer to the caller's data. Load the pointer and
-					// use it as the base so accesses go through to the actual data.
-					fbABIParamInfo abi = fb_abi_classify_type_sysv(param_e->type);
-					if (abi.classes[0] == FB_ABI_MEMORY) {
-						ptr = fb_emit_load(b, ptr, alloc_type_pointer(param_e->type));
-					}
-
-					fbAddr addr = {};
-					addr.kind = fbAddr_Default;
-					addr.base = ptr;
-					addr.type = param_e->type;
-					map_set(&b->variable_map, param_e, addr);
-					found = true;
-					break;
-				}
-			}
-			if (!found && b->proc->xmm_param_count > 0) {
-				// Search XMM param slots (non-Odin CC float params)
-				for (u32 xi = 0; xi < b->proc->xmm_param_count; xi++) {
-					u32 slot_idx = b->proc->xmm_param_locs[xi].slot_idx;
-					fbStackSlot *slot = &b->proc->slots[slot_idx];
-					if (slot->entity == param_e) {
-						fbValue ptr = fb_emit_alloca_from_slot(b, slot_idx);
-						fbAddr addr = {};
-						addr.kind = fbAddr_Default;
-						addr.base = ptr;
-						addr.type = param_e->type;
-						map_set(&b->variable_map, param_e, addr);
-						found = true;
-						break;
-					}
-				}
-			}
-			if (!found && b->proc->stack_param_count > 0) {
-				// Search stack-passed param slots (overflow beyond 6 GP registers)
-				for (u32 si = 0; si < b->proc->stack_param_count; si++) {
-					u32 slot_idx = b->proc->stack_param_locs[si].slot_idx;
-					fbStackSlot *slot = &b->proc->slots[slot_idx];
-					if (slot->entity == param_e) {
-						fbValue ptr = fb_emit_alloca_from_slot(b, slot_idx);
-
-						// For MEMORY class params, the slot holds a pointer to
-						// the caller's data. Load the pointer to get the actual base.
-						fbABIParamInfo abi = fb_abi_classify_type_sysv(param_e->type);
-						if (abi.classes[0] == FB_ABI_MEMORY) {
-							ptr = fb_emit_load(b, ptr, alloc_type_pointer(param_e->type));
-						}
-
-						fbAddr addr = {};
-						addr.kind = fbAddr_Default;
-						addr.base = ptr;
-						addr.type = param_e->type;
-						map_set(&b->variable_map, param_e, addr);
-						found = true;
-						break;
-					}
-				}
-			}
+		// For MEMORY class params (unions, large structs), the slot holds a
+		// pointer to the caller's data. Load the pointer and use it as the
+		// base so accesses go through to the actual data.
+		if (slot->is_indirect) {
+			ptr = fb_emit_load(b, ptr, alloc_type_pointer(param_e->type));
 		}
+
+		fbAddr addr = {};
+		addr.kind = fbAddr_Default;
+		addr.base = ptr;
+		addr.type = param_e->type;
+		map_set(&b->variable_map, param_e, addr);
 	}
 
 	// Odin CC: register context pointer.

@@ -321,6 +321,7 @@ struct fbStackSlot {
 	Entity *entity;       // NULL for temporaries
 	Type   *odin_type;
 	u32     scope_start;  // first instruction index where slot is live
+	bool    is_indirect;  // true for MEMORY-class ABI params (slot holds pointer to caller data)
 };
 
 // ───────────────────────────────────────────────────────────────────────
@@ -421,6 +422,16 @@ struct fbProc {
 	};
 	fbStackParamLoc *stack_param_locs;
 	u32              stack_param_count;
+
+	// Parameter entity lookup: maps parameter Entity* → stack slot index.
+	// Built during fb_setup_params, consumed during parameter binding to
+	// avoid O(params * locs) linear search across param/xmm/stack arrays.
+	struct fbParamEntityLoc {
+		Entity *entity;
+		u32     slot_idx;
+	};
+	fbParamEntityLoc *param_entity_locs;
+	u32               param_entity_count;
 
 	// Machine code output (populated by lowering)
 	u8    *machine_code;
