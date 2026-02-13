@@ -36,7 +36,6 @@ gb_internal isize   fb_type_info_index(CheckerInfo *info, Type *type, bool err_o
 
 // Forward declarations for functions used before their definition
 gb_internal void    fb_emit_copy_value(fbBuilder *b, fbValue dst_ptr, fbValue val, Type *type);
-gb_internal void    fb_unpack_multi_return(fbBuilder *b, fbValue last_val, fbValue *out_values, i32 out_count);
 gb_internal void    fb_unpack_tuple_values(fbBuilder *b, fbValue last_val, Type *tuple_type, fbValue *out_values, i32 out_count);
 gb_internal fbValue fb_build_source_code_location(fbBuilder *b, String proc_name, TokenPos pos);
 gb_internal u32     fb_gen_map_cell_info(fbModule *m, Type *type);
@@ -234,12 +233,15 @@ gb_internal void fb_setup_params(fbProc *p) {
 	// These go after regular params but before the context pointer, matching
 	// the order the caller pushes them in fb_build_call_expr.
 	if (split_count > 0) {
+		p->split_return_slot_idxs = gb_alloc_array(heap_allocator(), u32, split_count);
+		p->split_return_slot_count = cast(u32)split_count;
 		p->split_returns_index = cast(i32)gp_idx;
 		p->split_returns_count = 0;
 		for (i32 i = 0; i < split_count; i++) {
 			if (gp_idx >= FB_X64_SYSV_MAX_GP_ARGS) {
 				// Split return pointers that overflow go on the stack
 				u32 slot = fb_slot_create(p, 8, 8, nullptr, results->variables[i]->type);
+				p->split_return_slot_idxs[i] = slot;
 				stack_locs[stack_idx].slot_idx       = slot;
 				stack_locs[stack_idx].sub_offset      = 0;
 				stack_locs[stack_idx].caller_offset   = stack_offset;
@@ -250,6 +252,7 @@ gb_internal void fb_setup_params(fbProc *p) {
 			}
 			// Each split return param is a pointer (8 bytes) to the caller's temp
 			u32 slot = fb_slot_create(p, 8, 8, nullptr, results->variables[i]->type);
+			p->split_return_slot_idxs[i] = slot;
 			locs[gp_idx].slot_idx   = slot;
 			locs[gp_idx].sub_offset = 0;
 			gp_idx++;
@@ -260,7 +263,10 @@ gb_internal void fb_setup_params(fbProc *p) {
 	// Single MEMORY-class return: add hidden output pointer parameter.
 	// This matches the caller-side sret_single aux push in fb_build_call_expr.
 	if (needs_sret) {
-		u32 slot = fb_slot_create(p, 8, 8, nullptr, results->variables[0]->type);
+		// needs_sret is computed from the last result type (single return: the sole result).
+		GB_ASSERT(results != nullptr && result_count > 0);
+		Type *sret_type = results->variables[result_count - 1]->type;
+		u32 slot = fb_slot_create(p, 8, 8, nullptr, sret_type);
 		if (gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
 			locs[gp_idx].slot_idx   = slot;
 			locs[gp_idx].sub_offset = 0;
@@ -279,11 +285,13 @@ gb_internal void fb_setup_params(fbProc *p) {
 	if (has_context) {
 		if (gp_idx < FB_X64_SYSV_MAX_GP_ARGS) {
 			u32 slot = fb_slot_create(p, 8, 8, nullptr, nullptr);
+			p->context_slot_idx = cast(i32)slot;
 			locs[gp_idx].slot_idx   = slot;
 			locs[gp_idx].sub_offset = 0;
 			gp_idx++;
 		} else {
 			u32 slot = fb_slot_create(p, 8, 8, nullptr, nullptr);
+			p->context_slot_idx = cast(i32)slot;
 			stack_locs[stack_idx].slot_idx       = slot;
 			stack_locs[stack_idx].sub_offset      = 0;
 			stack_locs[stack_idx].caller_offset   = stack_offset;
@@ -3876,11 +3884,13 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 	bool has_context  = false;
 	TypeTuple *results = nullptr;
 	i32 result_count = 0;
+	Type *tuple_results_type = nullptr;
 
 	if (proc_type != nullptr && proc_type->kind == Type_Proc) {
 		is_odin_like = is_calling_convention_odin(proc_type->Proc.calling_convention);
 		has_context  = (proc_type->Proc.calling_convention == ProcCC_Odin);
 		if (proc_type->Proc.results != nullptr) {
+			tuple_results_type = proc_type->Proc.results;
 			results = &proc_type->Proc.results->Tuple;
 			result_count = cast(i32)results->variables.count;
 		}
@@ -4271,10 +4281,6 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 		last_val = fb_make_value(r, last_result_type);
 	}
 
-	// Expose split return temps so the statement-level handler can unpack them
-	b->last_call_split_temps = split_temps;
-	b->last_call_split_count = split_count;
-
 	// Check for deferred procedure on the callee entity
 	{
 		Ast *proc_expr = unparen_expr(ce->proc);
@@ -4441,72 +4447,60 @@ gb_internal fbValue fb_build_call_expr(fbBuilder *b, Ast *expr) {
 		}
 	}
 
+	// For Odin CC multi-return, return a pointer to a stack-allocated tuple holding
+	// all return values. This avoids builder side-channels for "split returns".
+	if (is_odin_like && result_count > 1) {
+		GB_ASSERT(tuple_results_type != nullptr && tuple_results_type->kind == Type_Tuple);
+		GB_ASSERT(split_count > 0 && split_temps != nullptr);
+
+		fbAddr tuple_temp = fb_add_local(b, tuple_results_type, nullptr, true);
+		fbValue tuple_ptr = tuple_temp.base;
+
+		for (i32 i = 0; i < split_count; i++) {
+			Type *field_type = results->variables[i]->type;
+			i64 offset = type_offset_of(tuple_results_type, i);
+			fbValue dst = (offset != 0) ? fb_emit_member(b, tuple_ptr, offset) : tuple_ptr;
+			fbValue rv = fb_addr_load(b, split_temps[i]);
+			rv = fb_emit_conv(b, rv, field_type);
+			fb_emit_copy_value(b, dst, rv, field_type);
+		}
+
+		// Last result is returned in a register, or via sret temp for aggregates.
+		{
+			i32 i = result_count - 1;
+			Type *field_type = results->variables[i]->type;
+			i64 offset = type_offset_of(tuple_results_type, i);
+			fbValue dst = (offset != 0) ? fb_emit_member(b, tuple_ptr, offset) : tuple_ptr;
+			fbValue rv = fb_emit_conv(b, last_val, field_type);
+			fb_emit_copy_value(b, dst, rv, field_type);
+		}
+
+		gb_free(heap_allocator(), split_temps);
+
+		fbValue r = tuple_ptr;
+		r.type = tuple_results_type; // aggregate convention: pointer tagged with type
+		return r;
+	}
+
+	if (split_temps != nullptr) {
+		gb_free(heap_allocator(), split_temps);
+	}
 	return last_val;
 }
 
 // Load the hidden output pointer for the i-th split return value.
-// Split returns first fill GP param slots starting at split_returns_index;
-// any that overflow beyond FB_X64_SYSV_MAX_GP_ARGS go to stack_param_locs.
 gb_internal fbValue fb_load_split_return_ptr(fbBuilder *b, i32 i) {
-	i32 param_idx = b->proc->split_returns_index + i;
-	if (param_idx < cast(i32)b->proc->param_count) {
-		u32 slot_idx = b->proc->param_locs[param_idx].slot_idx;
-		fbValue slot_ptr = fb_emit_alloca_from_slot(b, slot_idx);
-		return fb_emit_load(b, slot_ptr, t_rawptr);
-	}
-	// Overflowed to stack — scan stack_param_locs for split return entries.
-	// Split return pointers have entity==NULL and odin_type!=NULL.
-	i32 gp_split_count = cast(i32)b->proc->param_count - b->proc->split_returns_index;
-	if (gp_split_count < 0) gp_split_count = 0;
-	i32 stack_split_idx = i - gp_split_count;
-	i32 found = 0;
-	for (u32 si = 0; si < b->proc->stack_param_count; si++) {
-		u32 slot_idx = b->proc->stack_param_locs[si].slot_idx;
-		fbStackSlot *slot = &b->proc->slots[slot_idx];
-		if (slot->entity == nullptr && slot->odin_type != nullptr) {
-			if (found == stack_split_idx) {
-				fbValue slot_ptr = fb_emit_alloca_from_slot(b, slot_idx);
-				return fb_emit_load(b, slot_ptr, t_rawptr);
-			}
-			found++;
-		}
-	}
-	GB_PANIC("fast backend: could not find stack slot for split return %d", i);
-	return {};
-}
-
-// Unpack a multi-return call into individual values.
-// out_values must have space for out_count elements.
-gb_internal void fb_unpack_multi_return(fbBuilder *b, fbValue last_val, fbValue *out_values, i32 out_count) {
-	i32 split_count = b->last_call_split_count;
-
-	// Load each split return value from its temp
-	for (i32 i = 0; i < split_count && i < out_count; i++) {
-		out_values[i] = fb_addr_load(b, b->last_call_split_temps[i]);
-	}
-
-	// The last return value was returned in a register
-	if (split_count < out_count) {
-		out_values[split_count] = last_val;
-	}
-
-	// Clean up
-	if (b->last_call_split_temps != nullptr) {
-		gb_free(heap_allocator(), b->last_call_split_temps);
-		b->last_call_split_temps = nullptr;
-		b->last_call_split_count = 0;
-	}
+	GB_ASSERT(i >= 0);
+	GB_ASSERT(cast(u32)i < b->proc->split_return_slot_count);
+	u32 slot_idx = b->proc->split_return_slot_idxs[i];
+	fbValue slot_ptr = fb_emit_alloca_from_slot(b, slot_idx);
+	return fb_emit_load(b, slot_ptr, t_rawptr);
 }
 
 // Unpack a tuple-producing expression into individual values.
-// Handles both call-based split returns (via fb_unpack_multi_return)
-// and aggregate tuple pointers (from type assertions, map lookups, etc.).
+// The fast backend represents tuple values as pointers to tuple memory.
 gb_internal void fb_unpack_tuple_values(fbBuilder *b, fbValue last_val, Type *tuple_type, fbValue *out_values, i32 out_count) {
-	if (b->last_call_split_count > 0 || b->last_call_split_temps != nullptr) {
-		fb_unpack_multi_return(b, last_val, out_values, out_count);
-		return;
-	}
-	// Aggregate tuple: last_val is a pointer to the tuple memory.
+	// last_val is a pointer to the tuple memory.
 	GB_ASSERT(tuple_type != nullptr && tuple_type->kind == Type_Tuple);
 	fbValue tuple_ptr = last_val;
 	tuple_ptr.type = alloc_type_pointer(tuple_type);
@@ -5377,42 +5371,13 @@ gb_internal void fb_build_mutable_value_decl(fbBuilder *b, Ast *node) {
 	if (value_count == 1 && name_count > 1) {
 		Type *rhs_type = type_of_expr(vd->values[0]);
 		if (rhs_type != nullptr && rhs_type->kind == Type_Tuple) {
-			fbValue last_val = fb_build_expr(b, vd->values[0]);
+				fbValue last_val = fb_build_expr(b, vd->values[0]);
 
-			auto vals = array_make<fbValue>(heap_allocator(), name_count, name_count);
+				auto vals = array_make<fbValue>(heap_allocator(), name_count, name_count);
+				fb_unpack_tuple_values(b, last_val, rhs_type, vals.data, name_count);
 
-			// Determine unpack method: if split return temps were set up
-			// (procedure call), use them. Otherwise the result is an
-			// aggregate tuple pointer — load fields directly.
-			if (b->last_call_split_count > 0 || b->last_call_split_temps != nullptr) {
-				fb_unpack_multi_return(b, last_val, vals.data, name_count);
-			} else {
-				// Aggregate tuple: last_val is a pointer to the tuple memory.
-				fbValue tuple_ptr = last_val;
-				tuple_ptr.type = alloc_type_pointer(rhs_type);
-				for (i32 i = 0; i < name_count; i++) {
-					Type *field_type = rhs_type->Tuple.variables[i]->type;
-					i64 offset = type_offset_of(rhs_type, i);
-					fbType ft = fb_data_type(field_type);
-					if (ft.kind != FBT_VOID) {
-						// Scalar: load the field value.
-						vals[i] = fb_load_field(b, tuple_ptr, offset, field_type);
-					} else {
-						// Aggregate: return pointer to field (don't load).
-						// Fast backend convention: aggregate values are pointers
-						// tagged with the aggregate type.
-						fbValue field_ptr = tuple_ptr;
-						if (offset != 0) {
-							field_ptr = fb_emit_member(b, tuple_ptr, offset);
-						}
-						field_ptr.type = field_type;
-						vals[i] = field_ptr;
-					}
-				}
-			}
-
-			// Create locals and assign
-			for_array(i, vd->names) {
+				// Create locals and assign
+				for_array(i, vd->names) {
 				Ast *name = vd->names[i];
 				if (is_blank_ident(name)) continue;
 				Entity *e = entity_of_node(name);
@@ -5585,14 +5550,14 @@ gb_internal void fb_build_return_stmt(fbBuilder *b, Slice<Ast *> const &results)
 		Type *rtype = type_of_expr(rexpr);
 		fbValue val = fb_build_expr(b, rexpr);
 
-		if (rtype != nullptr && rtype->kind == Type_Tuple) {
-			i32 tuple_count = cast(i32)rtype->Tuple.variables.count;
-			auto unpacked = array_make<fbValue>(heap_allocator(), tuple_count, tuple_count);
-			fb_unpack_multi_return(b, val, unpacked.data, tuple_count);
-			for (i32 j = 0; j < tuple_count; j++) {
-				array_add(&flat_vals, unpacked[j]);
-			}
-			array_free(&unpacked);
+			if (rtype != nullptr && rtype->kind == Type_Tuple) {
+				i32 tuple_count = cast(i32)rtype->Tuple.variables.count;
+				auto unpacked = array_make<fbValue>(heap_allocator(), tuple_count, tuple_count);
+				fb_unpack_tuple_values(b, val, rtype, unpacked.data, tuple_count);
+				for (i32 j = 0; j < tuple_count; j++) {
+					array_add(&flat_vals, unpacked[j]);
+				}
+				array_free(&unpacked);
 		} else {
 			array_add(&flat_vals, val);
 		}
@@ -5657,25 +5622,14 @@ gb_internal void fb_build_assign_stmt(fbBuilder *b, AstAssignStmt *as) {
 		// Multi-return: single RHS call producing multiple values
 		if (rhs_count == 1 && lhs_count > 1) {
 			Type *rhs_type = type_of_expr(as->rhs[0]);
-			if (rhs_type != nullptr && rhs_type->kind == Type_Tuple) {
-				fbValue last_val = fb_build_expr(b, as->rhs[0]);
-				auto vals = array_make<fbValue>(heap_allocator(), lhs_count, lhs_count);
+				if (rhs_type != nullptr && rhs_type->kind == Type_Tuple) {
+					fbValue last_val = fb_build_expr(b, as->rhs[0]);
+					auto vals = array_make<fbValue>(heap_allocator(), lhs_count, lhs_count);
+					fb_unpack_tuple_values(b, last_val, rhs_type, vals.data, lhs_count);
 
-				if (b->last_call_split_count > 0 || b->last_call_split_temps != nullptr) {
-					fb_unpack_multi_return(b, last_val, vals.data, lhs_count);
-				} else {
-					fbValue tuple_ptr = last_val;
-					tuple_ptr.type = alloc_type_pointer(rhs_type);
-					for (i32 i = 0; i < lhs_count; i++) {
-						Type *field_type = rhs_type->Tuple.variables[i]->type;
-						i64 offset = type_offset_of(rhs_type, i);
-						vals[i] = fb_load_field(b, tuple_ptr, offset, field_type);
-					}
-				}
-
-				for_array(i, as->lhs) {
-					Ast *lhs_expr = as->lhs[i];
-					if (is_blank_ident(lhs_expr)) continue;
+					for_array(i, as->lhs) {
+						Ast *lhs_expr = as->lhs[i];
+						if (is_blank_ident(lhs_expr)) continue;
 					if (i >= vals.count) break;
 
 					fbAddr addr = fb_build_addr(b, lhs_expr);
@@ -6487,7 +6441,11 @@ gb_internal void fb_build_range_tuple(fbBuilder *b, AstRangeStmt *rs, Scope *sco
 
 	// Unpack all tuple values.
 	fbValue *values = gb_alloc_array(temporary_allocator(), fbValue, value_count);
-	fb_unpack_multi_return(b, last_val, values, value_count);
+	{
+		Type *tuple_type = type_of_expr(expr);
+		GB_ASSERT(tuple_type != nullptr && tuple_type->kind == Type_Tuple);
+		fb_unpack_tuple_values(b, last_val, tuple_type, values, value_count);
+	}
 
 	// Last value is the bool condition.
 	i32 cond_index = value_count - 1;
@@ -7458,34 +7416,9 @@ gb_internal void fb_procedure_begin(fbBuilder *b) {
 	}
 
 	// Odin CC: register context pointer.
-	// The context pointer is the last parameter slot — either in GP register
-	// params or in stack-passed params if registers overflowed.
 	if (proc_type->calling_convention == ProcCC_Odin) {
-		u32 ctx_slot = 0;
-		bool ctx_found = false;
-
-		// Check GP register params first (context is last when it fits)
-		if (b->proc->param_count > 0) {
-			u32 last_slot = b->proc->param_locs[b->proc->param_count - 1].slot_idx;
-			fbStackSlot *slot = &b->proc->slots[last_slot];
-			if (slot->entity == nullptr && slot->odin_type == nullptr) {
-				ctx_slot = last_slot;
-				ctx_found = true;
-			}
-		}
-
-		// Check stack-passed params (context overflowed to stack)
-		if (!ctx_found && b->proc->stack_param_count > 0) {
-			u32 last_slot = b->proc->stack_param_locs[b->proc->stack_param_count - 1].slot_idx;
-			fbStackSlot *slot = &b->proc->slots[last_slot];
-			if (slot->entity == nullptr && slot->odin_type == nullptr) {
-				ctx_slot = last_slot;
-				ctx_found = true;
-			}
-		}
-
-		if (ctx_found) {
-			fbValue ctx_ptr = fb_emit_alloca_from_slot(b, ctx_slot);
+		if (b->proc->context_slot_idx >= 0) {
+			fbValue ctx_ptr = fb_emit_alloca_from_slot(b, cast(u32)b->proc->context_slot_idx);
 			fbAddr ctx_addr = {};
 			ctx_addr.kind = fbAddr_Default;
 			ctx_addr.base = ctx_ptr;

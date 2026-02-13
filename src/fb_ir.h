@@ -168,9 +168,6 @@ enum fbOp : u8 {
 	FB_CALL,
 	FB_TAILCALL,
 
-	// Multi-value projection
-	FB_PROJ,
-
 	// Atomics
 	FB_ATOMIC_LOAD,
 	FB_ATOMIC_STORE,
@@ -209,6 +206,26 @@ enum fbOp : u8 {
 	FB_PHI,
 
 	FB_OP_COUNT,
+};
+
+// ───────────────────────────────────────────────────────────────────────
+// Opcode operand role specification (used by verification and IR helpers)
+// ───────────────────────────────────────────────────────────────────────
+
+enum fbOperandRole : u8 {
+	FBO_NONE,       // must be FB_NOREG
+	FBO_VALUE,      // SSA value ID, must be < next_value
+	FBO_VALUE_OPT,  // value ID or FB_NOREG (e.g., RET void)
+	FBO_BLOCK,      // block ID, must be < block_count
+	FBO_SLOT,       // slot index, must be < slot_count
+	FBO_AUX,        // aux pool index, must be < aux_count
+	FBO_COUNT,      // raw count (no range constraint)
+};
+
+struct fbOpSpec {
+	fbOperandRole a, b, c;
+	bool has_result;
+	bool is_terminator;
 };
 
 // ───────────────────────────────────────────────────────────────────────
@@ -397,10 +414,17 @@ struct fbProc {
 	// -1 means no split returns.
 	i32         split_returns_index;
 	i32         split_returns_count;
+	// Split return parameter slots in call order (length == split_returns_count).
+	// Each slot holds a pointer to the caller-provided output buffer for that return.
+	u32        *split_return_slot_idxs;
+	u32         split_return_slot_count;
 
 	// Single MEMORY-class return: hidden output pointer parameter slot.
 	// The callee receives the caller's output buffer address. -1 if no sret.
 	i32         sret_slot_idx;
+
+	// Odin CC: hidden context pointer parameter slot. -1 if none/unknown.
+	i32         context_slot_idx;
 
 	// XMM parameter ABI (non-Odin CC / foreign calls only).
 	// Maps incoming XMM register arguments to stack slots for SSE-classified params.
@@ -542,7 +566,7 @@ struct fbModule {
 	BlockingMutex     symbols_mutex;
 
 	// Read-only data (string literals, etc.)
-	// Abstract symbol index for rodata entry i = procs.count + i.
+	// Abstract symbol index for rodata entry i = FB_RODATA_SYM_BASE + i.
 	Array<fbRodataEntry>  rodata_entries;
 	StringMap<u32>        string_intern_map;  // string content → rodata entry index
 
@@ -728,12 +752,6 @@ struct fbBuilder {
 	// Variable → address mapping
 	PtrMap<Entity *, fbAddr>  variable_map;
 	PtrMap<Entity *, fbAddr>  soa_values_map;
-
-	// Multi-return: after fb_build_call_expr, these hold the temps for
-	// return values 0..N-2 (the split returns).  The caller loads from
-	// these to unpack multi-return values.  NULL when no split returns.
-	fbAddr *last_call_split_temps;
-	i32     last_call_split_count;
 
 	// Procedure flags
 	bool return_by_ptr;

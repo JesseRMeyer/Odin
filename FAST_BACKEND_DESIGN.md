@@ -4,10 +4,10 @@
 
 1. **Maximum compilation speed.** Two linear passes: AST → IR, IR → machine code. No graph structures, no iterative algorithms, no scheduling.
 2. **Decent -O0 codegen.** Expressions compute in registers. Variables live on the stack for debugger visibility. Block-local register allocation keeps memory traffic low.
-3. **Full Odin semantics.** Every language feature is supported. Complex addressing (maps, SOA, swizzle, relative pointers, bit fields) is resolved in the builder layer, not the IR.
+3. **Odin semantics (goal).** Complex addressing (maps, SOA, swizzle, relative pointers, bit fields) is resolved in the builder layer, not the IR. Coverage is still incomplete; see **Phase 11b** for known gaps.
 4. **SSA-ready.** The IR is in SSA form. At -O0, mutable variables use alloca+load/store (no phi nodes needed). A future -O1 path adds mem2reg + peephole passes using the same IR.
 5. **Data-oriented.** Fixed-size instructions in contiguous arrays. Arena allocation. Indices instead of pointers. Cache-friendly iteration.
-6. **Dual-target.** x86-64 and ARM64 from the start. Target-specific details are confined to the lowering layer.
+6. **Multi-target (planned).** x86-64 lowering exists today; ARM64 lowering is planned. Target-specific details are confined to the lowering layer.
 
 ## 2. Architecture
 
@@ -24,7 +24,7 @@
                              │  fbProc (flat arrays)
                     ┌────────▼────────┐
                     │  fb_lower_*()   │  Pass 2: IR → machine code
-                    │  (x64 or arm64) │  One forward pass per block.
+                    │  (x64 today)    │  One forward pass per block.
                     │                 │  Block-local register allocation.
                     │  Produces:      │  Direct binary encoding.
                     │  machine code   │
@@ -34,7 +34,7 @@
                              │
                     ┌────────▼────────┐
                     │  fb_emit_*()    │  Object file emission
-                    │  (elf/pe/macho) │  + DWARF / CodeView
+                    │  (elf today)    │  + DWARF (planned) / CodeView (planned)
                     └────────┬────────┘
                              │
                         .o / .obj
@@ -325,15 +325,11 @@ enum : u8 {
 };
 ```
 
-The `r` field receives the return value. For void calls, `r = FB_NOREG`. For multi-return, `r` receives a pseudo-value that `PROJ` extracts from.
+The `r` field receives the return value. For void calls, `r = FB_NOREG`.
 
-### 5.13 Multi-Value Projection
-
-| Op | r | a | b | c | imm | flags | Description |
-|----|---|---|---|---|-----|-------|-------------|
-| `PROJ` | dst | multi | - | - | index | - | Extract element from multi-value |
-
-Used after `CALL` with multiple return values, and after `ATOMIC_CAS` (value + success bool).
+The fast backend IR does not have a general "multi-value" result. Multi-return is expressed
+in terms of ABI-level hidden output pointers, and tuple values are represented as pointers
+to tuple memory (materialized by the builder as needed).
 
 ### 5.14 Atomics
 
@@ -347,7 +343,7 @@ Used after `CALL` with multiple return values, and after `ATOMIC_CAS` (value + s
 | `ATOMIC_AND` | dst | ptr | val | - | align | order | Atomic fetch-and |
 | `ATOMIC_OR` | dst | ptr | val | - | align | order | Atomic fetch-or |
 | `ATOMIC_XOR` | dst | ptr | val | - | align | order | Atomic fetch-xor |
-| `ATOMIC_CAS` | dst(multi) | ptr | expected | desired | align | order+fail | Atomic compare-exchange; PROJ 0=old val, PROJ 1=success (i1) |
+| `ATOMIC_CAS` | dst | ptr | expected | desired | align | order+fail | Atomic compare-exchange; returns old value |
 | `FENCE` | - | - | - | - | - | order | Memory fence |
 
 All atomic read-modify-write ops return the **old** value.
@@ -363,12 +359,10 @@ All atomic read-modify-write ops return the **old** value.
 
 ### 5.16 Wide Arithmetic
 
-| Op | r(multi) | a | b | c | imm | flags | Description |
-|----|----------|---|---|---|-----|-------|-------------|
-| `ADDPAIR` | lo,hi | a_lo | a_hi | b_lo | *(b_hi in aux)* | - | Wide add |
-| `MULPAIR` | lo,hi | lhs | rhs | - | - | - | Full-width multiply |
-
-`ADDPAIR` needs 4 source operands. The fourth (`b_hi`) is stored at `aux[imm]`. Both return multi-values accessible via `PROJ 0` (lo) and `PROJ 1` (hi).
+| Op | r | a | b | c | imm | flags | Description |
+|----|---|---|---|---|-----|-------|-------------|
+| `ADDPAIR` | - | - | - | - | - | - | Reserved (not emitted by current builder) |
+| `MULPAIR` | - | - | - | - | - | - | Reserved (not emitted by current builder) |
 
 ### 5.17 Vector (SIMD)
 
@@ -612,7 +606,7 @@ struct fbModule {
     BlockingMutex     symbols_mutex;
 
     // Read-only data (string literals, etc.)
-    // Abstract symbol index for rodata entry i = procs.count + i.
+    // Abstract symbol index for rodata entry i = FB_RODATA_SYM_BASE + i.
     Array<fbRodataEntry>  rodata_entries;
     StringMap<u32>        string_intern_map;  // string content → rodata entry index
 
@@ -630,7 +624,7 @@ struct fbModule {
 };
 ```
 
-**Thread safety:** Procedure IR construction and lowering can be parallelized. `procs_mutex` and `symbols_mutex` protect shared state. Per-procedure data (instructions, blocks, slots) is thread-local to the building thread — no synchronization needed within a procedure.
+**Thread safety:** Procedure IR construction and lowering are currently serial, but the data model is intended to support parallelization. `procs_mutex` and `symbols_mutex` protect shared state for future parallel builds/lowers. Per-procedure data (instructions, blocks, slots) is thread-local to the building thread — no synchronization needed within a procedure.
 
 **Module-level arena** is not yet implemented. The module currently uses `heap_allocator()` for all allocations. A future phase will add arena allocation (see §13).
 
@@ -801,7 +795,6 @@ fb_debugbreak(fbBuilder *b)
 ```cpp
 fb_call(fbBuilder *b, fbValue target, Slice<fbValue> args, Type *result_type) → fbValue
 fb_tailcall(fbBuilder *b, fbValue target, Slice<fbValue> args)
-fb_proj(fbBuilder *b, fbValue multi, u32 index, Type *elem_type) → fbValue
 ```
 
 **ABI lowering** is handled in the builder, not the IR. Before emitting `CALL`, the builder:
@@ -811,6 +804,8 @@ fb_proj(fbBuilder *b, fbValue multi, u32 index, Type *elem_type) → fbValue
 4. For struct returns: `ALLOCA` space, pass pointer as hidden first arg (sret).
 
 The IR-level `CALL` instruction sees only scalar/pointer arguments — all ABI decomposition has already happened.
+
+**Multi-return (Odin CC):** The IR does not have a general multi-value return. For Odin-style multi-return calls, the builder materializes a tuple local, stores the returned components into that tuple memory, and returns a pointer tagged with the tuple `Type*`. Field extraction is then expressed as pointer arithmetic + `LOAD` (see `fb_unpack_tuple_values` in the builder).
 
 ### 10.8 Address Operations (Odin Semantic Layer)
 
@@ -1315,7 +1310,6 @@ SEXT..BITCAST   Conversions       10
 SELECT          Select             1
 JUMP..DEBUGBR   Control flow       7
 CALL, TAILCALL  Calls              2
-PROJ            Multi-value        1
 ATOMIC_*,FENCE  Atomics           10
 BSWAP..POPCNT   Bit manip          4
 ADDPAIR,MULPAIR Wide arith         2
@@ -1323,7 +1317,7 @@ VSHUFFLE..VSPL  Vector             4
 VA_START..ASM   Misc               4
 PHI             SSA (future)       1
 ─────────────────────────────────────
-TOTAL                            ~102
+TOTAL                            ~101
 ```
 
 ~100 opcodes. Each maps 1:1 to a fixed machine instruction template.
@@ -1547,9 +1541,9 @@ Implemented Odin calling convention multi-return support and fixed a pre-existin
 - Split return pointers are caller-allocated stack temporaries; callee stores through them
 
 **Files modified:**
-- `src/fb_ir.h` — Added `split_returns_index` and `split_returns_count` to `fbProc` for tracking hidden output pointer param slots; added `last_call_split_temps` and `last_call_split_count` to `fbBuilder` for communicating split return addresses from call builder to statement-level unpacking
-- `src/fb_ir.cpp` — Initialize `split_returns_index = -1` in `fb_proc_create`
-- `src/fb_build.cpp` — `fb_setup_params` creates split return pointer param slots between regular params and context; `fb_build_call_expr` allocates stack temps, passes hidden output pointers, returns last value; `fb_unpack_multi_return` helper loads values from split temps; `fb_build_return_stmt` stores first N-1 values through hidden output pointers, RETs last value; `fb_build_mutable_value_decl` and `fb_build_assign_stmt` detect multi-return calls (single RHS with Tuple type, multiple LHS names) and unpack via `fb_unpack_multi_return`
+- `src/fb_ir.h` — Added `split_returns_index`/`split_returns_count` and `split_return_slot_idxs` to `fbProc` for tracking hidden output pointer param slots; added `context_slot_idx` to `fbProc`
+- `src/fb_ir.cpp` — Initialize per-proc indices (`split_returns_index`, `sret_slot_idx`, `context_slot_idx`) and free per-proc ABI tables on teardown
+- `src/fb_build.cpp` — `fb_setup_params` creates split return pointer param slots between regular params and context and records them in `split_return_slot_idxs`; `fb_build_call_expr` allocates stack temps, passes hidden output pointers, then materializes a tuple on the stack and returns a pointer to it; tuple unpacking loads fields from tuple memory
 
 **What works:**
 - Two-return functions: `proc() -> (int, bool)`, `proc() -> (bool, int)`
@@ -1900,7 +1894,7 @@ Signed narrow-type ICONST fix (`fb_emit_iconst`):
 
 *Tuple flattening in `fb_build_return_stmt`:*
 - **Problem:** `return some_multi_return_call()` has 1 expression producing N values. The old loop assumed 1:1 mapping between expressions and return values, crashing with type mismatch (e.g., I8→VOID).
-- **Fix:** Two-phase approach. Phase 1 builds each result expression; if its type is `Type_Tuple`, unpacks via `fb_unpack_multi_return` into individual values. Phase 2 stores the first N-1 flat values through split-return output pointers, returns the last in a register. Aggregate values (FBT_VOID) skip `fb_emit_conv` and use `fb_emit_copy_value` directly.
+- **Fix:** Two-phase approach. Phase 1 builds each result expression; if its type is `Type_Tuple`, unpacks by loading fields from tuple memory (tuple values are represented as pointers to tuple data). Phase 2 stores the first N-1 flat values through split-return output pointers, returns the last in a register. Aggregate values (FBT_VOID) skip `fb_emit_conv` and use `fb_emit_copy_value` directly.
 
 *nil→aggregate conversion in `fb_emit_conv`:*
 - **Problem:** `return nil, .Out_Of_Memory` — nil literal produces `rawptr` zero, but target type is `[]byte` (aggregate). No conversion path existed for scalar→aggregate.
@@ -1912,8 +1906,7 @@ Signed narrow-type ICONST fix (`fb_emit_iconst`):
 
 *`fb_load_split_return_ptr` helper:*
 - Loads the hidden output pointer for the i-th split return value.
-- First checks GP `param_locs` (when `split_returns_index + i < param_count`).
-- Falls back to `stack_param_locs` for overflow cases, scanning for slots with `entity == nullptr && odin_type != nullptr` (the signature of split-return stack entries).
+- Uses an explicit `split_return_slot_idxs[i]` list recorded on `fbProc` during parameter setup, covering both register-passed and stack-overflow cases.
 
 **Aggregate return sret expansion (DONE):**
 
@@ -1991,7 +1984,7 @@ Eliminated 5 of the remaining 9 runtime stubs and filled major feature gaps.
 - `ATOMIC_XCHG` → `XCHG [mem], reg`.
 - `ATOMIC_ADD/SUB` → `LOCK XADD [mem], reg` (SUB via `NEG` + `XADD`).
 - `ATOMIC_AND/OR/XOR` → CAS loop: load old, compute `old OP val`, `LOCK CMPXCHG`, retry on failure. Returns old value.
-- `ATOMIC_CAS` → `LOCK CMPXCHG [mem], new` with expected in RAX. Returns `(old, success)` via PROJ.
+- `ATOMIC_CAS` → `LOCK CMPXCHG [mem], new` with expected in RAX. Returns old value; higher-level builtins can materialize `(old, bool)` tuples in the builder.
 - `FENCE` → `MFENCE`/`SFENCE`/`LFENCE` based on ordering.
 
 *Additional builtins:*
@@ -2264,6 +2257,30 @@ set `c=aux_count`), `FB_CALL.b` = `FBO_COUNT` (zero-arg calls set `b=aux_count`)
 **Already caught real bugs:** Invalid LOAD operand (`a=3432793272` with `next_value=20`)
 in `os.error_to_io_error` — was silently producing wrong machine code, now stubbed
 with diagnostic.
+
+### Phase 11b: Remaining Coverage Gaps (TODO)
+
+These are known areas where the fast backend still stubs procedures or panics due to
+missing implementation.
+
+**Targets / object formats:**
+- Non-x86-64 targets are rejected (`FB_ARCH_ARM64` lowering is not implemented yet).
+- Non-ELF object formats are not implemented (PE/COFF, Mach-O).
+- `fb_emit_object` only supports ELF for Linux/FreeBSD; other OSes are unsupported.
+
+**Lowering gaps (x86-64):**
+- Unlowered opcodes: `FB_TAILCALL`, `FB_VA_START`, `FB_PREFETCH`, `FB_PHI`.
+- Reserved/unlowered wide arithmetic: `FB_ADDPAIR`, `FB_MULPAIR`.
+- `FB_ASM` only supports specific variants; other variants panic.
+
+**Builder gaps (AST → IR):**
+- `Ast_SliceExpr` does not handle all base types (notably `#soa[...]`-based values).
+- Some AST forms still hit explicit `TODO fb_build_*` panics (addr/expr/stmt/range and some operators).
+- Not all `fbAddrKind` variants are handled in `fb_addr_load`/`fb_addr_store` (if constructed).
+- Multi-return for non-Odin calling conventions is still rejected.
+
+**Builtins:**
+- Some builtins (general/atomic/SIMD) are still unimplemented and will panic when reached.
 
 ### Phase 12: Debug Info (TODO)
 

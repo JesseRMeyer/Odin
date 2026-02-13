@@ -21,26 +21,6 @@
 	GB_DEBUG_TRAP(); \
 } } while(0)
 
-// ───────────────────────────────────────────────────────────────────────
-// Opcode operand role specification
-// ───────────────────────────────────────────────────────────────────────
-
-enum fbOperandRole : u8 {
-	FBO_NONE,       // must be FB_NOREG
-	FBO_VALUE,      // SSA value ID, must be < next_value
-	FBO_VALUE_OPT,  // value ID or FB_NOREG (e.g., RET void)
-	FBO_BLOCK,      // block ID, must be < block_count
-	FBO_SLOT,       // slot index, must be < slot_count
-	FBO_AUX,        // aux pool index, must be < aux_count
-	FBO_COUNT,      // raw count (no range constraint)
-};
-
-struct fbOpSpec {
-	fbOperandRole a, b, c;
-	bool has_result;
-	bool is_terminator;
-};
-
 // Indexed by fbOp. Verified against both builder (fb_build.cpp) and lowerer (fb_lower_x64.cpp).
 gb_global const fbOpSpec fb_op_specs[FB_OP_COUNT] = {
 	// Constants: ICONST, FCONST, SYMADDR, UNDEF
@@ -146,9 +126,6 @@ gb_global const fbOpSpec fb_op_specs[FB_OP_COUNT] = {
 	[FB_CALL]      = { FBO_VALUE,     FBO_COUNT, FBO_COUNT, true,  false },
 	[FB_TAILCALL]  = { FBO_VALUE,     FBO_COUNT, FBO_COUNT, false, true },
 
-	// Multi-value projection
-	[FB_PROJ]      = { FBO_VALUE,     FBO_NONE,  FBO_NONE,  true,  false },
-
 	// Atomics
 	[FB_ATOMIC_LOAD]  = { FBO_VALUE,  FBO_NONE,  FBO_NONE,  true,  false },
 	[FB_ATOMIC_STORE] = { FBO_VALUE,  FBO_VALUE, FBO_NONE,  false, false },
@@ -216,7 +193,6 @@ gb_global const char *fb_op_names[FB_OP_COUNT] = {
 	[FB_JUMP] = "JUMP", [FB_BRANCH] = "BRANCH", [FB_SWITCH] = "SWITCH", [FB_RET] = "RET",
 	[FB_UNREACHABLE] = "UNREACHABLE", [FB_TRAP] = "TRAP", [FB_DEBUGBREAK] = "DEBUGBREAK",
 	[FB_CALL] = "CALL", [FB_TAILCALL] = "TAILCALL",
-	[FB_PROJ] = "PROJ",
 	[FB_ATOMIC_LOAD] = "ATOMIC_LOAD", [FB_ATOMIC_STORE] = "ATOMIC_STORE",
 	[FB_ATOMIC_XCHG] = "ATOMIC_XCHG", [FB_ATOMIC_ADD] = "ATOMIC_ADD",
 	[FB_ATOMIC_SUB] = "ATOMIC_SUB", [FB_ATOMIC_AND] = "ATOMIC_AND",

@@ -119,7 +119,7 @@ gb_internal i32 fb_type_size(fbType t) {
 	case FBT_F16:  return 2;
 	case FBT_F32:  return 4;
 	case FBT_F64:  return 8;
-	case FBT_PTR:  return 8; // 64-bit targets only for now
+	case FBT_PTR:  return cast(i32)build_context.metrics.ptr_size;
 	default:       return 0;
 	}
 }
@@ -165,34 +165,6 @@ gb_internal fbOS fb_os_from_target(TargetOsKind os) {
 	}
 }
 
-// ───────────────────────────────────────────────────────────────────────
-// Instruction emission helpers
-// ───────────────────────────────────────────────────────────────────────
-
-gb_internal bool fb_op_has_result(fbOp op) {
-	switch (op) {
-	case FB_STORE:
-	case FB_MEMCPY:
-	case FB_MEMSET:
-	case FB_MEMZERO:
-	case FB_JUMP:
-	case FB_BRANCH:
-	case FB_SWITCH:
-	case FB_RET:
-	case FB_UNREACHABLE:
-	case FB_TRAP:
-	case FB_DEBUGBREAK:
-	case FB_ATOMIC_STORE:
-	case FB_TAILCALL:
-	case FB_FENCE:
-	case FB_VA_START:
-	case FB_PREFETCH:
-		return false;
-	default:
-		return true;
-	}
-}
-
 gb_internal u32 fb_inst_emit(fbProc *p, fbOp op, fbType type,
                               u32 a, u32 b, u32 c, u32 loc, i64 imm) {
 	GB_ASSERT_MSG(p->current_block < p->block_count,
@@ -208,8 +180,8 @@ gb_internal u32 fb_inst_emit(fbProc *p, fbOp op, fbType type,
 	}
 
 	// type.kind != FBT_VOID: ops like FB_CALL with a void return have
-	// fb_op_has_result()==true but should not allocate a value number.
-	u32 r = (fb_op_has_result(op) && type.kind != FBT_VOID) ? p->next_value++ : FB_NOREG;
+	// has_result==true but should not allocate a value number.
+	u32 r = (fb_op_specs[op].has_result && type.kind != FBT_VOID) ? p->next_value++ : FB_NOREG;
 
 	fbInst *inst = &p->insts[p->inst_count];
 	inst->op       = cast(u8)op;
@@ -329,6 +301,7 @@ gb_internal fbProc *fb_proc_create(fbModule *m, Entity *e) {
 	p->current_block = FB_NOREG; // no active block until fb_block_start
 	p->split_returns_index = -1;
 	p->sret_slot_idx = -1;
+	p->context_slot_idx = -1;
 
 	// Foreign procs are extern declarations — no IR, no machine code.
 	// Skip heap allocations; all pointers remain NULL, caps stay 0.
@@ -359,6 +332,10 @@ gb_internal void fb_proc_destroy(fbProc *p) {
 	if (p->aux)          gb_free(heap_allocator(), p->aux);
 	if (p->locs)         gb_free(heap_allocator(), p->locs);
 	if (p->param_locs)   gb_free(heap_allocator(), p->param_locs);
+	if (p->xmm_param_locs)   gb_free(heap_allocator(), p->xmm_param_locs);
+	if (p->stack_param_locs) gb_free(heap_allocator(), p->stack_param_locs);
+	if (p->param_entity_locs) gb_free(heap_allocator(), p->param_entity_locs);
+	if (p->split_return_slot_idxs) gb_free(heap_allocator(), p->split_return_slot_idxs);
 	if (p->relocs)       gb_free(heap_allocator(), p->relocs);
 	if (p->machine_code) gb_free(heap_allocator(), p->machine_code);
 }
@@ -562,7 +539,7 @@ gb_internal void fb_module_destroy(fbModule *m) {
 }
 
 // Intern a string literal into the module's rodata section.
-// Returns the abstract symbol index (procs.count + rodata entry index).
+// Returns the abstract symbol index (FB_RODATA_SYM_BASE + rodata entry index).
 // Deduplicates identical strings.
 gb_internal u32 fb_module_intern_string_data(fbModule *m, String str) {
 	// Check for existing entry
@@ -607,8 +584,8 @@ gb_internal bool fb_generate_code(Checker *c, LinkerData *ld) {
 	m->linker_data = ld;
 
 	if (m->target.arch != FB_ARCH_X64) {
-		gb_printf_err("fast backend: only x86-64 is supported (got %s)\n",
-			target_arch_names[build_context.metrics.arch]);
+		gb_printf_err("fast backend: only x86-64 is supported (got %.*s)\n",
+			LIT(target_arch_names[build_context.metrics.arch]));
 		fb_module_destroy(m);
 		return false;
 	}
