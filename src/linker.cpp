@@ -978,6 +978,9 @@ try_cross_linking:;
 			if (build_context.lto_kind != LTO_None) {
 				link_command_line = gb_string_appendc(link_command_line, " -flto=thin");
 				link_command_line = gb_string_append_fmt(link_command_line, " -flto-jobs=%d ", build_context.thread_count);
+				if (build_context.ODIN_DEBUG) {
+					link_command_line = gb_string_appendc(link_command_line, " -g ");
+				}
 			}
 
 			link_command_line = gb_string_appendc(link_command_line, object_files);
