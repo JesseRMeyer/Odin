@@ -4077,7 +4077,16 @@ gb_internal lbValue lb_build_expr_internal(lbProcedure *p, Ast *expr) {
 					if (e->kind == Ast_Ident) return true;
 					if (e->kind == Ast_SelectorExpr) {
 						Ast *operand = unparen_expr(e->SelectorExpr.expr);
-						if (operand && operand->kind == Ast_Ident) return true;
+						if (operand && operand->kind == Ast_Ident) {
+							// Reject if operand is a pointer — the selector
+							// dereferences it, which traps when the pointer
+							// is nil (select evaluates both arms eagerly).
+							Type *ot = type_of_expr(operand);
+							if (ot == nullptr || is_type_pointer(ot)) {
+								return false;
+							}
+							return true;
+						}
 					}
 					if (e->kind == Ast_UnaryExpr && e->UnaryExpr.op.kind != Token_And) {
 						Ast *operand = unparen_expr(e->UnaryExpr.expr);
