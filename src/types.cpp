@@ -4663,6 +4663,20 @@ gb_internal i64 type_offset_of(Type *t, i64 index, Type **field_type_) {
 			return 3*build_context.int_size; // allocator
 		}
 		break;
+	case Type_Map:
+		// Raw_Map layout: {data: uintptr, len: uintptr, allocator: Allocator}
+		switch (index) {
+		case 0:
+			if (field_type_) *field_type_ = t_uintptr;
+			return 0;                          // data
+		case 1:
+			if (field_type_) *field_type_ = t_uintptr;
+			return 1*build_context.ptr_size;   // len
+		case 2:
+			if (field_type_) *field_type_ = t_allocator;
+			return 2*build_context.ptr_size;   // allocator
+		}
+		break;
 	case Type_Union:
 		if (!is_type_union_maybe_pointer(t)) {
 			/* i64 s = */ type_size_of(t);

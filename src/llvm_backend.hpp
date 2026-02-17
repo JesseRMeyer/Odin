@@ -367,6 +367,7 @@ struct lbProcedure {
 	std::atomic<bool> is_done;
 
 	lbAddr           return_ptr;
+	Entity *         sret_rvo_entity; // extended RVO: this local aliases return_ptr
 	Array<lbDefer>   defer_stmts;
 	Array<lbBlock *> blocks;
 	Array<lbBranchBlocks> branch_blocks;

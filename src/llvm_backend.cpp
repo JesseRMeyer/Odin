@@ -3119,6 +3119,7 @@ gb_internal void lb_generate_procedure(lbModule *m, lbProcedure *p) {
 	if (p->body != nullptr) { // Build Procedure
 		m->curr_procedure = p;
 		lb_begin_procedure_body(p);
+		lb_scan_for_sret_rvo(p);
 		lb_build_stmt(p, p->body);
 		lb_end_procedure_body(p);
 		p->is_done.store(true, std::memory_order_relaxed);

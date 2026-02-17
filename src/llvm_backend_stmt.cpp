@@ -22,6 +22,104 @@ gb_internal lbFunctionType *lb_call_sret_eligible(lbProcedure *p, Ast *call_expr
 	return callee_ft;
 }
 
+// Extended sret RVO: scan for `x := call(); ...; return x` pattern.
+// When matched, x's alloca will be the sret pointer itself, eliminating
+// the copy from x to the sret buffer on return.
+gb_internal void lb_scan_for_sret_rvo(lbProcedure *p) {
+	if (p->body == nullptr || p->body->kind != Ast_BlockStmt) {
+		return;
+	}
+	Type *proc_type = p->type;
+	if (proc_type->Proc.result_count != 1 || proc_type->Proc.results == nullptr) {
+		return;
+	}
+	lbFunctionType *ft = lb_get_function_type(p->module, proc_type);
+	if (ft->ret.kind != lbArg_Indirect) {
+		return;
+	}
+
+	Slice<Ast *> stmts = p->body->BlockStmt.stmts;
+	if (stmts.count < 2) {
+		return;
+	}
+
+	// Last stmt must be `return x` where x is an identifier
+	Ast *last = stmts[stmts.count - 1];
+	if (last->kind != Ast_ReturnStmt) {
+		return;
+	}
+	Slice<Ast *> results = last->ReturnStmt.results;
+	if (results.count != 1) {
+		return;
+	}
+	Ast *ret_expr = unparen_expr(results[0]);
+	if (ret_expr->kind != Ast_Ident) {
+		return;
+	}
+	Entity *ret_entity = entity_of_node(ret_expr);
+	if (ret_entity == nullptr || ret_entity->kind != Entity_Variable) {
+		return;
+	}
+
+	Type *ret_type = reduce_tuple_to_single_type(proc_type->Proc.results);
+	if (ret_type == nullptr || !are_types_identical(ret_entity->type, ret_type)) {
+		return;
+	}
+
+	// Walk backwards from the second-to-last stmt to find `x := call()`
+	// Everything between must be safe (no reassignment of x, no control flow)
+	i64 decl_index = -1;
+	for (i64 i = stmts.count - 2; i >= 0; i--) {
+		Ast *stmt = stmts[i];
+		switch (stmt->kind) {
+		case Ast_ValueDecl: {
+			AstValueDecl *vd = &stmt->ValueDecl;
+			if (!vd->is_mutable) {
+				// constant decl — safe, keep scanning
+				continue;
+			}
+			if (vd->names.count == 1 && vd->values.count == 1) {
+				Entity *e = entity_of_node(vd->names[0]);
+				if (e == ret_entity) {
+					Ast *rhs = unparen_expr(vd->values[0]);
+					if (rhs->kind == Ast_CallExpr && lb_call_sret_eligible(p, rhs, e->type)) {
+						decl_index = i;
+					}
+					goto done_scanning;
+				}
+			}
+			// Some other mutable ValueDecl — safe as long as it doesn't involve ret_entity
+			for (Ast *name : vd->names) {
+				if (entity_of_node(name) == ret_entity) {
+					goto done_scanning;
+				}
+			}
+			continue;
+		}
+		case Ast_ExprStmt:
+			// Expression statements (reads, function calls) are safe
+			continue;
+		case Ast_AssignStmt: {
+			// Check if any lhs is our entity
+			for (Ast *lhs : stmt->AssignStmt.lhs) {
+				Ast *l = unparen_expr(lhs);
+				if (l->kind == Ast_Ident && entity_of_node(l) == ret_entity) {
+					goto done_scanning;
+				}
+			}
+			continue;
+		}
+		default:
+			// Control flow or anything else — bail
+			goto done_scanning;
+		}
+	}
+done_scanning:
+	if (decl_index >= 0) {
+		p->sret_rvo_entity = ret_entity;
+	}
+}
+
 gb_internal void lb_build_constant_value_decl(lbProcedure *p, AstValueDecl *vd) {
 	if (vd == nullptr || vd->is_mutable) {
 		return;
@@ -2455,6 +2553,22 @@ gb_internal void lb_build_return_stmt(lbProcedure *p, Slice<Ast *> const &return
 			}
 		}
 
+		// Extended RVO: `x := call(); ...; return x` — x already in sret buffer
+		if (res_count == 1 && return_by_pointer && p->sret_rvo_entity != nullptr) {
+			Ast *ret_expr = unparen_expr(return_results[0]);
+			if (ret_expr->kind == Ast_Ident) {
+				Entity *ret_e = entity_of_node(ret_expr);
+				if (ret_e == p->sret_rvo_entity) {
+					lb_emit_defer_stmts(p, lbDeferExit_Return, nullptr, pos);
+					LLVMValueRef instr = LLVMGetLastInstruction(p->curr_block->block);
+					if (!lb_is_instr_terminating(instr)) {
+						LLVMBuildRetVoid(p->builder);
+					}
+					return;
+				}
+			}
+		}
+
 		if (res_count == 0) {
 			rw_mutex_shared_lock(&p->module->values_mutex);
 			lbValue found = map_must_get(&p->module->values, e);
@@ -3110,8 +3224,16 @@ gb_internal void lb_build_stmt(lbProcedure *p, Ast *node) {
 				Ast *rhs_expr = unparen_expr(values[0]);
 				Entity *e = entity_of_node(vd->names[0]);
 				if (rhs_expr->kind == Ast_CallExpr && e != nullptr && lb_call_sret_eligible(p, rhs_expr, e->type)) {
-					lbAddr local = lb_add_local(p, e->type, e, true);
-					lbValue dest = local.addr;
+					lbValue dest;
+					if (e == p->sret_rvo_entity) {
+						// Extended RVO: x aliases the sret buffer directly
+						dest = p->return_ptr.addr;
+						lb_add_entity(p->module, e, dest);
+						lb_add_debug_local_variable(p, dest.value, e->type, e->token);
+					} else {
+						lbAddr local = lb_add_local(p, e->type, e, true);
+						dest = local.addr;
+					}
 					lb_build_call_expr(p, rhs_expr, &dest);
 					break;
 				}

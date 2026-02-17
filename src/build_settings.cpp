@@ -611,6 +611,7 @@ struct BuildContext {
 	isize max_error_count;
 
 	bool tilde_backend;
+	bool fast_backend;
 
 
 	u32 cmd_doc_flags;
