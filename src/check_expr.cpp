@@ -11453,6 +11453,8 @@ gb_internal ExprKind check_index_expr(CheckerContext *c, Operand *o, Ast *node, 
 			// Okay
 		} else if (is_type_matrix(t)) {
 			// Okay
+		} else if (is_type_dynamic_array(t)) {
+			// Okay - element type is known, needed for type_of patterns
 		} else {
 			valid = false;
 		}
